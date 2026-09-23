@@ -43,20 +43,15 @@ test.describe("Gate 1.2 — 3 jornadas E2E + regressões", () => {
     await page.getByRole("button", { name: /Classificar e salvar/i }).click();
     await expect(page.getByText("Ideia teste E2E")).toBeVisible();
     await expect(page.getByText(/Captura classificada e salva/i)).toBeVisible();
-    await expect(page.locator('span:has-text("CRIVO")').first()).toBeVisible();
+    await expect(page.getByTestId("capture-card").filter({ hasText: "Ideia teste E2E" })).toHaveAttribute("data-domain-id", "dom_crivo");
     await page.getByRole("link", { name: /Ver em Domínios/i }).first().click();
     await expect(page).toHaveURL(/dominios/);
     await expect(page.getByRole("heading", { name: "Domínios", exact: true })).toBeVisible();
-
-    // Scroll horizontal do chip-scroll sem force:true — CRIVO fica acessível
-    const crivoFilter = page.getByRole("tab", { name: /^CRIVO/ });
-    await page.locator(".chip-scroll").evaluate((el) => {
-      (el as HTMLElement).scrollLeft = Math.min(el.scrollWidth, 220);
-    });
-    await expect(crivoFilter).toBeVisible({ timeout: 10000 });
+    const crivoFilter = page.getByTestId("domain-tab-dom_crivo");
+    await expect(crivoFilter).toBeVisible();
     await crivoFilter.click();
-    await expect(page.getByText(/Contexto ativo: CRIVO/i)).toBeVisible();
-    await expect(page.getByText(/triagem por similaridade/i).first()).toBeVisible();
+    await expect(page.getByTestId("domain-context")).toContainText("CRIVO");
+    await expect(page.getByTestId("domain-captures").getByText(/triagem por similaridade/i)).toBeVisible();
     await expect(page.getByText(/não recupera/i)).toBeVisible();
   });
 

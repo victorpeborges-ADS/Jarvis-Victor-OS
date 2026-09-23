@@ -1,4 +1,4 @@
-import demo from "../fixtures/demo.json";
+import demo from "../../../fixtures/demo.json";
 
 // Re-export tipos mínimos
 export type Source = (typeof demo.sources)[number];
@@ -73,14 +73,14 @@ export function formatMinutesUntil(targetIso: string, nowIso: string = DEMO_NOW)
 
 export function commitmentsToday() {
   return fixtures.events
-    .filter((e) => e.event_type === "commitment")
+    .filter((e) => e.event_type === "commitment" && e.show_in_agora !== false)
     .slice()
     .sort((a, b) => new Date(a.occurred_at).getTime() - new Date(b.occurred_at).getTime());
 }
 
 export function messagesToday() {
   return fixtures.events
-    .filter((e) => e.event_type === "communication")
+    .filter((e) => e.event_type === "communication" && e.show_in_agora !== false)
     .slice()
     .sort((a, b) => new Date(b.occurred_at).getTime() - new Date(a.occurred_at).getTime());
 }

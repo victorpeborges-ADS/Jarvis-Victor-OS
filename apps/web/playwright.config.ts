@@ -8,7 +8,7 @@ export default defineConfig({
   workers: process.env.CI ? 1 : undefined,
   reporter: "list",
   use: {
-    baseURL: "http://localhost:3000",
+    baseURL: "http://127.0.0.1:3013",
     trace: "on-first-retry"
   },
   projects: [
@@ -22,9 +22,9 @@ export default defineConfig({
     }
   ],
   webServer: {
-    command: "./node_modules/.bin/next start --port 3000",
-    url: "http://localhost:3000",
-    reuseExistingServer: !process.env.CI,
-    timeout: 120 * 1000
+    command: "npm run build && npx next start --hostname 127.0.0.1 --port 3013",
+    url: "http://127.0.0.1:3013",
+    reuseExistingServer: false,
+    timeout: 180 * 1000
   }
 });

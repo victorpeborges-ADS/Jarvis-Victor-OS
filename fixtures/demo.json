@@ -4,7 +4,8 @@
     "label": "DEMO — dados fictícios",
     "generated_at": "2026-09-23T09:00:00-03:00",
     "timezone": "America/Sao_Paulo",
-    "note": "Todos os registros são fictícios, exclusivos para demonstração do Gate 1. Nenhum dado real de Victor, MedSyn, MCID ou CRIVO."
+    "schema": "jarvis.demo.v1",
+    "note": "Todos os registros são fictícios, exclusivos para demonstração do Gate 1. Nenhum dado real de Victor, MedSyn, MCID ou CRIVO. Domínio é domain_id; sensibilidade e proveniência são campos separados."
   },
   "sources": [
     { "id": "src_calendar", "provider": "google_calendar", "account": "victor.demo@example.com", "scope": "calendar.readonly", "sync_status": "connected", "last_success": "2026-09-23T08:45:00-03:00", "consent": "mock" },
@@ -12,10 +13,10 @@
     { "id": "src_drive", "provider": "google_drive", "account": "victor.demo@example.com", "scope": "drive.readonly", "sync_status": "stale", "last_success": "2026-09-22T09:00:00-03:00", "consent": "mock", "stale_reason": "Sem sincronização há 24h — dados podem estar desatualizados" }
   ],
   "entities": [
-    { "id": "ent_projeto_crivo", "kind": "project", "name": "CRIVO — Plataforma de triagem", "domain": "CRIVO", "aliases": ["crivo_platform"] },
-    { "id": "ent_projeto_medsyn", "kind": "project", "name": "MedSyn — Entrega sprint 7", "domain": "MedSyn", "aliases": ["medsyn_sprint7"] },
-    { "id": "ent_pessoa_bruna", "kind": "person", "name": "Bruna", "domain": "Família/Fé", "aliases": [] },
-    { "id": "ent_meta_academia", "kind": "goal", "name": "Academia — consistência", "domain": "Saúde", "aliases": [] }
+    { "id": "ent_projeto_crivo", "kind": "project", "name": "CRIVO — Plataforma de triagem", "domain_id": "dom_crivo", "aliases": ["crivo_platform"] },
+    { "id": "ent_projeto_medsyn", "kind": "project", "name": "MedSyn — Entrega sprint 7", "domain_id": "dom_medsyn", "aliases": ["medsyn_sprint7"] },
+    { "id": "ent_pessoa_bruna", "kind": "person", "name": "Bruna", "domain_id": "dom_familia", "aliases": [] },
+    { "id": "ent_meta_academia", "kind": "goal", "name": "Academia — consistência", "domain_id": "dom_saude", "aliases": [] }
   ],
   "events": [
     {
@@ -23,6 +24,8 @@
       "external_ref": "cal_001",
       "source_id": "src_calendar",
       "event_type": "commitment",
+      "domain_id": "dom_medsyn",
+      "show_in_agora": true,
       "title": "Daily MedSyn — revisão sprint",
       "occurred_at": "2026-09-23T09:30:00-03:00",
       "observed_at": "2026-09-23T08:45:00-03:00",
@@ -35,6 +38,8 @@
       "external_ref": "cal_002",
       "source_id": "src_calendar",
       "event_type": "commitment",
+      "domain_id": "dom_saude",
+      "show_in_agora": true,
       "title": "Treino — Academia",
       "occurred_at": "2026-09-23T18:00:00-03:00",
       "observed_at": "2026-09-23T08:45:00-03:00",
@@ -47,6 +52,8 @@
       "external_ref": "cal_003",
       "source_id": "src_calendar",
       "event_type": "commitment",
+      "domain_id": "dom_medsyn",
+      "show_in_agora": true,
       "title": "Entrega MedSyn — demo cliente",
       "occurred_at": "2026-09-23T19:00:00-03:00",
       "observed_at": "2026-09-23T08:45:00-03:00",
@@ -59,6 +66,8 @@
       "external_ref": "gmail_001",
       "source_id": "src_gmail",
       "event_type": "communication",
+      "domain_id": "dom_financas",
+      "show_in_agora": true,
       "title": "E-mail: Atualização orçamento SOFF — revisar",
       "occurred_at": "2026-09-23T07:15:00-03:00",
       "observed_at": "2026-09-23T08:47:00-03:00",
@@ -71,12 +80,112 @@
       "external_ref": "gmail_002",
       "source_id": "src_gmail",
       "event_type": "communication",
+      "domain_id": null,
+      "show_in_agora": true,
       "title": "E-mail promocional: Oferta academia (ignorar)",
       "occurred_at": "2026-09-23T07:20:00-03:00",
       "observed_at": "2026-09-23T08:47:00-03:00",
       "payload_minimized": { "from": "promo@academia.example.com", "subject": "50% OFF este mês!", "snippet": "Promoção imperdível..." },
       "sensitivity": "public",
       "provenance": { "origin": "Gmail", "url": "mock://gmail/evt_005", "last_checked": "2026-09-23T08:47:00-03:00", "confidence": "baixa", "scope": "pessoal", "note": "Classificado como promocional — não é obrigação" }
+    },
+    {
+      "id": "evt_006",
+      "external_ref": "cal_006",
+      "source_id": "src_calendar",
+      "domain_id": "dom_medsyn",
+      "show_in_agora": false,
+      "event_type": "commitment",
+      "title": "MedSyn — pauta interna que cita CRIVO no título",
+      "occurred_at": "2026-09-23T11:00:00-03:00",
+      "observed_at": "2026-09-23T08:45:00-03:00",
+      "payload_minimized": { "location": "Meet interno" },
+      "sensitivity": "internal",
+      "provenance": { "origin": "Google Calendar", "url": "mock://calendar/evt_006", "last_checked": "2026-09-23T08:45:00-03:00", "confidence": "alta", "scope": "MedSyn", "note": "Menção a CRIVO no título não transfere o registro de domínio." }
+    },
+    {
+      "id": "evt_007",
+      "external_ref": "cal_007",
+      "source_id": "src_calendar",
+      "domain_id": "dom_trabalho",
+      "show_in_agora": false,
+      "event_type": "commitment",
+      "title": "Alinhamento CGMUR — pauta semanal",
+      "occurred_at": "2026-09-23T10:00:00-03:00",
+      "observed_at": "2026-09-23T08:45:00-03:00",
+      "payload_minimized": { "location": "Sala 2" },
+      "sensitivity": "internal",
+      "provenance": { "origin": "Google Calendar", "url": "mock://calendar/evt_007", "last_checked": "2026-09-23T08:45:00-03:00", "confidence": "alta", "scope": "trabalho" }
+    },
+    {
+      "id": "evt_008",
+      "external_ref": "cal_008",
+      "source_id": "src_calendar",
+      "domain_id": "dom_trabalho",
+      "show_in_agora": false,
+      "event_type": "commitment",
+      "title": "CGMUR — leitura de ofício",
+      "occurred_at": "2026-09-23T15:00:00-03:00",
+      "observed_at": "2026-09-23T08:45:00-03:00",
+      "payload_minimized": { "location": "Mesa" },
+      "sensitivity": "internal",
+      "provenance": { "origin": "Google Calendar", "url": "mock://calendar/evt_008", "last_checked": "2026-09-23T08:45:00-03:00", "confidence": "média", "scope": "trabalho" }
+    },
+    {
+      "id": "evt_009",
+      "external_ref": "note_009",
+      "source_id": "src_calendar",
+      "domain_id": "dom_aprender",
+      "show_in_agora": false,
+      "event_type": "commitment",
+      "title": "Estudo — embeddings locais",
+      "occurred_at": "2026-09-23T21:00:00-03:00",
+      "observed_at": "2026-09-23T08:45:00-03:00",
+      "payload_minimized": { "location": "Casa" },
+      "sensitivity": "personal",
+      "provenance": { "origin": "Fixtures DEMO", "url": "mock://note/evt_009", "last_checked": "2026-09-23T08:45:00-03:00", "confidence": "média", "scope": "estudo" }
+    },
+    {
+      "id": "evt_010",
+      "external_ref": "cal_010",
+      "source_id": "src_calendar",
+      "domain_id": "dom_familia",
+      "show_in_agora": false,
+      "event_type": "commitment",
+      "title": "Compromisso família — DEMO",
+      "occurred_at": "2026-09-23T20:00:00-03:00",
+      "observed_at": "2026-09-23T08:45:00-03:00",
+      "payload_minimized": { "location": "Casa" },
+      "sensitivity": "personal",
+      "provenance": { "origin": "Google Calendar", "url": "mock://calendar/evt_010", "last_checked": "2026-09-23T08:45:00-03:00", "confidence": "alta", "scope": "familia" }
+    },
+    {
+      "id": "evt_011",
+      "external_ref": "cal_011",
+      "source_id": "src_calendar",
+      "domain_id": null,
+      "show_in_agora": false,
+      "event_type": "commitment",
+      "title": "Registro sem domínio atribuído",
+      "occurred_at": "2026-09-23T12:00:00-03:00",
+      "observed_at": "2026-09-23T08:45:00-03:00",
+      "payload_minimized": {},
+      "sensitivity": "internal",
+      "provenance": { "origin": "Fixtures DEMO", "url": "mock://calendar/evt_011", "last_checked": "2026-09-23T08:45:00-03:00", "confidence": "baixa", "scope": "indefinido" }
+    },
+    {
+      "id": "evt_012",
+      "external_ref": "cal_012",
+      "source_id": "src_calendar",
+      "domain_id": "dom_fantasma",
+      "show_in_agora": false,
+      "event_type": "commitment",
+      "title": "Registro com domínio desconhecido",
+      "occurred_at": "2026-09-23T12:30:00-03:00",
+      "observed_at": "2026-09-23T08:45:00-03:00",
+      "payload_minimized": {},
+      "sensitivity": "internal",
+      "provenance": { "origin": "Fixtures DEMO", "url": "mock://calendar/evt_012", "last_checked": "2026-09-23T08:45:00-03:00", "confidence": "baixa", "scope": "indefinido" }
     }
   ],
   "briefing": {
@@ -106,7 +215,7 @@
     }
   ],
   "inbox": [
-    { "id": "inb_001", "type": "idea", "title": "Ideia CRIVO: triagem por similaridade semântica", "domain": "CRIVO", "entity_ref": "ent_projeto_crivo", "status": "classified", "created_at": "2026-09-23T08:10:00-03:00", "evidence": "Captura de voz/texto — classificada como referência, não cria evento externo" }
+    { "id": "inb_001", "type": "referência", "title": "Ideia CRIVO: triagem por similaridade semântica", "domain_id": "dom_crivo", "entity_ref": "ent_projeto_crivo", "status": "classified", "created_at": "2026-09-23T08:10:00-03:00", "evidence": "Captura de voz/texto — classificada como referência, não cria evento externo" }
   ],
   "approvals": [
     {
@@ -121,8 +230,8 @@
   ],
   "domains": [
     { "id": "dom_trabalho", "name": "Trabalho / CGMUR", "count": 2 },
-    { "id": "dom_medsyn", "name": "MedSyn", "count": 2 },
-    { "id": "dom_crivo", "name": "CRIVO", "count": 2 },
+    { "id": "dom_medsyn", "name": "MedSyn", "count": 3 },
+    { "id": "dom_crivo", "name": "CRIVO", "count": 1 },
     { "id": "dom_carreira", "name": "Carreira", "count": 0 },
     { "id": "dom_aprender", "name": "Aprender AI", "count": 1 },
     { "id": "dom_saude", "name": "Saúde", "count": 1 },

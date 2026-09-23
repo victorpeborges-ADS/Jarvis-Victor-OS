@@ -17,16 +17,12 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-FIXTURES = Path(__file__).parent.parent.parent / "fixtures" / "demo.json"
+FIXTURES = Path(__file__).resolve().parents[2] / "fixtures" / "demo.json"
 
 def load_fixtures():
-    if FIXTURES.exists():
-        return json.loads(FIXTURES.read_text())
-    # fallback para quando rodando dentro de apps/api
-    alt = Path(__file__).parent / "demo.json"
-    if alt.exists():
-        return json.loads(alt.read_text())
-    return {"meta": {"demo": True}}
+    if not FIXTURES.exists():
+        return {"meta": {"demo": True}, "events": [], "sources": [], "briefing": {}}
+    return json.loads(FIXTURES.read_text())
 
 @app.get("/health")
 def health():

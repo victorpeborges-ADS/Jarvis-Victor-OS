@@ -2,6 +2,8 @@
 import { useState } from "react";
 import Link from "next/link";
 import { fixtures, inboxStatusLabel, formatTimeH } from "@/lib/demo";
+import { domainName, recordsForDomain } from "@/lib/domains";
+import { appendCapture, DEMO_STORAGE_LIMITS, useDemoCaptures } from "@/lib/demo-inbox-store";
 import { Badge, Card, Button, ProvenanceDrawer, EmptyState } from "@/components/ui/primitives";
 
 type InboxType = "tarefa" | "evento" | "referência" | "projeto" | "pessoa" | "nota";
@@ -9,8 +11,8 @@ type InboxType = "tarefa" | "evento" | "referência" | "projeto" | "pessoa" | "n
 export default function InboxPage() {
   const [text, setText] = useState("");
   const [type, setType] = useState<InboxType>("referência");
-  const [domain, setDomain] = useState("CRIVO");
-  const [items, setItems] = useState(fixtures.inbox);
+  const [domainId, setDomainId] = useState("dom_crivo");
+  const items = useDemoCaptures();
   const [drawer, setDrawer] = useState<string | null>(null);
   const [filter, setFilter] = useState<string>("todos");
   const [feedback, setFeedback] = useState<string | null>(null);
@@ -18,22 +20,22 @@ export default function InboxPage() {
   function handleCapture() {
     if (!text.trim()) return;
     const title = text.slice(0, 80);
-    const novo: (typeof fixtures.inbox)[number] = {
-      id: `inb_${Date.now()}`,
-      type: type,
+    const id = `inb_${crypto.randomUUID()}`;
+    appendCapture({
+      id,
+      type,
       title,
-      domain,
-      entity_ref: domain === "CRIVO" ? "ent_projeto_crivo" : "",
+      domain_id: domainId,
+      entity_ref: domainId === "dom_crivo" ? "ent_projeto_crivo" : "",
       status: "classified",
       created_at: new Date().toISOString(),
       evidence: "Classificada localmente — sem criação de evento/e-mail externo"
-    };
-    setItems([novo, ...items]);
+    });
     setText("");
-    setFeedback(`Salvo como ${type} em ${domain}. Nenhuma reunião ou e-mail foi criado — revisão humana preservada.`);
+    setFeedback(`Salvo como ${type} em ${domainName(domainId)}. Nenhuma reunião ou e-mail foi criado — revisão humana preservada.`);
   }
 
-  const filtered = filter === "todos" ? items : items.filter((i) => i.domain === filter);
+  const filtered = filter === "todos" ? items : recordsForDomain(items, filter);
 
   return (
     <div className="mx-auto max-w-[880px] px-4 py-6 md:px-8">
@@ -42,6 +44,9 @@ export default function InboxPage() {
           <div className="text-xs font-semibold tracking-widest text-ink-faint">INBOX · CAPTURA RÁPIDA</div>
           <h1 className="text-lg font-semibold tracking-tight text-ink">Caixa de entrada</h1>
           <p className="text-sm text-ink-subtle">Capte texto ou link. Classificamos sem criar reunião ou e-mail sem aprovação.</p>
+          <p className="mt-1 max-w-[560px] text-xs leading-relaxed text-ink-faint" data-testid="demo-storage-limits">
+            {DEMO_STORAGE_LIMITS}
+          </p>
         </div>
         <Badge tone="amber">DEMO</Badge>
       </div>
@@ -72,6 +77,7 @@ export default function InboxPage() {
           </label>
           <textarea
             id="capture"
+            data-testid="capture-input"
             value={text}
             onChange={(e) => setText(e.target.value.slice(0, 280))}
             placeholder="Ex: Ideia CRIVO — triagem por similaridade semântica com embeddings locais..."
@@ -106,21 +112,22 @@ export default function InboxPage() {
             </label>
             <select
               id="inbox-domain"
-              value={domain}
-              onChange={(e) => setDomain(e.target.value)}
+              data-testid="domain-select"
+              value={domainId}
+              onChange={(e) => setDomainId(e.target.value)}
               className="mt-1 w-full rounded-full border border-paper-border bg-white px-3 py-2 text-sm text-ink focus:border-ink focus:outline-none"
             >
-              <option>CRIVO</option>
-              <option>MedSyn</option>
-              <option>Trabalho / CGMUR</option>
-              <option>Saúde</option>
-              <option>Finanças</option>
+              {fixtures.domains.map((d) => (
+                <option key={d.id} value={d.id}>
+                  {d.name}
+                </option>
+              ))}
             </select>
           </div>
         </div>
 
         <div className="mt-4 flex flex-col gap-2 sm:flex-row sm:items-center">
-          <Button onClick={handleCapture} disabled={!text.trim()} className="w-full sm:w-auto sm:min-w-[200px]" size="lg">
+          <Button onClick={handleCapture} disabled={!text.trim()} className="w-full sm:w-auto sm:min-w-[200px]" size="lg" data-testid="capture-save">
             Classificar e salvar
           </Button>
           <span
@@ -137,18 +144,30 @@ export default function InboxPage() {
 
       <div className="mt-6 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
         <h2 className="text-sm font-semibold text-ink">Itens capturados · {filtered.length}</h2>
-        <div className="chip-scroll" role="toolbar" aria-label="Filtrar por domínio">
-          {["todos", "CRIVO", "MedSyn"].map((f) => (
+        <div className="flex flex-wrap gap-2" role="toolbar" aria-label="Filtrar por domínio">
+          <button
+            type="button"
+            data-testid="inbox-filter-todos"
+            onClick={() => setFilter("todos")}
+            className={[
+              "shrink-0 rounded-full px-3 py-1 text-xs font-medium",
+              filter === "todos" ? "bg-ink text-white" : "bg-paper-muted text-ink-subtle hover:bg-paper-border"
+            ].join(" ")}
+          >
+            todos
+          </button>
+          {fixtures.domains.map((d) => (
             <button
-              key={f}
+              key={d.id}
               type="button"
-              onClick={() => setFilter(f)}
+              data-testid={`inbox-filter-${d.id}`}
+              onClick={() => setFilter(d.id)}
               className={[
                 "shrink-0 rounded-full px-3 py-1 text-xs font-medium",
-                filter === f ? "bg-ink text-white" : "bg-paper-muted text-ink-subtle hover:bg-paper-border"
+                filter === d.id ? "bg-ink text-white" : "bg-paper-muted text-ink-subtle hover:bg-paper-border"
               ].join(" ")}
             >
-              {f}
+              {d.name}
             </button>
           ))}
         </div>
@@ -170,11 +189,12 @@ export default function InboxPage() {
         ) : (
           filtered.map((it) => (
             <Card key={it.id} className="p-4">
+              <div data-testid="capture-card" data-capture-id={it.id} data-domain-id={it.domain_id}>
               <div className="flex items-start justify-between gap-3">
                 <div>
                   <div className="flex flex-wrap items-center gap-2">
                     <span className="rounded-full bg-paper-muted px-2 py-1 text-xs font-medium text-ink">{it.type}</span>
-                    <span className="rounded-full bg-violet-50 px-2 py-1 text-xs font-medium text-violet-700 ring-1 ring-violet-200">{it.domain}</span>
+                    <span className="rounded-full bg-violet-50 px-2 py-1 text-xs font-medium text-violet-700 ring-1 ring-violet-200">{domainName(it.domain_id)}</span>
                     <Badge tone="emerald">{inboxStatusLabel(it.status)}</Badge>
                   </div>
                   <div className="mt-2 text-sm font-medium leading-tight text-ink">{it.title}</div>
@@ -191,9 +211,10 @@ export default function InboxPage() {
               <div className="mt-3 flex flex-wrap items-center gap-2 text-xs text-ink-faint">
                 <span>{formatTimeH(it.created_at)} · {new Date(it.created_at).toLocaleDateString("pt-BR", { timeZone: "America/Sao_Paulo" })}</span>
                 <span>·</span>
-                <Link href="/dominios" className="font-medium text-ink underline decoration-ink/20 underline-offset-4">
+                <Link href={`/dominios?dominio=${it.domain_id}`} data-testid="open-domains" className="font-medium text-ink underline decoration-ink/20 underline-offset-4">
                   Ver em Domínios →
                 </Link>
+              </div>
               </div>
             </Card>
           ))
@@ -210,8 +231,8 @@ export default function InboxPage() {
             origin: "Inbox local + fixtures",
             last_checked: it.created_at,
             confidence: "média",
-            scope: it.domain,
-            note: "Vinculada a ent_projeto_crivo quando domínio = CRIVO"
+            scope: domainName(it.domain_id),
+            note: "Classificação pelo domain_id. Sem compartilhamento automático com outros domínios."
           }}
         />
       ))}
