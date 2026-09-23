@@ -11,14 +11,15 @@ export function Badge({ children, tone = "neutral" }: { children: React.ReactNod
   return <span className={["inline-flex items-center rounded-full px-2.5 py-1 text-xs font-medium ring-1", map[tone]].join(" ")}>{children}</span>;
 }
 
-export function Card({ children, className = "" }: { children: React.ReactNode; className?: string }) {
-  return <div className={["rounded-2xl border border-paper-border bg-white shadow-soft", className].join(" ")}>{children}</div>;
+export function Card({ children, className = "", id }: { children: React.ReactNode; className?: string; id?: string }) {
+  return <div id={id} className={["rounded-2xl border border-paper-border bg-white shadow-soft", className].join(" ")}>{children}</div>;
 }
 
 export function Button({
   children,
   variant = "primary",
   size = "md",
+  className = "",
   ...props
 }: React.ButtonHTMLAttributes<HTMLButtonElement> & { variant?: "primary" | "ghost" | "outline"; size?: "sm" | "md" | "lg" }) {
   const variants: Record<string, string> = {
@@ -33,7 +34,7 @@ export function Button({
   };
   return (
     <button
-      className={["inline-flex items-center justify-center rounded-full font-medium transition focus-visible:outline-none disabled:opacity-50", variants[variant], sizes[size]].join(" ")}
+      className={["inline-flex items-center justify-center rounded-full font-medium transition focus-visible:outline-none disabled:opacity-50", variants[variant], sizes[size], className].join(" ")}
       {...props}
     >
       {children}
@@ -42,14 +43,34 @@ export function Button({
 }
 
 export function StatusDot({ status }: { status: "mock" | "connected" | "stale" | "error" | "pending_approval" }) {
+  // Gate 1: “connected” nunca usa verde de conexão real — âmbar = simulação
   const map: Record<string, string> = {
     mock: "bg-amber-500",
-    connected: "bg-emerald-500",
-    stale: "bg-amber-500",
+    connected: "bg-amber-500",
+    stale: "bg-amber-600",
     error: "bg-red-500",
     pending_approval: "bg-violet-500"
   };
   return <span className={["inline-block h-2 w-2 rounded-full", map[status] ?? "bg-slate-400"].join(" ")} aria-hidden />;
+}
+
+/** Badge de conector Gate 1 — nunca exibe “connected” cru */
+export function ConnectorBadge({ status, label }: { status: string; label: string }) {
+  const stale = status === "stale";
+  const dotStatus: "mock" | "stale" | "error" | "pending_approval" =
+    status === "stale" ? "stale" : status === "error" ? "error" : status === "pending_approval" ? "pending_approval" : "mock";
+  return (
+    <span
+      className={[
+        "inline-flex items-center gap-1.5 rounded-full px-2 py-1 text-xs font-medium ring-1",
+        stale ? "bg-amber-50 text-amber-800 ring-amber-200" : "bg-amber-50/80 text-amber-900 ring-amber-200"
+      ].join(" ")}
+      title="Estado simulado — sem OAuth real no Gate 1"
+    >
+      <StatusDot status={dotStatus} />
+      {label}
+    </span>
+  );
 }
 
 export function ProvenanceDrawer({ open, onClose, title, provenance, children }: { open: boolean; onClose: () => void; title: string; provenance: any; children?: React.ReactNode }) {

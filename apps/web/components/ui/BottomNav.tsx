@@ -16,11 +16,14 @@ export function BottomNav() {
     <nav
       aria-label="Navegação mobile"
       className="fixed inset-x-0 bottom-0 z-40 border-t border-paper-border bg-white/95 backdrop-blur supports-[backdrop-filter]:bg-white/80 md:hidden"
-      style={{ paddingBottom: "env(safe-area-inset-bottom)" }}
+      style={{
+        height: "calc(var(--bottom-nav-height) + env(safe-area-inset-bottom, 0px))",
+        paddingBottom: "env(safe-area-inset-bottom, 0px)"
+      }}
     >
-      <div className="grid grid-cols-5 gap-1 px-2 py-2">
+      <div className="grid h-[var(--bottom-nav-height)] grid-cols-5 gap-1 px-2">
         {items.map((it) => {
-          const active = pathname === it.href;
+          const active = pathname === it.href || (it.href !== "/" && pathname.startsWith(it.href));
           return (
             <Link
               key={it.href}

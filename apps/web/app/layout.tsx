@@ -41,7 +41,7 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
         <Header />
         <div className="mx-auto flex max-w-[1280px]">
           <Sidebar />
-          <main id="conteudo" className="min-h-[calc(100vh-64px)] flex-1 pb-20 md:pb-0">
+          <main id="conteudo" className="main-with-bottom-nav min-h-[calc(100vh-64px)] flex-1">
             <div className="animate-fadeIn">{children}</div>
           </main>
         </div>

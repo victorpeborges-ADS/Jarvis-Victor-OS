@@ -1,6 +1,8 @@
 "use client";
 import Link from "next/link";
 import { usePathname } from "next/navigation";
+import { fixtures, syncStatusLabel, providerLabel, formatTimeH } from "@/lib/demo";
+import { ConnectorBadge } from "@/components/ui/primitives";
 
 const items = [
   { href: "/", label: "Agora", desc: "Visão do momento", icon: "◐" },
@@ -42,33 +44,23 @@ export function Sidebar() {
         </div>
 
         <div className="mt-6 rounded-2xl border border-paper-border bg-paper-muted p-4">
-          <div className="text-xs font-semibold tracking-widest text-ink-faint">ESTADO — GATE 1</div>
+          <div className="text-xs font-semibold tracking-widest text-ink-faint">CONECTORES — GATE 1</div>
           <div className="mt-2 space-y-2 text-xs">
-            <div className="flex items-center justify-between">
-              <span className="text-ink-subtle">Calendar</span>
-              <span className="inline-flex items-center gap-1.5 rounded-full bg-emerald-50 px-2 py-1 font-medium text-emerald-700 ring-1 ring-emerald-200">
-                <span className="h-1.5 w-1.5 rounded-full bg-emerald-500" /> connected
-              </span>
-            </div>
-            <div className="flex items-center justify-between">
-              <span className="text-ink-subtle">Gmail</span>
-              <span className="inline-flex items-center gap-1.5 rounded-full bg-emerald-50 px-2 py-1 font-medium text-emerald-700 ring-1 ring-emerald-200">
-                <span className="h-1.5 w-1.5 rounded-full bg-emerald-500" /> connected
-              </span>
-            </div>
-            <div className="flex items-center justify-between">
-              <span className="text-ink-subtle">Drive</span>
-              <span className="inline-flex items-center gap-1.5 rounded-full bg-amber-50 px-2 py-1 font-medium text-amber-700 ring-1 ring-amber-200" title="Sem sincronização há 24h">
-                <span className="h-1.5 w-1.5 rounded-full bg-amber-500" /> stale
-              </span>
-            </div>
+            {fixtures.sources.map((s) => (
+              <div key={s.id} className="flex items-center justify-between gap-2">
+                <span className="text-ink-subtle">{providerLabel(s.provider).replace("Google ", "")}</span>
+                <ConnectorBadge status={s.sync_status} label={syncStatusLabel(s.sync_status)} />
+              </div>
+            ))}
           </div>
-          <p className="mt-3 text-xs leading-relaxed text-ink-faint">Dados mock sinalizados. Nenhuma escrita externa sem aprovação explícita.</p>
+          <p className="mt-3 text-xs leading-relaxed text-ink-faint">
+            Simulação sinalizada. Última verificação mock: {formatTimeH(fixtures.sources[0].last_success)}. Sem escrita externa.
+          </p>
         </div>
 
         <div className="mt-4 rounded-xl bg-amber-50 px-3 py-3 ring-1 ring-amber-200">
           <div className="text-xs font-semibold text-amber-800">DEMO</div>
-          <p className="mt-1 text-xs leading-relaxed text-amber-700">Tudo aqui é fictício. Veja fontes para proveniência.</p>
+          <p className="mt-1 text-xs leading-relaxed text-amber-700">Tudo aqui é fictício. Veja Fontes para proveniência.</p>
         </div>
       </nav>
     </aside>

@@ -11,6 +11,8 @@
   --accent: #0f172a;
   --accent-hover: #1e293b;
   --focus: #6366f1;
+  /* Altura da BottomNav (ícone+rótulo+py) — conteúdo reserva este espaço + safe-area */
+  --bottom-nav-height: 4.25rem;
 }
 
 * {
@@ -80,4 +82,29 @@ body {
 }
 @media (prefers-reduced-motion: reduce) {
   .animate-fadeIn { animation: none; }
+}
+
+/* Reserva espaço para nav mobile + safe area (home indicator) */
+.main-with-bottom-nav {
+  padding-bottom: calc(var(--bottom-nav-height) + env(safe-area-inset-bottom, 0px) + 0.75rem);
+}
+@media (min-width: 768px) {
+  .main-with-bottom-nav {
+    padding-bottom: 0;
+  }
+}
+
+/* Scroll horizontal de chips com máscara e snap */
+.chip-scroll {
+  display: flex;
+  gap: 0.5rem;
+  overflow-x: auto;
+  scroll-snap-type: x mandatory;
+  -webkit-overflow-scrolling: touch;
+  padding-bottom: 0.5rem;
+  padding-right: 1.5rem;
+  scrollbar-width: thin;
+}
+.chip-scroll > * {
+  scroll-snap-align: start;
 }
