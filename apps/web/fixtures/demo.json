@@ -1,0 +1,132 @@
+{
+  "meta": {
+    "demo": true,
+    "label": "DEMO — dados fictícios",
+    "generated_at": "2026-09-23T09:00:00-03:00",
+    "timezone": "America/Sao_Paulo",
+    "note": "Todos os registros são fictícios, exclusivos para demonstração do Gate 1. Nenhum dado real de Victor, MedSyn, MCID ou CRIVO."
+  },
+  "sources": [
+    { "id": "src_calendar", "provider": "google_calendar", "account": "victor.demo@example.com", "scope": "calendar.readonly", "sync_status": "connected", "last_success": "2026-09-23T08:45:00-03:00", "consent": "mock" },
+    { "id": "src_gmail", "provider": "gmail", "account": "victor.demo@example.com", "scope": "gmail.readonly", "sync_status": "connected", "last_success": "2026-09-23T08:47:00-03:00", "consent": "mock" },
+    { "id": "src_drive", "provider": "google_drive", "account": "victor.demo@example.com", "scope": "drive.readonly", "sync_status": "stale", "last_success": "2026-09-22T09:00:00-03:00", "consent": "mock", "stale_reason": "Sem sincronização há 24h — dados podem estar desatualizados" }
+  ],
+  "entities": [
+    { "id": "ent_projeto_crivo", "kind": "project", "name": "CRIVO — Plataforma de triagem", "domain": "CRIVO", "aliases": ["crivo_platform"] },
+    { "id": "ent_projeto_medsyn", "kind": "project", "name": "MedSyn — Entrega sprint 7", "domain": "MedSyn", "aliases": ["medsyn_sprint7"] },
+    { "id": "ent_pessoa_bruna", "kind": "person", "name": "Bruna", "domain": "Família/Fé", "aliases": [] },
+    { "id": "ent_meta_academia", "kind": "goal", "name": "Academia — consistência", "domain": "Saúde", "aliases": [] }
+  ],
+  "events": [
+    {
+      "id": "evt_001",
+      "external_ref": "cal_001",
+      "source_id": "src_calendar",
+      "event_type": "commitment",
+      "title": "Daily MedSyn — revisão sprint",
+      "occurred_at": "2026-09-23T09:30:00-03:00",
+      "observed_at": "2026-09-23T08:45:00-03:00",
+      "payload_minimized": { "location": "Meet", "attendees": ["victor.demo@example.com"] },
+      "sensitivity": "internal",
+      "provenance": { "origin": "Google Calendar", "url": "mock://calendar/evt_001", "last_checked": "2026-09-23T08:45:00-03:00", "confidence": "alta", "scope": "pessoal" }
+    },
+    {
+      "id": "evt_002",
+      "external_ref": "cal_002",
+      "source_id": "src_calendar",
+      "event_type": "commitment",
+      "title": "Treino — Academia",
+      "occurred_at": "2026-09-23T18:00:00-03:00",
+      "observed_at": "2026-09-23T08:45:00-03:00",
+      "payload_minimized": { "location": "Academia Central" },
+      "sensitivity": "personal",
+      "provenance": { "origin": "Google Calendar", "url": "mock://calendar/evt_002", "last_checked": "2026-09-23T08:45:00-03:00", "confidence": "alta", "scope": "pessoal" }
+    },
+    {
+      "id": "evt_003",
+      "external_ref": "cal_003",
+      "source_id": "src_calendar",
+      "event_type": "commitment",
+      "title": "Entrega MedSyn — demo cliente",
+      "occurred_at": "2026-09-23T19:00:00-03:00",
+      "observed_at": "2026-09-23T08:45:00-03:00",
+      "payload_minimized": { "location": "Meet cliente" },
+      "sensitivity": "internal",
+      "provenance": { "origin": "Google Calendar", "url": "mock://calendar/evt_003", "last_checked": "2026-09-23T08:45:00-03:00", "confidence": "alta", "scope": "MedSyn" }
+    },
+    {
+      "id": "evt_004",
+      "external_ref": "gmail_001",
+      "source_id": "src_gmail",
+      "event_type": "communication",
+      "title": "E-mail: Atualização orçamento SOFF — revisar",
+      "occurred_at": "2026-09-23T07:15:00-03:00",
+      "observed_at": "2026-09-23T08:47:00-03:00",
+      "payload_minimized": { "from": "financeiro@demo.example.com", "subject": "SOFF — orçamento setembro", "snippet": "Segue atualização do orçamento para revisão..." },
+      "sensitivity": "internal",
+      "provenance": { "origin": "Gmail", "url": "mock://gmail/evt_004", "last_checked": "2026-09-23T08:47:00-03:00", "confidence": "média", "scope": "Finanças" }
+    },
+    {
+      "id": "evt_005",
+      "external_ref": "gmail_002",
+      "source_id": "src_gmail",
+      "event_type": "communication",
+      "title": "E-mail promocional: Oferta academia (ignorar)",
+      "occurred_at": "2026-09-23T07:20:00-03:00",
+      "observed_at": "2026-09-23T08:47:00-03:00",
+      "payload_minimized": { "from": "promo@academia.example.com", "subject": "50% OFF este mês!", "snippet": "Promoção imperdível..." },
+      "sensitivity": "public",
+      "provenance": { "origin": "Gmail", "url": "mock://gmail/evt_005", "last_checked": "2026-09-23T08:47:00-03:00", "confidence": "baixa", "scope": "pessoal", "note": "Classificado como promocional — não é obrigação" }
+    }
+  ],
+  "briefing": {
+    "date": "2026-09-23",
+    "next_commitment": "evt_001",
+    "priority": { "title": "Finalizar slides demo MedSyn", "rationale": "Entrega às 19h depende deste artefato", "evidence_event_ids": ["evt_003"], "confidence": "alta" },
+    "alerts": [
+      { "type": "conflict", "title": "Conflito: Academia 18h × Entrega 19h — deslocamento curto", "evidence_event_ids": ["evt_002", "evt_003"], "consequence": "Risco de atraso se treino estender" }
+    ],
+    "energy_optional": { "suggestion": "Se energia baixa, foque nos slides; treino pode ser encurtado." }
+  },
+  "proposals": [
+    {
+      "id": "dec_001",
+      "title": "Resolver conflito Academia × Entrega",
+      "state": "proposed",
+      "rationale": "Dois compromissos com 60min de intervalo e deslocamento. Proposta não executada — aguarda aprovação.",
+      "conflicts": ["evt_002", "evt_003"],
+      "alternatives": [
+        { "id": "alt_a", "label": "Antecipar academia para 17h (30min leve)", "impact": "Chega 18h30, buffer 30min antes da entrega" },
+        { "id": "alt_b", "label": "Manter academia 18h mas encurtar para 40min + saída 18h45", "impact": "Buffer 15min, risco moderado" }
+      ],
+      "actions": [
+        { "id": "act_001", "kind": "calendar_proposal", "target": "mock_calendar", "payload": { "move_event": "evt_002", "to": "2026-09-23T17:00:00-03:00" }, "idempotency_key": "idem_dec001_act001", "execution_state": "pending_approval" }
+      ],
+      "provenance": { "origin": "Regra determinística + fixtures", "last_checked": "2026-09-23T08:45:00-03:00", "confidence": "média" }
+    }
+  ],
+  "inbox": [
+    { "id": "inb_001", "type": "idea", "title": "Ideia CRIVO: triagem por similaridade semântica", "domain": "CRIVO", "entity_ref": "ent_projeto_crivo", "status": "classified", "created_at": "2026-09-23T08:10:00-03:00", "evidence": "Captura de voz/texto — classificada como referência, não cria evento externo" }
+  ],
+  "approvals": [
+    {
+      "id": "appr_001",
+      "decision_id": "dec_001",
+      "title": "Mover Academia para 17h?",
+      "diff": "Antes: 18h00–19h00. Depois: 17h00–17h30. Impacto: libera 90min até entrega 19h.",
+      "scope": "Apenas rascunho local — nenhuma alteração no Google Calendar sem aprovação",
+      "state": "pending_approval",
+      "requested_at": "2026-09-23T08:50:00-03:00"
+    }
+  ],
+  "domains": [
+    { "id": "dom_trabalho", "name": "Trabalho / CGMUR", "count": 2 },
+    { "id": "dom_medsyn", "name": "MedSyn", "count": 2 },
+    { "id": "dom_crivo", "name": "CRIVO", "count": 2 },
+    { "id": "dom_carreira", "name": "Carreira", "count": 0 },
+    { "id": "dom_aprender", "name": "Aprender AI", "count": 1 },
+    { "id": "dom_saude", "name": "Saúde", "count": 1 },
+    { "id": "dom_financas", "name": "Finanças", "count": 1 },
+    { "id": "dom_familia", "name": "Família / Fé", "count": 1 }
+  ]
+}

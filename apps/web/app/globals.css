@@ -1,0 +1,83 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* Design tokens — premium sóbrio, hierarquia editorial */
+:root {
+  --background: #fdfcfb;
+  --foreground: #0f172a;
+  --muted: #f8fafc;
+  --border: #e2e8f0;
+  --accent: #0f172a;
+  --accent-hover: #1e293b;
+  --focus: #6366f1;
+}
+
+* {
+  @apply border-paper-border;
+}
+
+html {
+  scroll-behavior: smooth;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  html {
+    scroll-behavior: auto;
+  }
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}
+
+body {
+  color: var(--foreground);
+  background: var(--background);
+  font-feature-settings: "rlig" 1, "calt" 1, "ss01" 1;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+/* Foco visível WCAG AA */
+*:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: 2px;
+  border-radius: 2px;
+}
+
+/* Tipografia editorial */
+.prose-editorial {
+  font-family: var(--font-newsreader), Georgia, serif;
+  letter-spacing: -0.02em;
+  line-height: 1.1;
+}
+
+/* Scrollbar sutil */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+::-webkit-scrollbar-thumb {
+  background: #cbd5e1;
+  border-radius: 999px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+/* Animação frugal */
+@keyframes fadeIn {
+  from { opacity: 0; transform: translateY(4px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+.animate-fadeIn {
+  animation: fadeIn 0.35s ease-out;
+}
+@media (prefers-reduced-motion: reduce) {
+  .animate-fadeIn { animation: none; }
+}
