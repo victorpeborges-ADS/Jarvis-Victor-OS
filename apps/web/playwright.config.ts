@@ -14,15 +14,15 @@ export default defineConfig({
   projects: [
     {
       name: "desktop",
-      use: { ...devices["Desktop Chrome"], viewport: { width: 1280, height: 800 } }
+      use: { ...devices["Desktop Chrome"], viewport: { width: 1280, height: 800 }, channel: "chrome" }
     },
     {
       name: "mobile",
-      use: { ...devices["Pixel 5"], viewport: { width: 390, height: 844 } }
+      use: { ...devices["Pixel 5"], viewport: { width: 390, height: 844 }, channel: "chrome" }
     }
   ],
   webServer: {
-    command: "./node_modules/.bin/next dev --port 3000",
+    command: "./node_modules/.bin/next start --port 3000",
     url: "http://localhost:3000",
     reuseExistingServer: !process.env.CI,
     timeout: 120 * 1000

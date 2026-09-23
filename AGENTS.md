@@ -13,13 +13,13 @@
 8. Proteger rotina real: automação não incentiva sobrecarga.
 
 ## 2. Arquitetura decidida (Gate 1)
-- **Raiz:** `/Users/vic/Freela/Jarvis:Victor OS` (não criar subdir `jarvis`). Preservar `JARVIS_Blueprint_v0.1.md` e `JARVIS_PromptPack_OpenCode_Codex_Cursor.md`.
-- **Frontend:** `apps/web` — Next.js 15 + React 19 + TypeScript 5 + Tailwind CSS 3. App Router, PWA responsiva, animação frugal. Design system em `apps/web/components/ui` + `apps/web/app/globals.css` (tokens).
+- **Raiz:** `/Users/vic/Freela/Jarvis-Victor-OS` (não criar subdir `jarvis`). Preservar `JARVIS_Blueprint_v0.1.md` e `JARVIS_PromptPack_OpenCode_Codex_Cursor.md`.
+- **Frontend:** `apps/web` — Next.js 15.5.26 + React 19.1 + TypeScript 5 + Tailwind CSS 3. App Router, PWA responsiva, animação frugal. Design system em `apps/web/components/ui` + `apps/web/app/globals.css` (tokens).
 - **Backend:** `apps/api` — FastAPI + Uvicorn + Pydantic v2. Endpoints mock em Gate 1 (sem DB persistente); SQLite só se necessário. OpenAPI tipado em `/docs`.
 - **Fixtures:** `fixtures/demo.json` — dados DEMO fictícios, sinalizados explicitamente. Única fonte de dados no Gate 1.
 - **Infra Gate 1:** sem OAuth real, sem DB externo, sem n8n, sem LLM, sem túnel, sem deploy público. Tudo mock sinalizado.
-- **Node:** global v26.7.0 (não LTS) compatível com Next.js 15 (>=18.17). Preferir LTS 22.x em produção futura via `.nvmrc` sem alterar global. Validado: `node --version` + `next --version`.
-- **Python:** 3.14.3 compatível com FastAPI 0.110+.
+- **Node:** global v26.7.0 (não LTS) compatível com Next.js 15.5.26 (>=18.17). Preferir LTS 22.x em produção futura via `.nvmrc` sem alterar global. Validado: `node --version` + `next --version`.
+- **Python:** 3.12 LTS recomendado (compatível com FastAPI/pydantic); 3.14 apresenta falhas de build pydantic-core. Validado com `python3 --version`.
 
 ## 3. Estrutura
 ```
