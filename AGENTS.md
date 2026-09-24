@@ -47,8 +47,9 @@ npm run build
 npm run lint
 npm run typecheck  # tsc --noEmit
 npm test           # vitest (se configurado)
-npx playwright test
-npx playwright test --project=mobile
+npm run e2e                 # build novo, API loopback e SQLite sintético temporário
+npm run e2e -- --project=desktop
+npm run e2e -- --project=mobile
 
 # Backend
 cd apps/api
@@ -57,6 +58,8 @@ uv sync --locked --python 3.12
 uv run --locked pytest
 uv run --locked python serve.py  # loopback; não executar uvicorn main:app
 ```
+
+O modo de integração web/API usa o mesmo hostname loopback no navegador e na API para respeitar `SameSite=Lax` (por exemplo, `localhost` nos dois ou `127.0.0.1` nos dois). O cliente recusa qualquer API fora de loopback. Para E2E, use `npm run e2e`; não rode `npx playwright test` diretamente, pois o script cria um banco descartável e inicia apenas o runner oficial da API.
 
 ## 5. Política de dados e segurança (Gate 1)
 - Apenas fixtures fictícias em `fixtures/demo.json`, marcadas `DEMO` na UI. Nenhum dado pessoal/institucional real no repo.
@@ -71,7 +74,7 @@ uv run --locked python serve.py  # loopback; não executar uvicorn main:app
 - **Gate 2.0-C.1:** tecnicamente aceito em `gate2-c1-accepted-v0.1`, no commit `2609bdb`. A base SQLite permanece separada das fixtures DEMO; sessões e concessões são voláteis.
 - **Gate 2.0-C.2:** tecnicamente aceito para backup cifrado e restauração isolada de bancos sintéticos; tag local `gate2-c2-accepted-v0.1` aponta para `c6f7ce5`. O registro da auditoria independente está em `docs/GATE2_0C_2_ACEITE.md`. A aceitação não cobre usar/restaurar o banco padrão em testes, dados pessoais/institucionais, retenção automática, Keychain, ativação ou substituição de banco.
 - **Gate 2.0-D:** tecnicamente aceito exclusivamente para Calendar simulado; tag local anotada `gate2-d-accepted-v0.1` aponta para `3175c0f`. A auditoria independente reportou 136 testes da API, 7 probes adversariais e 31 Vitest aprovados; veja `docs/GATE2_0D_ACEITE.md`. Limites: grants coordenados em um processo, GET decidido antes de revogação pode responder depois e eventos de dia inteiro ainda não são suportados.
-- **Gate 2.0-E:** autorizado para integração sintética da interface web com a API local, sujeito a nova auditoria antes de consolidação. Isso não autoriza OAuth, dados pessoais/institucionais, Google Calendar real, Gmail, Drive, LLM, acesso remoto ou deploy. Escrita externa permanece desativada.
+- **Gate 2.0-E:** implementação de integração sintética web/API em `feat/gate2.0-e-integracao-web-api`, pendente de auditoria independente; não consolidado. O cliente usa sessão e grants locais existentes, sem autenticação privilegiada automática. DEMO e API usam fontes/datasets separados. Isso não autoriza OAuth, dados pessoais/institucionais, Google Calendar real, Gmail, Drive, LLM, acesso remoto ou deploy. Escrita externa permanece desativada.
 - **Próximas etapas externas:** Calendar real, OAuth, Gmail, Drive, LLM, acesso remoto e deploy exigem autorização específica. Eventos de dia inteiro precisam de contrato aprovado antes de uma integração real.
 - **Gate 3+:** escrita só após testes de idempotência, concorrência, revogação e consentimento.
 

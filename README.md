@@ -52,10 +52,11 @@ uv run --locked python backup_cli.py restore jarvis-backup-v1-20260924T120000Z-a
 ```bash
 cd apps/web
 # npx playwright install chromium  # timeout 300s diagnosticado — usar channel chrome existente
-npx playwright test                # desktop e mobile, com build novo e servidor isolado
-npx playwright test --project=desktop
-npx playwright test --project=mobile
+npm run e2e                        # build novo, API loopback e banco sintético temporário exclusivo
+npm run e2e -- --project=desktop
+npm run e2e -- --project=mobile
 ```
+O modo API deve ser aberto com o mesmo hostname local na página e na API (`localhost`/`localhost` ou `127.0.0.1`/`127.0.0.1`), devido ao cookie `SameSite=Lax`. A URL pode ser definida por `NEXT_PUBLIC_JARVIS_API_URL`, mas o cliente só aceita loopback. O script E2E rejeita origens não locais, inicia a API por `serve.py`, passa um SQLite sintético temporário e o remove ao final.
 
 ### Capturas (6 telas × 2 viewports + estados)
 ```bash
@@ -89,4 +90,6 @@ Agora · Conversa JARVIS · Inbox · Domínios · Aprovações · Fontes/Privaci
 
 ## Gates
 
-Gate 1, Gate 2.0-B, Gate 2.0-C.1, Gate 2.0-C.2 e Gate 2.0-D estão tecnicamente aceitos, cada qual dentro do seu escopo. D cobre exclusivamente Calendar simulado e não autoriza dados pessoais/institucionais, OAuth ou Google real. A auditoria independente reportou 136 testes da API, 7 probes adversariais adicionais e 31 testes Vitest aprovados; esse resultado externo está documentado em `docs/GATE2_0D_ACEITE.md` e os probes externos não foram incorporados à suíte versionada. Riscos: coordenação de grants limitada a um processo; um GET decidido antes de revogação pode responder depois; eventos de dia inteiro não são suportados. A integração sintética da interface no Gate E está autorizada separadamente; não amplia a autorização para fontes ou dados reais.
+Gate 1, Gate 2.0-B, Gate 2.0-C.1, Gate 2.0-C.2 e Gate 2.0-D estão tecnicamente aceitos, cada qual dentro do seu escopo. D cobre exclusivamente Calendar simulado e não autoriza dados pessoais/institucionais, OAuth ou Google real. A auditoria independente reportou 136 testes da API, 7 probes adversariais adicionais e 31 testes Vitest aprovados; esse resultado externo está documentado em `docs/GATE2_0D_ACEITE.md` e os probes externos não foram incorporados à suíte versionada. Riscos: coordenação de grants limitada a um processo; um GET decidido antes de revogação pode responder depois; eventos de dia inteiro não são suportados.
+
+O Gate 2.0-E está implementado em `feat/gate2.0-e-integracao-web-api` e aguarda auditoria independente; ainda não foi aceito nem incorporado à `main`. Ele conecta a interface somente ao provider Calendar fictício e ao banco sintético local, mantém DEMO separado e não amplia autorização para OAuth, Google Calendar real, Gmail, Drive, dados pessoais/institucionais, LLM, acesso remoto ou deploy. Consulte `docs/GATE2_0E_INTEGRACAO_WEB_API.md` para limites, execução, evidências e riscos.
