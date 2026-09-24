@@ -6,8 +6,9 @@
 
 ## Política de inicialização
 
-- `apps/api/main.py` não exporta mais um objeto global `app`. A API é criada por `create_app(config: LocalServerConfig)`, que exige configuração explícita.
-- `LocalServerConfig` aceita somente `127.0.0.1` ou `::1` e valida a porta. O lifespan revalida a configuração antes de iniciar.
+- `apps/api/main.py` não exporta mais um objeto global `app`. A API é criada por `create_app(config: LocalServerConfig)`, que exige uma instância exata da configuração; objetos duck-typed e subclasses são recusados.
+- Antes de construir a aplicação e novamente no lifespan, a factory valida diretamente os tipos e valores atuais de `host` e `port` por `validate_local_server_config`. A verificação não chama `validate()` do objeto recebido. Isso detecta também adulteração via APIs de baixo nível após a criação da factory.
+- `LocalServerConfig` aceita somente os IPs literais `127.0.0.1` ou `::1` e valida a porta. O hostname `localhost` não é aceito como bind para evitar depender de resolução de nomes.
 - `python serve.py` é o único entrypoint suportado. Ele valida a configuração e passa a instância da aplicação ao Uvicorn com proxy headers desabilitados, lista de proxies confiáveis vazia e access log desligado.
 - `python -m uvicorn main:app ...` e `uvicorn.run("main:app", ...)` falham ao resolver a aplicação, antes de iniciar o listener. `uvicorn main:create_app --factory ...` falha porque a factory exige configuração.
 - A fronteira ASGI ainda confere Host, endereço do peer e endereço local da conexão em cada requisição. TestClient usa a mesma factory e configuração local, sem modo de autenticação especial para testes.
@@ -26,6 +27,10 @@ Os testes subprocess usam portas livres e abrem sockets; não simulam o transpor
 | Programa customizado cria app com config loopback e a vincula a `0.0.0.0` | Demonstra o limite da confiança: o processo arbitrário consegue abrir listener. Requisições pela interface LAN retornam 403 para DEMO, `/docs`, OpenAPI e `/real`; loopback ainda recebe as rotas locais. |
 
 O JARVIS não pode impedir que o próprio proprietário execute código Python arbitrário e abra um socket. A garantia implementada cobre o launcher oficial, as formas usuais de importação do Uvicorn e a recusa de tráfego não loopback na camada ASGI; não é uma sandbox do processo nem do usuário do sistema.
+
+### Correção pontual após auditoria independente
+
+A auditoria reproduziu que a factory aceitava um objeto falso com `validate()` inofensivo. `create_app` agora exige `type(config) is LocalServerConfig`; a validação interna verifica tipo exato, IP de loopback permitido e porta inteira válida, sem confiar em métodos do chamador. A validação repete-se no lifespan. Regressões cobrem configs válidas (`127.0.0.1` e `::1`), binds não loopback, objeto falso, subclass, campos adulterados, ausência de configuração, listener Uvicorn com objeto falso e alteração após construir a app. Um bind público customizado com configuração legítima continua barrado para peers LAN pelo middleware; isso não restringe código arbitrário do proprietário.
 
 **Proteções complementares no Mac:** manter o Firewall do macOS ativo e negar conexões de entrada para processos Python/Uvicorn; não criar regras PF, encaminhamento no roteador, túnel ou proxy reverso; limitar o uso ao usuário local e manter FileVault ativo. Essas medidas não substituem o launcher e precisam ser conferidas no host antes de qualquer dado pessoal.
 
@@ -58,15 +63,15 @@ O `uvx` mantém o scanner separado dos pacotes da aplicação; o arquivo exporta
 
 | Verificação | Resultado |
 |---|---|
-| pytest API, instalação nova com Python 3.12.14 + `uv.lock` | **39/39 PASS** |
-| Novos testes de sockets e entrypoints | **4 PASS** dentro dos 39; LAN negada ou sem listener conforme o cenário. |
+| pytest API, `uv sync --locked` com Python 3.12 | **47/47 PASS** nesta correção; dois avisos de depreciação do TestClient. |
+| Regressões da factory e inicialização, incluindo sockets reais | **14 PASS** no recorte focado; listener Uvicorn com config falsa não inicia, e peers LAN não recebem rotas no cenário customizado. |
 | `pip-audit` sobre export runtime do lock | **Nenhuma vulnerabilidade conhecida**. O scanner executou via `uvx` e não foi incluído no inventário da aplicação. |
 | Vitest | **31/31 PASS** |
 | Playwright desktop/mobile | **24/24 PASS** |
 | Typecheck, lint e build Next.js | **PASS** |
 | `npm audit` e `npm audit --omit=dev` | **0 vulnerabilidades** |
 
-O pytest informa dois avisos de depreciação em Starlette/httpx TestClient; não houve falha. As verificações frontend foram feitas em `npm ci` limpo, numa cópia temporária, sem alterações no estado original do Gate 1.
+O pytest informa avisos de depreciação em Starlette/httpx TestClient; não houve falha. Nesta correção, Vitest passou com 31 testes. O lock Python foi sincronizado em modo `--locked` e não precisou de alteração.
 
 ## Limites e pendências
 

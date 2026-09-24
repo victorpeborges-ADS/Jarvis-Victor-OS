@@ -19,7 +19,7 @@ from contract import (
 )
 from local_security import router as real_router
 from loopback import ALLOWED_ORIGINS, is_allowed_host_header, is_loopback_address
-from server_config import LocalServerConfig
+from server_config import LocalServerConfig, validate_local_server_config
 
 demo_router = APIRouter()
 
@@ -88,13 +88,13 @@ def create_app(config: LocalServerConfig) -> FastAPI:
     There is intentionally no module-level ``app`` object: standard Uvicorn
     import strings such as ``main:app`` cannot bypass the local launcher.
     """
-    config.validate()
+    validate_local_server_config(config)
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
-        # Revalidate at startup in case a nonstandard caller bypassed the
-        # dataclass constructor or mutated its internals before serving.
-        config.validate()
+        # Revalidate values at startup in case the frozen dataclass was altered
+        # through low-level Python APIs after app construction.
+        validate_local_server_config(config)
         yield
 
     app = FastAPI(

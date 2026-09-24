@@ -7,6 +7,7 @@ import sys
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import httpx
@@ -177,6 +178,55 @@ def test_allowed_hosts_and_ipv6_origin_are_explicit():
     for host in ("0.0.0.0", "::", "192.168.1.2"):
         with pytest.raises(RuntimeError):
             assert_bind_host(host)
+
+
+@pytest.mark.parametrize("host", ["127.0.0.1", "::1"])
+def test_factory_accepts_exact_valid_loopback_configuration(host):
+    app = create_app(LocalServerConfig(host=host, port=8123))
+    assert app.title == "JARVIS API — Gate 1 mock"
+
+
+@pytest.mark.parametrize("host", ["0.0.0.0", "::", "192.168.1.25"])
+def test_local_config_rejects_non_loopback_bind_addresses(host):
+    with pytest.raises(RuntimeError):
+        LocalServerConfig(host=host)
+
+
+def test_factory_rejects_missing_fake_subclass_and_corrupted_config():
+    with pytest.raises(TypeError):
+        create_app()
+    with pytest.raises(TypeError, match="instância exata"):
+        create_app(SimpleNamespace(host="127.0.0.1", port=8000, validate=lambda: None))
+
+    class ExtendedConfig(LocalServerConfig):
+        pass
+
+    extended = object.__new__(ExtendedConfig)
+    object.__setattr__(extended, "host", "127.0.0.1")
+    object.__setattr__(extended, "port", 8000)
+    with pytest.raises(TypeError, match="instância exata"):
+        create_app(extended)
+
+    corrupted = object.__new__(LocalServerConfig)
+    object.__setattr__(corrupted, "host", "0.0.0.0")
+    object.__setattr__(corrupted, "port", 8000)
+    with pytest.raises(RuntimeError):
+        create_app(corrupted)
+
+    corrupted_port = object.__new__(LocalServerConfig)
+    object.__setattr__(corrupted_port, "host", "127.0.0.1")
+    object.__setattr__(corrupted_port, "port", True)
+    with pytest.raises(ValueError, match="porta"):
+        create_app(corrupted_port)
+
+
+def test_factory_revalidates_configuration_at_lifespan_startup():
+    config = LocalServerConfig()
+    app = create_app(config)
+    object.__setattr__(config, "host", "0.0.0.0")
+    with pytest.raises(RuntimeError):
+        with TestClient(app):
+            pytest.fail("a aplicação não deveria iniciar com configuração adulterada")
 
 
 def test_grants_are_canonical_expiring_and_resource_scoped(client):
@@ -420,6 +470,26 @@ def test_uvicorn_factory_without_local_configuration_fails_before_listening():
     )
     assert result.returncode != 0
     assert "config" in result.stderr
+    assert not _port_accepts("127.0.0.1", port)
+
+
+def test_fake_configuration_cannot_start_a_public_uvicorn_listener():
+    port = _free_port()
+    command = (
+        "from types import SimpleNamespace; import uvicorn; from main import create_app; "
+        "fake=SimpleNamespace(host='127.0.0.1', port=8000, validate=lambda: None); "
+        f"uvicorn.run(create_app(fake), host='0.0.0.0', port={port}, log_level='critical')"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", command],
+        cwd=Path(__file__).parent,
+        env={**os.environ, "JARVIS_LOCAL_PASSPHRASE": PASSPHRASE},
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    assert result.returncode != 0
+    assert "instância exata de LocalServerConfig" in result.stderr
     assert not _port_accepts("127.0.0.1", port)
 
 
