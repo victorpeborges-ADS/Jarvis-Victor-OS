@@ -51,3 +51,30 @@ Avisos não bloqueantes observados: aviso de depreciação do `TestClient`/httpx
 ## Próximo passo
 
 Parar para auditoria independente do Gate 2.0-C.1.1. Este incremento não autoriza C.2, backup/restauração, OAuth, conectores reais, LLM ou acesso remoto.
+
+## Correção C.1.2 — comparação segura do DDL
+
+### Causa identificada na auditoria independente
+
+A comparação anterior aplicava casefold() ao DDL inteiro do sqlite_master. Isso também alterava literais SQL entre aspas. Um CHECK (outcome = 'success') podia, portanto, ser considerado igual a CHECK (outcome = 'SUCCESS'); com a tabela vazia, a inicialização passava e uma gravação posterior falhava.
+
+### Solução
+
+- A comparação agora tokeniza o DDL. Normaliza somente caixa de um conjunto explícito de palavras-chave SQL, espaços entre tokens e comentários completos.
+- Literais string, identificadores entre aspas, números, operadores e símbolos mantêm seus tokens originais. Aspas simples escapadas, identificadores entre aspas duplas, crases e colchetes, além de comentários de linha/bloco, são tratados lexicalmente; não há regex para separar conteúdo entre aspas.
+- Se a tokenização encontrar uma construção incompleta ou não confiável, a comparação usa o SQL original exato. Assim, a normalização não tenta adivinhar semântica.
+- A definição SQL continua sendo comparada junto das assinaturas table_xinfo, index_list/index_xinfo e foreign_key_list. Divergência produz erro genérico na inicialização; nenhum esquema é reconstruído.
+
+### Regressões e resultados
+
+- O CHECK de auditoria com apenas 'source_write'/'success' alterados para maiúsculas é rejeitado durante a inicialização. O teste também confirma que o SQL adulterado continua no banco após a falha e que o erro não contém caminho ou conteúdo.
+- CHECK removido, índice obrigatório recriado com o mesmo nome mas outra coluna, coluna obrigatória ausente, tabela/índice ausentes e tipo incompatível falham fechados.
+- Espaços, comentário completo e caixa de palavras-chave fora de literais são aceitos; literais com aspas simples escapadas e texto que parece comentário, identificadores delimitados e comentários incompletos são cobertos pelo teste lexical. record_audit() funciona após inicialização válida, inclusive depois de alteração cosmética comprovadamente equivalente.
+- Migrações 0001→0002→0003, inicialização repetida, rollback de migração interrompida, colisão entre fontes, idempotência, concorrência e isolamento dos oito domínios permanecem cobertos.
+- uv sync --locked --python 3.12 com Python 3.12.14; uv run --locked pytest -q: **84 passed**.
+- Instalação limpa npm ci e npm test -- --run: **31 passed** em 6 arquivos. Nenhum componente frontend foi alterado.
+- npm audit e npm audit --omit=dev: **0 vulnerabilidades**; pip-audit sobre o ambiente Python travado: **No known vulnerabilities found**.
+
+O npm informou que quatro scripts de instalação de pacotes não estavam aprovados e avisou sobre versões depreciadas; Vitest passou. Não existe ainda fluxo de integração da interface com /real, portanto smoke UI/API não é aplicável nesta etapa. Os testes da aplicação FastAPI com TestClient cobrem inicialização e rotas reais.
+
+Esta correção requer nova auditoria independente antes do encerramento do C.1.1 ou início do C.2. Nenhum backup, restauração, dado pessoal, OAuth ou conector foi adicionado.
