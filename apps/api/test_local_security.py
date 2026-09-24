@@ -1,11 +1,15 @@
 import json
+import ipaddress
 import os
+import socket
 import subprocess
 import sys
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
+import httpx
 from fastapi.testclient import TestClient
 
 import local_security
@@ -18,7 +22,8 @@ from local_security import (
     reset_state,
 )
 from loopback import ALLOWED_ORIGINS, assert_bind_host
-from main import app
+from main import create_app
+from server_config import LocalServerConfig
 
 PASSPHRASE = "frase-local-de-ensaio"
 DEMO_IDS = {
@@ -31,7 +36,7 @@ RESOURCE = "calendar:synthetic-primary"
 
 @pytest.fixture
 def client():
-    return TestClient(app, base_url="http://127.0.0.1", client=("127.0.0.1", 51000))
+    return TestClient(create_app(LocalServerConfig()), base_url="http://127.0.0.1", client=("127.0.0.1", 51000))
 
 
 @pytest.fixture(autouse=True)
@@ -89,7 +94,7 @@ def test_cookie_flags_entropy_expiry_and_no_store(client):
 
 
 def test_secure_cookie_is_set_on_https():
-    secure_client = TestClient(app, base_url="https://127.0.0.1", client=("127.0.0.1", 51000))
+    secure_client = TestClient(create_app(LocalServerConfig()), base_url="https://127.0.0.1", client=("127.0.0.1", 51000))
     response = login(secure_client)
     assert response.status_code == 201
     assert "Secure" in response.headers["set-cookie"]
@@ -117,8 +122,8 @@ def test_absent_tampered_expired_logout_and_restarted_sessions_fail_closed(clien
     previous_token = client.cookies.get("jarvis_session")
     child_env = {**os.environ, "JARVIS_LOCAL_PASSPHRASE": PASSPHRASE, "OLD_SESSION_TOKEN": previous_token}
     child_code = (
-        "from fastapi.testclient import TestClient; from main import app; import os; "
-        "c=TestClient(app,base_url='http://127.0.0.1',client=('127.0.0.1',51001)); "
+        "from fastapi.testclient import TestClient; from main import create_app; from server_config import LocalServerConfig; import os; "
+        "c=TestClient(create_app(LocalServerConfig()),base_url='http://127.0.0.1',client=('127.0.0.1',51001)); "
         "c.cookies.set('jarvis_session',os.environ['OLD_SESSION_TOKEN']); print(c.get('/real/briefing').status_code)"
     )
     result = subprocess.run([sys.executable, "-c", child_code], cwd=Path(__file__).parent, env=child_env, capture_output=True, text=True, check=True)
@@ -151,14 +156,14 @@ def test_host_external_dns_rebinding_and_public_server_scope_are_rejected(client
     assert client.get("/real/events", headers={"host": "evil.example", "origin": "http://127.0.0.1:3000"}).status_code == 400
     assert client.get("/real/events", headers={"origin": "https://evil.example"}).status_code == 403
     # Host permitido não basta se a app recebeu tráfego por interface pública.
-    public_client = TestClient(app, base_url="http://203.0.113.10", client=("203.0.113.10", 51000))
+    public_client = TestClient(create_app(LocalServerConfig()), base_url="http://203.0.113.10", client=("203.0.113.10", 51000))
     assert public_client.get("/events", headers={"host": "127.0.0.1"}).status_code == 403
     assert public_client.get("/docs", headers={"host": "127.0.0.1"}).status_code == 403
     assert public_client.get("/openapi.json", headers={"host": "127.0.0.1"}).status_code == 403
 
 
 def test_demo_docs_and_openapi_are_not_served_on_non_loopback_scope(client):
-    public_client = TestClient(app, base_url="http://198.51.100.7", client=("198.51.100.7", 51000))
+    public_client = TestClient(create_app(LocalServerConfig()), base_url="http://198.51.100.7", client=("198.51.100.7", 51000))
     for route in ("/health", "/briefing", "/events", "/sources", "/inbox", "/domains", "/proposals", "/approvals", "/docs", "/openapi.json", "/real/session"):
         response = public_client.get(route, headers={"host": "localhost"})
         assert response.status_code == 403, (route, response.status_code)
@@ -326,8 +331,8 @@ def test_login_rate_limit_recovers_after_window(client, monkeypatch):
 def test_rate_limit_recovers_after_process_restart():
     env = {**os.environ, "JARVIS_LOCAL_PASSPHRASE": PASSPHRASE}
     limited = (
-        "from fastapi.testclient import TestClient; from main import app; "
-        "c=TestClient(app,base_url='http://127.0.0.1',client=('127.0.0.1',51002)); "
+        "from fastapi.testclient import TestClient; from main import create_app; from server_config import LocalServerConfig; "
+        "c=TestClient(create_app(LocalServerConfig()),base_url='http://127.0.0.1',client=('127.0.0.1',51002)); "
         "h={'origin':'http://127.0.0.1:3000'}; "
         "[c.post('/real/session',json={'passphrase':'senha-errada-comprida'},headers=h) for _ in range(8)]; "
         "print(c.post('/real/session',json={'passphrase':'frase-local-de-ensaio'},headers=h).status_code)"
@@ -335,8 +340,8 @@ def test_rate_limit_recovers_after_process_restart():
     result = subprocess.run([sys.executable, "-c", limited], cwd=Path(__file__).parent, env=env, capture_output=True, text=True, check=True)
     assert result.stdout.strip().endswith("429")
     fresh_process = (
-        "from fastapi.testclient import TestClient; from main import app; "
-        "c=TestClient(app,base_url='http://127.0.0.1',client=('127.0.0.1',51003)); "
+        "from fastapi.testclient import TestClient; from main import create_app; from server_config import LocalServerConfig; "
+        "c=TestClient(create_app(LocalServerConfig()),base_url='http://127.0.0.1',client=('127.0.0.1',51003)); "
         "print(c.post('/real/session',json={'passphrase':'frase-local-de-ensaio'},headers={'origin':'http://127.0.0.1:3000'}).status_code)"
     )
     restarted = subprocess.run([sys.executable, "-c", fresh_process], cwd=Path(__file__).parent, env=env, capture_output=True, text=True, check=True)
@@ -365,8 +370,9 @@ def test_supported_entrypoint_rejects_public_bind_before_uvicorn(monkeypatch):
 
 
 def test_direct_uvicorn_cli_refuses_to_start_without_guarded_runner():
+    port = _free_port()
     result = subprocess.run(
-        [sys.executable, "-m", "uvicorn", "main:app", "--host", "0.0.0.0", "--port", "18761"],
+        [sys.executable, "-m", "uvicorn", "main:app", "--host", "0.0.0.0", "--port", str(port)],
         cwd=Path(__file__).parent,
         env={**os.environ, "JARVIS_LOCAL_PASSPHRASE": PASSPHRASE},
         capture_output=True,
@@ -374,4 +380,150 @@ def test_direct_uvicorn_cli_refuses_to_start_without_guarded_runner():
         timeout=10,
     )
     assert result.returncode != 0
-    assert "use python serve.py" in result.stderr
+    assert not _port_accepts("127.0.0.1", port)
+
+
+def test_programmatic_uvicorn_import_string_refuses_to_start_before_listening():
+    port = _free_port()
+    command = (
+        "import uvicorn; "
+        f"uvicorn.run('main:app', host='0.0.0.0', port={port}, log_level='critical')"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", command],
+        cwd=Path(__file__).parent,
+        env={**os.environ, "JARVIS_LOCAL_PASSPHRASE": PASSPHRASE},
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    assert result.returncode != 0
+    assert not _port_accepts("127.0.0.1", port)
+
+
+def test_uvicorn_factory_without_local_configuration_fails_before_listening():
+    port = _free_port()
+    result = subprocess.run(
+        [sys.executable, "-m", "uvicorn", "main:create_app", "--factory", "--host", "0.0.0.0", "--port", str(port)],
+        cwd=Path(__file__).parent,
+        env={**os.environ, "JARVIS_LOCAL_PASSPHRASE": PASSPHRASE},
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    assert result.returncode != 0
+    assert "config" in result.stderr
+    assert not _port_accepts("127.0.0.1", port)
+
+
+def test_real_socket_supported_runner_is_loopback_only_and_serves_expected_routes():
+    port = _free_port()
+    env = {
+        **os.environ,
+        "JARVIS_LOCAL_PASSPHRASE": PASSPHRASE,
+        "JARVIS_BIND_HOST": "127.0.0.1",
+        "JARVIS_BIND_PORT": str(port),
+    }
+    process = subprocess.Popen(
+        [sys.executable, "serve.py"],
+        cwd=Path(__file__).parent,
+        env=env,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    try:
+        client = _wait_for_http_server(process, port)
+        for route in ("/health", "/events", "/docs", "/openapi.json"):
+            assert client.get(route).status_code == 200, route
+        assert client.get("/real/events").status_code == 401
+        lan_address = _lan_ipv4()
+        if lan_address:
+            with pytest.raises(httpx.ConnectError):
+                httpx.get(f"http://{lan_address}:{port}/health", timeout=0.5)
+    finally:
+        process.terminate()
+        process.wait(timeout=5)
+
+
+def test_real_socket_non_loopback_scope_denies_demo_docs_openapi_and_real_routes():
+    port = _free_port()
+    env = {**os.environ, "JARVIS_LOCAL_PASSPHRASE": PASSPHRASE}
+    command = (
+        "import uvicorn; from main import create_app; from server_config import LocalServerConfig; "
+        f"uvicorn.run(create_app(LocalServerConfig()), host='0.0.0.0', port={port}, "
+        "proxy_headers=False, access_log=False, log_level='critical')"
+    )
+    process = subprocess.Popen(
+        [sys.executable, "-c", command],
+        cwd=Path(__file__).parent,
+        env=env,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    try:
+        client = _wait_for_http_server(process, port)
+        assert client.get("/health").status_code == 200
+        assert client.get("/events").status_code == 200
+        assert client.get("/docs").status_code == 200
+        assert client.get("/openapi.json").status_code == 200
+        assert client.get("/real/events").status_code == 401
+        lan_address = _lan_ipv4()
+        if not lan_address:
+            pytest.skip("nenhum endereço IPv4 LAN detectado para probe de socket")
+        for route in ("/health", "/events", "/docs", "/openapi.json", "/real/events"):
+            response = httpx.get(
+                f"http://{lan_address}:{port}{route}",
+                headers={"host": f"localhost:{port}", "x-forwarded-for": "127.0.0.1"},
+                timeout=2,
+            )
+            assert response.status_code == 403, (route, response.status_code)
+    finally:
+        process.terminate()
+        process.wait(timeout=5)
+
+
+def _free_port() -> int:
+    with socket.socket() as listener:
+        listener.bind(("127.0.0.1", 0))
+        return listener.getsockname()[1]
+
+
+def _port_accepts(host: str, port: int) -> bool:
+    with socket.socket() as client:
+        client.settimeout(0.2)
+        return client.connect_ex((host, port)) == 0
+
+
+def _wait_for_http_server(process: subprocess.Popen, port: int) -> httpx.Client:
+    deadline = time.monotonic() + 8
+    client = httpx.Client(base_url=f"http://127.0.0.1:{port}", timeout=1)
+    while time.monotonic() < deadline:
+        if process.poll() is not None:
+            raise AssertionError(f"servidor encerrou durante startup: {process.returncode}")
+        try:
+            response = client.get("/health")
+            if response.status_code == 200:
+                return client
+        except httpx.HTTPError:
+            time.sleep(0.05)
+    client.close()
+    raise AssertionError("servidor não iniciou em loopback")
+
+
+def _lan_ipv4() -> str | None:
+    if sys.platform == "darwin":
+        try:
+            result = subprocess.run(["ipconfig", "getifaddr", "en0"], capture_output=True, text=True, check=True)
+            address = result.stdout.strip()
+            if address and not ipaddress.ip_address(address).is_loopback:
+                return address
+        except (OSError, subprocess.CalledProcessError, ValueError):
+            pass
+    try:
+        for result in socket.getaddrinfo(socket.gethostname(), None, family=socket.AF_INET):
+            address = result[4][0]
+            if not ipaddress.ip_address(address).is_loopback:
+                return address
+    except OSError:
+        pass
+    return None

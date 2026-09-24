@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import ipaddress
-import sys
 from urllib.parse import urlsplit
 
 LOOPBACK_BIND_HOSTS = frozenset({"127.0.0.1", "::1"})
@@ -15,7 +14,6 @@ ALLOWED_ORIGINS = frozenset(
         "http://[::1]:3000",
     }
 )
-_SAFE_RUNNER_ACTIVE = False
 
 
 def is_loopback_address(value: str | None) -> bool:
@@ -57,15 +55,3 @@ def assert_bind_host(host: str) -> str:
         raise RuntimeError("bind não local recusado")
     return host
 
-
-def activate_supported_runner() -> None:
-    global _SAFE_RUNNER_ACTIVE
-    _SAFE_RUNNER_ACTIVE = True
-
-
-def reject_direct_uvicorn_cli(argv0: str | None = None) -> None:
-    """Only the guarded serve.py may use the Uvicorn CLI/import target."""
-    executable = (argv0 or sys.argv[0]).lower()
-    is_uvicorn_cli = "uvicorn" in executable
-    if is_uvicorn_cli and not _SAFE_RUNNER_ACTIVE:
-        raise RuntimeError("inicialização direta por Uvicorn recusada; use python serve.py")
