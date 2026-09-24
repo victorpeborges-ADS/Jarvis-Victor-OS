@@ -1,8 +1,8 @@
 # JARVIS — Victor OS + Victor Context Hub
 
-Gate 1 tecnicamente aceito em `gate1-accepted-v0.1`. Gate 2.0-B foi aceito e consolidado em `gate2-b-accepted-v0.1`. A branch `feat/gate2.0-c1-memoria` implementa a memória local C.1, ainda em auditoria.
+Gate 1 tecnicamente aceito em `gate1-accepted-v0.1`. Gate 2.0-B foi aceito em `gate2-b-accepted-v0.1`. Gate 2.0-C.1 foi tecnicamente aceito em `gate2-c1-accepted-v0.1`; a branch `feat/gate2.0-c2-backup-recovery` trata somente backup cifrado e restauração local com bancos sintéticos.
 
-> **Estado dos dados:** A interface Gate 1 continua usando exclusivamente fixtures DEMO. A API C.1 dispõe de armazenamento SQLite local separado, inicialmente vazio; registros sintéticos aparecem apenas em bancos temporários de teste. Não há integração com Google Calendar/Gmail/Drive nem importação de fixtures.
+> **Estado dos dados:** A interface Gate 1 continua usando exclusivamente fixtures DEMO. A API C.1 dispõe de SQLite local separado; C.2 está limitado a backup/restauração com dados sintéticos em diretórios descartáveis. Não há integração com Google Calendar/Gmail/Drive nem importação de fixtures.
 
 **Raiz:** `/Users/vic/Freela/Jarvis-Victor-OS`. Aceite técnico registrado a partir de `feat/gate1.3.2-a11y` @ `de1e26b`, com a correção pontual de contraste no cartão selecionado.
 
@@ -77,4 +77,4 @@ Agora · Conversa JARVIS · Inbox · Domínios · Aprovações · Fontes/Privaci
 
 ## Gates
 
-Gate 1 permanece tecnicamente aceito. C.1 autoriza apenas a fundação SQLite local vazia e dados sintéticos em testes temporários. OAuth, fontes reais, backup cifrado, LLM, acesso remoto e deploy seguem fora do escopo e exigem nova autorização. Ver `docs/GATE2_0B_2_HARDENING.md`, `docs/GATE2_0C_1_MEMORIA.md` e `AGENTS.md`.
+Gate 1, Gate 2.0-B e Gate 2.0-C.1 estão tecnicamente aceitos. A autorização atual cobre exclusivamente backup cifrado e restauração isolada com bancos sintéticos; não cobre importar fixtures, usar/restaurar o banco padrão, dados reais, OAuth, conectores, LLM, acesso remoto ou deploy. Consulte `docs/GATE2_0C_1_1_INTEGRIDADE.md`, `docs/GATE2_0C_2_BACKUP_RECOVERY.md` e `AGENTS.md`.

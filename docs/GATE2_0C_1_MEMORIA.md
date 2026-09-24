@@ -1,6 +1,6 @@
 # Gate 2.0-C.1 — Memória local
 
-**Estado:** implementação na branch `feat/gate2.0-c1-memoria`, aguardando auditoria independente.
+**Estado:** tecnicamente aceito em `gate2-c1-accepted-v0.1` após auditoria independente da correção C.1.2.
 **Base:** `main` @ `b45fbb43` (`gate2-b-accepted-v0.1`).
 **Limite:** memória local vazia e testes com conteúdo exclusivamente sintético. Sem conexão de fontes externas.
 
@@ -35,7 +35,7 @@ JARVIS_LOCAL_PASSPHRASE='defina-uma-frase-local' uv run --locked python serve.py
 
 O runner oficial continua limitado a loopback conforme Gate 2.0-B. Não execute Uvicorn diretamente. A UI Gate 1 ainda não consome a API real; ela segue em modo DEMO.
 
-## Verificações desta entrega
+## Verificações da implementação
 
 - API: `uv sync --locked --python 3.12`; `uv run --locked pytest -q` — **68 passaram**.
 - Frontend: `npm run build`, `npm run typecheck`, `npm run lint` e `npm test -- --run` — **31 testes Vitest passaram**.
@@ -54,3 +54,5 @@ Os testes incluem banco vazio e migração repetida, rollback de migração e tr
 - O passphrase permanece configurado localmente pelo mecanismo existente. HTTP local não oferece as propriedades de transporte de HTTPS contra processos locais comprometidos.
 - Os identificadores de domínio nesta fundação são somente sintéticos. O mapeamento e a autorização para qualquer domínio/dado real continuam bloqueados até revisão e aceite próprios.
 - Nenhum resultado desta etapa autoriza OAuth, dados reais, Google Calendar, Gmail, Drive, LLM, backup cifrado, acesso remoto ou deploy.
+
+O aceite independente e a separação entre os resultados reportados pela implementação (OpenCode) e as verificações repetidas pelo Codex estão registrados em [`docs/GATE2_0C_1_1_INTEGRIDADE.md`](GATE2_0C_1_1_INTEGRIDADE.md). O aceite do C.1 não, por si só, autoriza dados reais ou conectores; o C.2 recebeu autorização separada e limitada.

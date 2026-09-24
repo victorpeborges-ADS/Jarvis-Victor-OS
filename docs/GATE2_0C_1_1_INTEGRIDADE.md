@@ -77,4 +77,24 @@ A comparação anterior aplicava casefold() ao DDL inteiro do sqlite_master. Iss
 
 O npm informou que quatro scripts de instalação de pacotes não estavam aprovados e avisou sobre versões depreciadas; Vitest passou. Não existe ainda fluxo de integração da interface com /real, portanto smoke UI/API não é aplicável nesta etapa. Os testes da aplicação FastAPI com TestClient cobrem inicialização e rotas reais.
 
-Esta correção requer nova auditoria independente antes do encerramento do C.1.1 ou início do C.2. Nenhum backup, restauração, dado pessoal, OAuth ou conector foi adicionado.
+## Encerramento técnico do C.1 — auditoria independente
+
+**Resultado:** aceito tecnicamente em `gate2-c1-accepted-v0.1`, apontada ao commit aprovado `2609bdb9ea511c83b45b464d9d1214638f452196`. A consolidação em `main` foi fast-forward; os tags `gate1-accepted-v0.1` e `gate2-b-accepted-v0.1` foram preservados. Este registro não altera os resultados das etapas anteriores.
+
+### Evidências da implementação (OpenCode, conforme handoff)
+
+- `uv sync --locked --python 3.12` e `uv run --locked pytest -q`: 84 testes da API passaram.
+- Instalação limpa do frontend e Vitest: 31 testes passaram em 6 arquivos.
+- `npm audit`, `npm audit --omit=dev` e `pip-audit`: sem vulnerabilidades conhecidas.
+- Os testes versionados incluem as regressões estruturais, de migração, identidade, idempotência, concorrência e isolamento descritas acima.
+
+### Verificações independentes do Codex
+
+- A auditoria foi executada numa cópia temporária; o repositório original permaneceu limpo e o banco padrão não foi inicializado.
+- No snapshot de `4d67c5f`, reproduziu-se a falha original: o DDL com literal `'SUCCESS'` foi aceito por `initialize()` e `record_audit()` falhou depois com `IntegrityError`.
+- Na versão aprovada, o mesmo banco adulterado foi rejeitado. O DDL e as linhas das tabelas foram comparados antes/depois da rejeição e permaneceram intactos; não houve reparo automático.
+- Probes independentes rejeitaram CHECK removido/alterado, literal com capitalização diferente e índice com definição incompatível. Alterações cosméticas seguras passaram e a escrita de auditoria continuou funcional.
+- `uv sync --locked --python 3.12`; pytest: 84 passed. Vitest: 31 passed. Os dois npm audits e `pip-audit` passaram. Dois avisos de depreciação no TestClient/cookies e avisos de instalação npm não bloquearam os testes.
+- Além da suíte, dois objetos `SQLiteMemoryStore` concorrendo na mesma identidade externa produziram apenas um evento e uma proveniência. Esses probes exploratórios não foram adicionados à suíte versionada.
+
+O aceite encerra somente a memória C.1. O C.2 autorizado em seguida limita-se a backup cifrado e restauração local isolada com bancos sintéticos descartáveis. Não autoriza retenção automática, armazenamento de chaves, substituição de banco ativo, dados pessoais/institucionais, OAuth, conectores reais, LLM, acesso remoto ou deploy.

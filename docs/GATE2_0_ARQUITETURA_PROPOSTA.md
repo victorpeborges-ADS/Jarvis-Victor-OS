@@ -1,11 +1,11 @@
 # Gate 2.0 — Proposta de arquitetura
 
-**Estado:** referência arquitetural aprovada. A fundação B foi aceita; C.1 está em implementação na branch dedicada.
+**Estado:** referência arquitetural aprovada. A fundação B e o C.1 foram tecnicamente aceitos; C.2 foi autorizado em branch dedicada apenas para backup cifrado e recuperação com dados sintéticos.
 **Base original da proposta:** `main` @ `ef5d3cd`, tag `gate1-accepted-v0.1`. A aprovação e consolidação B estão registradas em `docs/GATE2_0B_2_HARDENING.md`.
 **Data:** 23/09/2026.  
-**Restrição:** qualquer implementação depende de aceite explícito e delimitado. O aceite posterior cobre apenas C.1, conforme a nota abaixo; não cobre dados reais, OAuth ou conectores.
+**Restrição:** qualquer implementação depende de aceite explícito e delimitado. C.1 está aceito; o aceite separado do C.2 cobre apenas backup cifrado e restauração isolada com bancos sintéticos, não dados reais, OAuth ou conectores.
 
-> O aceite posterior autorizou apenas C.1 (SQLite local vazio e testes sintéticos temporários). Essa autorização delimitada não substitui os aceites específicos pendentes para dados reais, backup cifrado, OAuth ou conectores.
+> C.1 autorizou a memória local vazia e testes sintéticos. A autorização atual do C.2 é limitada a backup/restauração sintéticos em diretório isolado; retenção automática, persistência de chaves, substituição de base ativa, dados pessoais, OAuth ou conectores continuam pendentes de decisões e aceites próprios.
 
 O Blueprint descreve o Gate 2 como Calendar e Gmail somente leitura. Esta proposta estreita a primeira conexão real para **uma conta pessoal do Google Calendar, somente leitura**. Gmail, Drive e conversa com modelo ficam como contratos, não como entrega.
 
