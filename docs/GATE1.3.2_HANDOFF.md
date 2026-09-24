@@ -29,3 +29,7 @@ Capturas em `docs/screenshots/a11y/`: drawer e foco, desktop e mobile.
 - O anel de foco `#6366f1` passa de 3:1 como componente, não foi medido em todos os fundos.
 - `TestClient` continua avisando a futura troca para `httpx2`.
 - Gate 2 não foi iniciado.
+
+## Encerramento
+
+O aceite técnico do Gate 1 foi confirmado. Depois dele, o impacto da alternativa selecionada em Aprovações deixou de usar `#64748b` sobre o fundo real `#f8f8f9` (4,48:1) e passou a usar `#5c6a78` (5,22:1). O registro do encerramento está em `docs/GATE1_ENCERRAMENTO.md`.

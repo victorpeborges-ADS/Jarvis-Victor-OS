@@ -1,4 +1,5 @@
 import type { Config } from "tailwindcss";
+import { SELECTED_CARD_TEXT } from "./lib/contrast-tokens";
 
 const config: Config = {
   content: [
@@ -13,7 +14,8 @@ const config: Config = {
           DEFAULT: "#0f172a",
           muted: "#475569",
           subtle: "#64748b",
-          faint: "#6a7380"
+          faint: "#6a7380",
+          onSelected: SELECTED_CARD_TEXT
         },
         paper: {
           DEFAULT: "#fdfcfb",

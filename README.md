@@ -1,15 +1,17 @@
 # JARVIS — Victor OS + Victor Context Hub
 
-Protótipo Gate 1.1 — estabilização com dados DEMO fictícios. Gate 2 continua proibido.
+Gate 1 tecnicamente aceito em `gate1-accepted-v0.1`. O protótipo usa apenas dados DEMO. Gate 2 continua proibido.
 
 > **Aviso:** Todos os dados exibidos são fictícios e sinalizados como `DEMO` (badges, stale, proveniência). Nenhuma integração real com Google Calendar/Gmail/Drive ativa neste Gate.
 
-**Raiz:** `/Users/vic/Freela/Jarvis-Victor-OS` (renomeada de `Jarvis:Victor OS` para remover `:` que quebrava `PATH`/`venv`/`Vite`). Branch: `estabilizacao/gate1.1` a partir de `6d44099`.
+**Raiz:** `/Users/vic/Freela/Jarvis-Victor-OS`. Aceite técnico registrado a partir de `feat/gate1.3.2-a11y` @ `de1e26b`, com a correção pontual de contraste no cartão selecionado.
 
-## Stack (Gate 1.1)
-- Frontend: Next.js **15.5.26** (patch CVE-2025-66478 de 22/09/2026) + React 19.1.1 + TypeScript 5.8.3 + Tailwind 3.4.17
-- Backend: FastAPI 0.110 + Python 3.14 (venv em `apps/api/.venv` agora funciona; pydantic-core requer 3.12 para build, ver Riscos)
-- Testes: Vitest 3.2.7 + Playwright 1.55.1 (channel `chrome`) + pytest
+## Stack aceita no Gate 1
+- Frontend: Next.js **15.5.26** + React 19.1.1 + TypeScript 5.8.3 + Tailwind 3.4.17
+- Backend: FastAPI **0.141.1** + Starlette **1.7.0** + Python **3.12**
+- Testes versionados: Vitest 5.0.1 + Playwright 1.55.1 (`channel: chrome`, build novo na porta 3013) + pytest 9
+
+A auditoria independente relatou, fora desta suíte versionada, 34 testes Vitest e uma passagem adicional de Playwright com axe. Esses testes não foram incorporados ao repositório.
 
 ## Como executar (sem cópias para /tmp)
 
@@ -22,23 +24,23 @@ npm run build      # produção
 npm run start      # http://localhost:3000 (produção, usado por Playwright)
 npm run lint
 npm run typecheck  # tsc --noEmit (globals vitest)
-npm test           # vitest run — 8 PASS direto na nova pasta
+npm test           # vitest run
 ```
 
 ### Backend (apps/api)
 ```bash
 cd apps/api
-python3 -m venv .venv && source .venv/bin/activate
-pip install -r requirements.txt  # em Python 3.14 falha build pydantic-core (maturin) — usar Python 3.12 ou binary
+uv venv --python 3.12 .venv && source .venv/bin/activate
+uv pip install -r requirements.txt
 uvicorn main:app --reload --port 8000  # http://localhost:8000/docs
-pytest -q          # 4 PASS via global (venv pip BLOCKED em 3.14)
+pytest -q
 ```
 
 ### Playwright (apps/web)
 ```bash
 cd apps/web
 # npx playwright install chromium  # timeout 300s diagnosticado — usar channel chrome existente
-npx playwright test                # 10 PASS (5 cenários × desktop/mobile) via next start + channel chrome
+npx playwright test                # desktop e mobile, com build novo e servidor isolado
 npx playwright test --project=desktop
 npx playwright test --project=mobile
 ```
@@ -72,4 +74,4 @@ Agora · Conversa JARVIS · Inbox · Domínios · Aprovações · Fontes/Privaci
 
 ## Gates
 
-Gate 1 = mocks sinalizados. Gate 2 = readonly real (requer aprovação). Ver `AGENTS.md`.
+Gate 1 está tecnicamente aceito e permanece em mocks sinalizados. Gate 2, OAuth e qualquer fonte real continuam proibidos até nova autorização. Ver `docs/GATE1_ENCERRAMENTO.md` e `AGENTS.md`.

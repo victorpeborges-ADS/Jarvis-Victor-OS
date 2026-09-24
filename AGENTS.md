@@ -65,8 +65,8 @@ pytest
 - Logs sem PII. Auditoria local apenas por nomes de variáveis quando necessário (Gate 2).
 
 ## 6. Gates de ações
-- **Gate 1 (atual):** somente mocks sinalizados. Nenhuma escrita externa. Aprovação humana obrigatória para qualquer ação que toque Google/produção.
-- **Gate 2:** readonly Calendar/Gmail com OAuth menor privilégio, conta pessoal autorizada apenas. Escrita permanece DESATIVADA.
+- **Gate 1 (tecnicamente aceito):** somente mocks sinalizados. Nenhuma escrita externa. Tag `gate1-accepted-v0.1`. Aprovação humana continua obrigatória para qualquer ação que toque Google ou produção.
+- **Gate 2 (não iniciado):** readonly Calendar/Gmail com OAuth menor privilégio, conta pessoal autorizada apenas. Escrita permanece DESATIVADA. Não começar sem nova autorização.
 - **Gate 3+:** escrita só após testes de idempotência, concorrência, revogação e consentimento.
 
 ## 7. Convenções
@@ -78,12 +78,12 @@ pytest
 - **Design:** premium sóbrio, hierarquia editorial, uma cor de ação, espaço em branco, animações funcionais. Nunca cockpit com 8 painéis.
 
 ## 8. Definition of Done (Gate 1)
-- [ ] 6 áreas navegáveis: Agora, Conversa JARVIS, Inbox, Domínios, Aprovações, Fontes/Privacidade
-- [ ] 3 jornadas E2E com fixtures coerentes e testes Playwright passando (desktop + mobile)
-- [ ] Design system + responsividade + estados loading/empty/error/stale/mock visíveis
-- [ ] Keyboard nav, foco visível, reduced motion, contraste AA
-- [ ] `npm run build` + `npm run typecheck` + `pytest` (se aplicável) verdes
-- [ ] Handoff com lista de arquivos, instruções de execução, screenshots, testes PASS/FAIL, limitações e próximo gate
+- [x] 6 áreas navegáveis: Agora, Conversa JARVIS, Inbox, Domínios, Aprovações, Fontes/Privacidade
+- [x] 3 jornadas E2E com fixtures coerentes e testes Playwright passando (desktop + mobile)
+- [x] Design system + responsividade + estados loading/empty/error/stale/mock visíveis
+- [x] Keyboard nav, foco visível, reduced motion, contraste AA
+- [x] `npm run build` + `npm run typecheck` + `pytest` (se aplicável) verdes
+- [x] Handoff com lista de arquivos, instruções de execução, screenshots, testes PASS/FAIL, limitações e próximo gate
 
 ## 9. Áreas proibidas
 - Ler/escrever em `/Users/vic` além deste workspace; MCID, MedSyn, CRIVO, SOFF sem autorização explícita.

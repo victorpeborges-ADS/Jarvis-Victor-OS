@@ -109,7 +109,9 @@ export default function AprovacoesPage() {
                             <div>
                               <div className="text-xs font-semibold text-ink-faint">Alternativa {letter}</div>
                               <div className="mt-0.5 text-sm font-medium text-ink">{option.label}</div>
-                              <div className="mt-1 text-xs leading-relaxed text-ink-subtle">{option.impact}</div>
+                              <div className={["mt-1 text-xs leading-relaxed", selected ? "text-ink-onSelected" : "text-ink-subtle"].join(" ")}>
+                                {option.impact}
+                              </div>
                             </div>
                           </div>
                         </label>
