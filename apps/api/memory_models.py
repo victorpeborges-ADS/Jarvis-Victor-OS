@@ -82,6 +82,21 @@ class ProvenanceRecord(StrictRecord):
         return _require_aware(value)
 
 
+class AuditRecord(StrictRecord):
+    """Minimal operational audit fact; excludes record and user content."""
+
+    operation: Literal["source_write", "event_write", "entity_write", "relation_write", "memory_read"]
+    outcome: Literal["success"] = "success"
+    record_count: int = Field(default=0, ge=0)
+    dataset: Literal["real"] = "real"
+    occurred_at: datetime = Field(default_factory=utc_now)
+
+    @field_validator("occurred_at")
+    @classmethod
+    def occurred_at_is_aware(cls, value: datetime) -> datetime:
+        return _require_aware(value)  # type: ignore[return-value]
+
+
 class EventRecord(StrictRecord):
     id: str = Field(min_length=1, max_length=128)
     event_type: Literal["appointment", "task", "message", "note", "reference", "project"]
@@ -150,6 +165,7 @@ class RelationRecord(StrictRecord):
     from_entity_id: str
     to_entity_id: str
     relation_type: Literal["related_to", "owns", "blocks", "supports", "scheduled_for", "mentions"]
+    domain_id: str | None = None
     evidence_event_ids: tuple[str, ...] = ()
     review_status: Literal["pending", "accepted", "rejected"] = "pending"
     dataset: Literal["real"] = "real"
@@ -160,6 +176,18 @@ class RelationRecord(StrictRecord):
         if self.from_entity_id == self.to_entity_id:
             raise ValueError("relação não pode apontar para a mesma entidade")
         return self
+
+    @field_validator("domain_id")
+    @classmethod
+    def domain_is_canonical_or_quarantined(cls, value: str | None) -> str | None:
+        if value is not None and value not in CANONICAL_DOMAIN_IDS:
+            raise ValueError("domain_id desconhecido")
+        return value
+
+    @field_validator("created_at")
+    @classmethod
+    def created_at_is_aware(cls, value: datetime) -> datetime:
+        return _require_aware(value)  # type: ignore[return-value]
 
 
 class ReadScope(StrictRecord):

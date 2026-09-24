@@ -1,6 +1,7 @@
 import json
 import ipaddress
 import os
+import sqlite3
 import socket
 import subprocess
 import sys
@@ -12,8 +13,10 @@ from types import SimpleNamespace
 import pytest
 import httpx
 from fastapi.testclient import TestClient
+from pydantic import ValidationError
 
 import local_security
+from memory_models import EventRecord, ProvenanceRecord, SourceRecord
 from local_security import (
     Grant,
     MAX_LOGIN_FAILURES,
@@ -37,15 +40,64 @@ RESOURCE = "calendar:synthetic-primary"
 
 @pytest.fixture
 def client():
-    return TestClient(create_app(LocalServerConfig()), base_url="http://127.0.0.1", client=("127.0.0.1", 51000))
+    app = create_app(LocalServerConfig())
+    with TestClient(app, base_url="http://127.0.0.1", client=("127.0.0.1", 51000)) as test_client:
+        _seed_test_catalog(app.state.memory_store)
+        yield test_client
+
+
+@pytest.fixture
+def empty_client():
+    app = create_app(LocalServerConfig())
+    with TestClient(app, base_url="http://127.0.0.1", client=("127.0.0.1", 51000)) as test_client:
+        yield test_client
 
 
 @pytest.fixture(autouse=True)
-def isolated_state(monkeypatch):
+def isolated_state(monkeypatch, tmp_path):
     reset_state()
     monkeypatch.setenv("JARVIS_LOCAL_PASSPHRASE", PASSPHRASE)
+    monkeypatch.setenv("JARVIS_DATABASE_PATH", str(tmp_path / "jarvis-private" / "memory.sqlite3"))
     yield
     reset_state()
+
+
+def _seed_test_catalog(store):
+    source_id = "src_calendar_test"
+    store.save_source(SourceRecord(
+        id=source_id,
+        provider="calendar_sim",
+        resource_id=RESOURCE,
+        sync_status="disconnected",
+    ))
+    observed = datetime(2026, 9, 24, 12, tzinfo=timezone.utc)
+    eight_domain_records = []
+    letters = "abcdefgh"
+    for index, letter in enumerate(letters):
+        domain_id = f"dom_synthetic_{letter}"
+        mentioned_domain = f"dom_synthetic_{letters[-index - 1]}"
+        event_id = f"synth_{letter}_1"
+        title = f"evento sintético classificado em {domain_id}; título menciona {mentioned_domain}"
+        eight_domain_records.append((event_id, domain_id, title))
+    eight_domain_records.append(("synth_unclassified_1", None, "registro sintético não classificado"))
+    for event_id, domain_id, title in eight_domain_records:
+        classified = domain_id is not None
+        store.save_event(EventRecord(
+            id=event_id,
+            event_type="appointment",
+            title=title,
+            domain_id=domain_id,
+            occurred_at=observed,
+            provenance=ProvenanceRecord(
+                source_id=source_id,
+                external_ref=f"external-{event_id}",
+                observed_at=observed,
+                last_verified_at=observed,
+                confidence=0.9,
+                classification_method="human_review" if classified else "unclassified",
+                classified_at=observed if classified else None,
+            ),
+        ))
 
 
 def login(client: TestClient, origin: str | None = ALLOWED_ORIGIN, passphrase: str = PASSPHRASE):
@@ -80,6 +132,61 @@ def test_demo_stays_separate_and_real_requires_session(client):
     assert "evt_001" in {item["id"] for item in demo.json()}
     assert client.get("/real/events").status_code == 401
     assert client.get("/real/briefing").status_code == 401
+
+
+def test_session_without_grant_cannot_list_read_by_id_or_build_briefing(client, monkeypatch):
+    assert login(client).status_code == 201
+    def query_without_grant(*_args, **_kwargs):
+        pytest.fail("consulta ao banco não deve ocorrer sem concessão ativa")
+
+    monkeypatch.setattr(client.app.state.memory_store, "list_authorized_events", query_without_grant)
+    monkeypatch.setattr(client.app.state.memory_store, "get_authorized_event", query_without_grant)
+    assert client.get("/real/events").status_code == 403
+    assert client.get("/real/events/synth_a_1").status_code == 403
+    assert client.get("/real/briefing").status_code == 403
+
+
+def test_real_database_starts_empty_and_never_imports_demo_fixture(empty_client):
+    assert "evt_001" in {record["id"] for record in empty_client.get("/events").json()}
+    assert login(empty_client).status_code == 201
+    csrf = csrf_for(empty_client)
+    assert grant(empty_client, csrf, ["dom_synthetic_a"]).status_code == 201
+    assert empty_client.get("/real/events").status_code == 403
+    assert empty_client.get("/real/briefing").status_code == 403
+    assert empty_client.get("/real/events/evt_001").status_code == 404
+    with sqlite3.connect(empty_client.app.state.memory_store.path) as connection:
+        assert connection.execute("SELECT COUNT(*) FROM events").fetchone()[0] == 0
+        tables = {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        assert "grants" not in tables
+        assert "sessions" not in tables
+
+
+def test_storage_query_failure_returns_generic_service_unavailable(client, monkeypatch):
+    assert login(client).status_code == 201
+    csrf = csrf_for(client)
+    assert grant(client, csrf, ["dom_synthetic_a"]).status_code == 201
+
+    def fail_read(*_args, **_kwargs):
+        raise sqlite3.OperationalError("private path and record payload must not leak")
+
+    monkeypatch.setattr(client.app.state.memory_store, "list_authorized_events", fail_read)
+    response = client.get("/real/events")
+    assert response.status_code == 503
+    assert response.json() == {"detail": "memória local indisponível"}
+    assert "private path" not in response.text
+
+
+def test_malformed_persisted_record_is_omitted_without_crashing_api(client):
+    assert login(client).status_code == 201
+    csrf = csrf_for(client)
+    assert grant(client, csrf, ["dom_synthetic_a"]).status_code == 201
+    with sqlite3.connect(client.app.state.memory_store.path) as connection:
+        connection.execute("PRAGMA ignore_check_constraints=ON")
+        connection.execute("UPDATE events SET payload_json='{' WHERE id='synth_a_1'")
+        connection.commit()
+    assert client.get("/real/events").status_code == 403
+    assert client.get("/real/events/synth_a_1").status_code == 404
+    assert client.get("/real/briefing").status_code == 403
 
 
 def test_cookie_flags_entropy_expiry_and_no_store(client):
@@ -288,6 +395,7 @@ def test_duplicate_and_overlapping_grants_are_rejected_and_revoke_is_effective(c
     assert revoke.status_code == 200
     assert client.get("/real/events").status_code == 403
     assert client.get("/real/events/synth_a_1").status_code == 403
+    assert client.get("/real/briefing").status_code == 403
     assert grant(client, csrf, ["dom_synthetic_a"]).status_code == 201
 
 
@@ -306,22 +414,79 @@ def test_aggregate_and_direct_retrieval_respect_connector_resource_and_domain(cl
     assert [item["id"] for item in client.get("/real/briefing").json()["items"]] == ["synth_a_1"]
 
 
+def test_all_eight_synthetic_domains_are_isolated_by_explicit_domain_id(client):
+    assert login(client).status_code == 201
+    csrf = csrf_for(client)
+    letters = "abcdefgh"
+    for index, letter in enumerate(letters):
+        domain_id = f"dom_synthetic_{letter}"
+        expected_id = f"synth_{letter}_1"
+        next_letter = letters[(index + 1) % len(letters)]
+        next_id = f"synth_{next_letter}_1"
+
+        grant_response = grant(client, csrf, [domain_id])
+        assert grant_response.status_code == 201
+        listing = client.get("/real/events")
+        assert listing.status_code == 200
+        assert [event["id"] for event in listing.json()] == [expected_id]
+        assert domain_id in listing.json()[0]["title"]
+        assert client.get("/real/events", params={"domain_id": domain_id}).json()[0]["id"] == expected_id
+        assert client.get("/real/events", params={"domain_id": f"dom_synthetic_{next_letter}"}).status_code == 403
+        assert client.get(f"/real/events/{next_id}").status_code == 404
+        assert [event["id"] for event in client.get("/real/briefing").json()["items"]] == [expected_id]
+
+        revoked = client.post(
+            f"/real/grants/{grant_response.json()['id']}/revoke",
+            headers={"origin": ALLOWED_ORIGIN, "x-csrf-token": csrf},
+        )
+        assert revoked.status_code == 200
+        assert client.get("/real/events").status_code == 403
+        assert client.get(f"/real/events/{expected_id}").status_code == 403
+        assert client.get("/real/briefing").status_code == 403
+
+
+def test_grants_are_volatile_even_when_database_survives_process_restart(client):
+    assert login(client).status_code == 201
+    csrf = csrf_for(client)
+    assert grant(client, csrf, ["dom_synthetic_a"]).status_code == 201
+    assert [event["id"] for event in client.get("/real/events").json()] == ["synth_a_1"]
+
+    child_env = {**os.environ, "JARVIS_LOCAL_PASSPHRASE": PASSPHRASE}
+    child_code = (
+        "from fastapi.testclient import TestClient\n"
+        "from main import create_app\n"
+        "from server_config import LocalServerConfig\n"
+        "with TestClient(create_app(LocalServerConfig()),base_url='http://127.0.0.1',client=('127.0.0.1',51004)) as c:\n"
+        f" assert c.post('/real/session',json={{'passphrase':'{PASSPHRASE}'}},headers={{'origin':'{ALLOWED_ORIGIN}'}}).status_code==201\n"
+        " print(c.get('/real/events').status_code,c.get('/real/events/synth_a_1').status_code,c.get('/real/briefing').status_code)"
+    )
+    restarted = subprocess.run(
+        [sys.executable, "-c", child_code], cwd=Path(__file__).parent,
+        env=child_env, capture_output=True, text=True, timeout=15,
+    )
+    assert restarted.returncode == 0, restarted.stderr
+    assert restarted.stdout.strip().endswith("403 403 403")
+
+
 def test_records_with_unknown_connector_resource_or_domain_fail_closed(client):
     login(client)
     csrf = csrf_for(client)
     grant(client, csrf, ["dom_synthetic_a"])
-    valid = local_security.SYNTHETIC_RECORDS[0]
-    invalid_records = [
-        valid.__class__(valid.id, "gmail_sim", RESOURCE, valid.domain_id, valid.title),
-        valid.__class__(valid.id, "calendar_sim", "calendar:unknown", valid.domain_id, valid.title),
-        valid.__class__(valid.id, "calendar_sim", RESOURCE, "dom_unknown", valid.title),
-        valid.__class__(valid.id, "calendar_sim", RESOURCE, None, valid.title),
-    ]
-    for record in invalid_records:
-        monkeypatch_record = local_security.SYNTHETIC_RECORDS
-        local_security.SYNTHETIC_RECORDS = (record,)
-        assert client.get("/real/events").status_code == 403
-        local_security.SYNTHETIC_RECORDS = monkeypatch_record
+    with pytest.raises(ValidationError):
+        SourceRecord(id="src_unknown_connector", provider="gmail_sim", resource_id=RESOURCE)
+    with pytest.raises(ValidationError):
+        SourceRecord(id="src_unknown_resource", provider="calendar_sim", resource_id="calendar:unknown")
+    with pytest.raises(ValidationError):
+        EventRecord(
+            id="unknown-domain", event_type="appointment", title="malformed synthetic",
+            domain_id="dom_unknown", provenance=ProvenanceRecord(
+                source_id="src_calendar_test", observed_at=datetime.now(timezone.utc),
+                classification_method="human_review", classified_at=datetime.now(timezone.utc),
+            ),
+        )
+    assert client.get("/real/events").status_code == 200
+    assert [event["id"] for event in client.get("/real/events").json()] == ["synth_a_1"]
+    assert client.get("/real/events/synth_unclassified_1").status_code == 404
 
 
 def test_grant_from_other_principal_does_not_authorize(client):

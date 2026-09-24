@@ -1,4 +1,6 @@
 from contextlib import asynccontextmanager
+import sqlite3
+from pathlib import Path
 
 from fastapi import APIRouter, FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
@@ -19,6 +21,7 @@ from contract import (
 )
 from local_security import router as real_router
 from loopback import ALLOWED_ORIGINS, is_allowed_host_header, is_loopback_address
+from memory_store import MemoryStoreError, SQLiteMemoryStore
 from server_config import LocalServerConfig, validate_local_server_config
 
 demo_router = APIRouter()
@@ -82,19 +85,21 @@ def approvals() -> list:
     return data if isinstance(data, list) else []
 
 
-def create_app(config: LocalServerConfig) -> FastAPI:
+def create_app(config: LocalServerConfig, *, database_path: str | Path | None = None) -> FastAPI:
     """Build the ASGI app only with an explicit loopback server configuration.
 
     There is intentionally no module-level ``app`` object: standard Uvicorn
     import strings such as ``main:app`` cannot bypass the local launcher.
     """
     validate_local_server_config(config)
+    store = SQLiteMemoryStore(database_path)
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
         # Revalidate values at startup in case the frozen dataclass was altered
         # through low-level Python APIs after app construction.
         validate_local_server_config(config)
+        store.initialize()
         yield
 
     app = FastAPI(
@@ -107,6 +112,7 @@ def create_app(config: LocalServerConfig) -> FastAPI:
         version="0.1.0",
         lifespan=lifespan,
     )
+    app.state.memory_store = store
     app.add_middleware(
         CORSMiddleware,
         allow_origins=sorted(ALLOWED_ORIGINS),
@@ -143,5 +149,11 @@ def create_app(config: LocalServerConfig) -> FastAPI:
         # Pydantic's default detail contains `input`; never echo a passphrase or body.
         detail = "credencial inválida" if request.url.path == "/real/session" else "requisição inválida"
         return JSONResponse({"detail": detail}, status_code=422)
+
+    async def memory_store_unavailable(request: Request, exc: Exception):
+        return JSONResponse({"detail": "memória local indisponível"}, status_code=503)
+
+    for error_type in (MemoryStoreError, sqlite3.Error, OSError):
+        app.add_exception_handler(error_type, memory_store_unavailable)
 
     return app

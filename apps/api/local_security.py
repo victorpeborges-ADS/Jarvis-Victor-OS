@@ -6,13 +6,16 @@ import hmac
 import os
 import secrets
 from collections import defaultdict, deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Literal
 
 from fastapi import APIRouter, HTTPException, Request, Response
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from domain_registry import CANONICAL_CONNECTORS, CANONICAL_DOMAIN_IDS, CANONICAL_RESOURCES
+from memory_models import ProvenanceRecord, ReadScope
+from memory_store import SQLiteMemoryStore, StoredEvent
 from loopback import ALLOWED_ORIGINS, is_loopback_address, require_allowed_origin
 
 SESSION_COOKIE = "jarvis_session"
@@ -22,11 +25,6 @@ MAX_LOGIN_FAILURES = 8
 LOGIN_WINDOW = timedelta(minutes=10)
 LOGIN_COOLDOWN = timedelta(seconds=60)
 MAX_GRANT_TTL = timedelta(days=30)
-
-CANONICAL_CONNECTORS = frozenset({"calendar_sim"})
-CANONICAL_RESOURCES = {"calendar_sim": frozenset({"calendar:synthetic-primary"})}
-# IDs sintéticos locais, sem vínculo com a fixture DEMO ou organizações reais.
-CANONICAL_DOMAIN_IDS = frozenset({"dom_synthetic_a", "dom_synthetic_b", "dom_synthetic_c"})
 
 router = APIRouter(prefix="/real", tags=["real"])
 
@@ -49,22 +47,6 @@ class Grant:
     expires_at: datetime
     revoked: bool = False
 
-
-@dataclass
-class ClassifiedRecord:
-    id: str
-    connector: str
-    resource_id: str
-    domain_id: str | None
-    title: str
-
-
-# Este catálogo não é carregado de fixtures/demo.json.
-SYNTHETIC_RECORDS: tuple[ClassifiedRecord, ...] = (
-    ClassifiedRecord("synth_a_1", "calendar_sim", "calendar:synthetic-primary", "dom_synthetic_a", "ensaio sintético A"),
-    ClassifiedRecord("synth_b_1", "calendar_sim", "calendar:synthetic-primary", "dom_synthetic_b", "ensaio sintético B"),
-    ClassifiedRecord("synth_unclassified_1", "calendar_sim", "calendar:synthetic-primary", None, "registro sem classificação; deve falhar fechado"),
-)
 
 _sessions: dict[str, Session] = {}
 _grants: dict[str, Grant] = {}
@@ -100,7 +82,7 @@ class GrantIn(BaseModel):
     connector: Literal["calendar_sim"]
     permission: Literal["read"]
     resource_ids: list[str] = Field(min_length=1, max_length=1)
-    domain_ids: list[str] = Field(min_length=1, max_length=3)
+    domain_ids: list[str] = Field(min_length=1, max_length=8)
     expires_at: datetime
 
     @field_validator("resource_ids")
@@ -136,12 +118,33 @@ class RealEventOut(BaseModel):
     resource_id: str
     domain_id: str
     title: str
+    event_type: str
+    sensitivity: str
+    occurred_at: datetime | None
+    provenance: ProvenanceRecord
     dataset: str = "real"
 
 
 class RealBriefingOut(BaseModel):
     dataset: str = "real"
     items: list[RealEventOut]
+
+
+def _event_response(record: StoredEvent) -> RealEventOut:
+    event = record.event
+    if event.domain_id is None:
+        raise HTTPException(status_code=404, detail="registro ausente")
+    return RealEventOut(
+        id=event.id,
+        connector=record.source.provider,
+        resource_id=record.source.resource_id,
+        domain_id=event.domain_id,
+        title=event.title,
+        event_type=event.event_type,
+        sensitivity=event.sensitivity,
+        occurred_at=event.occurred_at,
+        provenance=event.provenance,
+    )
 
 
 def _client_host(request: Request) -> str:
@@ -177,45 +180,60 @@ def _active_grants(principal: str, at: datetime | None = None) -> list[Grant]:
     return [grant for grant in _grants.values() if grant.principal == principal and not grant.revoked and grant.expires_at > instant]
 
 
-def _record_is_well_classified(record: ClassifiedRecord) -> bool:
-    return (
-        record.connector in CANONICAL_CONNECTORS
-        and record.resource_id in CANONICAL_RESOURCES.get(record.connector, frozenset())
-        and record.domain_id in CANONICAL_DOMAIN_IDS
-    )
-
-
-def _record_is_authorized(record: ClassifiedRecord, grants: list[Grant]) -> bool:
-    return _record_is_well_classified(record) and any(
-        grant.connector == record.connector
-        and record.resource_id in grant.resource_ids
-        and record.domain_id in grant.domain_ids
-        for grant in grants
-    )
-
-
 def _authorized_records(
     principal: str,
+    store: SQLiteMemoryStore,
     requested_domain: str | None,
     record_id: str | None = None,
-) -> list[ClassifiedRecord]:
+) -> list[StoredEvent]:
     if requested_domain is not None and requested_domain not in CANONICAL_DOMAIN_IDS:
         raise HTTPException(status_code=403, detail="concessão ausente")
     grants = _active_grants(principal)
     if not grants:
         raise HTTPException(status_code=403, detail="concessão ausente")
-    found = [record for record in SYNTHETIC_RECORDS if record_id is None or record.id == record_id]
-    if record_id is not None and not found:
-        raise HTTPException(status_code=404, detail="registro ausente")
-    authorized = [record for record in found if _record_is_authorized(record, grants)]
-    if requested_domain is not None:
-        authorized = [record for record in authorized if record.domain_id == requested_domain]
+    scopes: list[ReadScope] = []
+    for grant in grants:
+        if grant.connector not in CANONICAL_CONNECTORS:
+            continue
+        valid_domains = frozenset(grant.domain_ids & CANONICAL_DOMAIN_IDS)
+        valid_resources = grant.resource_ids & CANONICAL_RESOURCES.get(grant.connector, frozenset())
+        for resource_id in valid_resources:
+            if valid_domains:
+                scopes.append(ReadScope(
+                    connector=grant.connector,
+                    resource_id=resource_id,
+                    domain_ids=valid_domains,
+                ))
+    if not scopes:
+        raise HTTPException(status_code=403, detail="concessão ausente")
+
+    if record_id is None:
+        found = store.list_authorized_events(scopes, requested_domain)
+    else:
+        record = store.get_authorized_event(record_id, scopes, requested_domain)
+        found = [record] if record is not None else []
+    authorized = [
+        record for record in found
+        if record.event.domain_id in CANONICAL_DOMAIN_IDS
+        and record.source.provider in CANONICAL_CONNECTORS
+        and record.source.resource_id in CANONICAL_RESOURCES.get(record.source.provider, frozenset())
+        and any(
+            scope.connector == record.source.provider
+            and scope.resource_id == record.source.resource_id
+            and record.event.domain_id in scope.domain_ids
+            for scope in scopes
+        )
+    ]
     if record_id is not None and not authorized:
-        # Resposta uniforme evita revelar se ID existe fora do escopo concedido.
+        # Resposta uniforme evita revelar se o ID existe fora do escopo concedido.
         raise HTTPException(status_code=404, detail="registro ausente")
     if not authorized:
         raise HTTPException(status_code=403, detail="concessão ausente")
     return authorized
+
+
+def _store_from(request: Request) -> SQLiteMemoryStore:
+    return request.app.state.memory_store
 
 
 def _set_cookie(response: Response, token: str, secure: bool) -> None:
@@ -339,22 +357,22 @@ def revoke_grant(grant_id: str, request: Request) -> dict:
 @router.get("/events", response_model=list[RealEventOut])
 def read_events(request: Request, domain_id: str | None = None) -> list[RealEventOut]:
     session = _session_from(request)
-    records = _authorized_records(session.principal, domain_id)
-    return [RealEventOut(**record.__dict__) for record in records]
+    records = _authorized_records(session.principal, _store_from(request), domain_id)
+    return [_event_response(record) for record in records]
 
 
 @router.get("/events/{record_id}", response_model=RealEventOut)
 def read_event(record_id: str, request: Request) -> RealEventOut:
     session = _session_from(request)
-    record = _authorized_records(session.principal, None, record_id)[0]
-    return RealEventOut(**record.__dict__)
+    record = _authorized_records(session.principal, _store_from(request), None, record_id)[0]
+    return _event_response(record)
 
 
 @router.get("/briefing", response_model=RealBriefingOut)
 def read_briefing(request: Request) -> RealBriefingOut:
     session = _session_from(request)
-    records = _authorized_records(session.principal, None)
-    return RealBriefingOut(items=[RealEventOut(**record.__dict__) for record in records])
+    records = _authorized_records(session.principal, _store_from(request), None)
+    return RealBriefingOut(items=[_event_response(record) for record in records])
 
 
 def put_grant_for_tests(grant: Grant) -> None:

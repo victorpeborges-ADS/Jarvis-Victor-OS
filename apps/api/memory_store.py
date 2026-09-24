@@ -7,6 +7,7 @@ import json
 import logging
 import os
 import platform
+import secrets
 import sqlite3
 import stat
 from contextlib import closing, contextmanager
@@ -17,7 +18,7 @@ from typing import Iterator, Sequence
 from pydantic import BaseModel, ValidationError
 
 from domain_registry import CANONICAL_CONNECTORS, CANONICAL_DOMAIN_IDS, CANONICAL_RESOURCES
-from memory_models import EntityRecord, EventRecord, ReadScope, RelationRecord, SourceRecord, StrictRecord
+from memory_models import AuditRecord, EntityRecord, EventRecord, ReadScope, RelationRecord, SourceRecord, StrictRecord
 
 logger = logging.getLogger(__name__)
 API_ROOT = Path(__file__).resolve().parent
@@ -57,7 +58,7 @@ def default_database_path() -> Path:
 
 def _safe_database_path(path: Path) -> Path:
     expanded = path.expanduser()
-    if expanded.exists() and expanded.is_symlink():
+    if expanded.is_symlink():
         raise ValueError("o arquivo do banco não pode ser link simbólico")
     resolved = expanded.parent.resolve() / expanded.name
     try:
@@ -108,13 +109,17 @@ class SQLiteMemoryStore:
         self._initialized = True
 
     def _prepare_private_path(self) -> None:
-        if self.path.exists() and self.path.is_symlink():
+        if self.path.is_symlink():
             raise ValueError("o arquivo do banco não pode ser link simbólico")
+        parent_existed = self.path.parent.exists()
         self.path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         directory_stat = self.path.parent.stat()
         if directory_stat.st_uid != os.getuid():
             raise PermissionError("diretório do banco pertence a outro usuário")
-        os.chmod(self.path.parent, 0o700)
+        if parent_existed and stat.S_IMODE(directory_stat.st_mode) & 0o077:
+            raise PermissionError("diretório do banco precisa de permissões privadas")
+        if not parent_existed:
+            os.chmod(self.path.parent, 0o700)
         if self.path.exists():
             file_stat = self.path.stat()
             if not stat.S_ISREG(file_stat.st_mode):
@@ -186,6 +191,22 @@ class SQLiteMemoryStore:
         if not self._initialized:
             raise MemoryStoreError("banco local ainda não foi inicializado")
 
+    @staticmethod
+    def _insert_audit(connection: sqlite3.Connection, operation: str, record_count: int = 0) -> None:
+        entry = AuditRecord(operation=operation, record_count=record_count)
+        connection.execute(
+            "INSERT INTO audit_entries(id, operation, outcome, record_count, dataset, occurred_at) VALUES (?, ?, ?, ?, ?, ?)",
+            (secrets.token_hex(16), entry.operation, entry.outcome, entry.record_count,
+             entry.dataset, entry.occurred_at.isoformat()),
+        )
+
+    def record_audit(self, operation: str, record_count: int = 0) -> None:
+        """Persist an allow-listed operation and count, never event content or IDs."""
+        self._require_initialized()
+        entry = AuditRecord(operation=operation, record_count=record_count)
+        with self.transaction() as connection:
+            self._insert_audit(connection, entry.operation, entry.record_count)
+
     @contextmanager
     def transaction(self) -> Iterator[sqlite3.Connection]:
         self._require_initialized()
@@ -210,6 +231,7 @@ class SQLiteMemoryStore:
                 (source.id, source.provider, source.resource_id, source.account_ref, scopes_json,
                  source.sync_status, source.dataset, source.created_at.isoformat()),
             )
+            self._insert_audit(connection, "source_write")
         return source
 
     def save_event(self, event_value: EventRecord | dict) -> EventRecord:
@@ -270,6 +292,7 @@ class SQLiteMemoryStore:
                  _aware_iso(provenance.last_verified_at), _aware_iso(provenance.valid_until), provenance.confidence,
                  provenance.classification_method, _aware_iso(provenance.classified_at)),
             )
+            self._insert_audit(connection, "event_write")
         return event.model_copy(update={"id": event_id})
 
     def save_entity(self, entity_value: EntityRecord | dict) -> EntityRecord:
@@ -281,21 +304,41 @@ class SQLiteMemoryStore:
                 (entity.id, entity.entity_type, entity.name, entity.domain_id, entity.sensitivity,
                  entity.dataset, entity.created_at.isoformat()),
             )
+            self._insert_audit(connection, "entity_write")
         return entity
 
     def save_relation(self, relation_value: RelationRecord | dict) -> RelationRecord:
         relation = _validated(RelationRecord, relation_value)
         with self.transaction() as connection:
+            endpoint_domains = connection.execute(
+                "SELECT id, domain_id FROM entities WHERE id IN (?, ?)",
+                (relation.from_entity_id, relation.to_entity_id),
+            ).fetchall()
+            if len(endpoint_domains) != 2:
+                raise sqlite3.IntegrityError("relação aponta para entidade ausente")
+            if any(row["domain_id"] != relation.domain_id for row in endpoint_domains):
+                raise ValueError("relação não pode cruzar domínios sem classificação comum")
+            if relation.evidence_event_ids:
+                placeholders = ",".join("?" for _ in relation.evidence_event_ids)
+                evidence_domains = connection.execute(
+                    f"SELECT id, domain_id FROM events WHERE id IN ({placeholders})",
+                    relation.evidence_event_ids,
+                ).fetchall()
+                if len(evidence_domains) != len(set(relation.evidence_event_ids)):
+                    raise sqlite3.IntegrityError("evidência da relação aponta para evento ausente")
+                if any(row["domain_id"] != relation.domain_id for row in evidence_domains):
+                    raise ValueError("evidência da relação pertence a outro domínio")
             connection.execute(
-                "INSERT INTO relations(id, from_entity_id, to_entity_id, relation_type, review_status, dataset, created_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                "INSERT INTO relations(id, from_entity_id, to_entity_id, relation_type, domain_id, review_status, dataset, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                 (relation.id, relation.from_entity_id, relation.to_entity_id, relation.relation_type,
-                 relation.review_status, relation.dataset, relation.created_at.isoformat()),
+                 relation.domain_id, relation.review_status, relation.dataset, relation.created_at.isoformat()),
             )
             connection.executemany(
                 "INSERT INTO relation_evidence(relation_id, event_id) VALUES (?, ?)",
                 [(relation.id, event_id) for event_id in relation.evidence_event_ids],
             )
+            self._insert_audit(connection, "relation_write")
         return relation
 
     def list_authorized_events(
@@ -307,7 +350,9 @@ class SQLiteMemoryStore:
         query, parameters = self._authorized_query(scopes, requested_domain)
         with closing(self._connect()) as connection:
             rows = connection.execute(query + " ORDER BY COALESCE(e.occurred_at, e.created_at), e.id", parameters).fetchall()
-        return [record for row in rows if (record := self._row_to_record(row)) is not None]
+        records = [record for row in rows if (record := self._row_to_record(row)) is not None]
+        self.record_audit("memory_read", len(records))
+        return records
 
     def get_authorized_event(
         self,
@@ -319,7 +364,9 @@ class SQLiteMemoryStore:
         query, parameters = self._authorized_query(scopes, requested_domain)
         with closing(self._connect()) as connection:
             row = connection.execute(query + " AND e.id=? LIMIT 1", (*parameters, event_id)).fetchone()
-        return self._row_to_record(row) if row is not None else None
+        record = self._row_to_record(row) if row is not None else None
+        self.record_audit("memory_read", int(record is not None))
+        return record
 
     @staticmethod
     def _authorized_query(scopes: Sequence[ReadScope], requested_domain: str | None) -> tuple[str, tuple]:

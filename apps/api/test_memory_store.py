@@ -1,11 +1,18 @@
 import sqlite3
 import stat
+import subprocess
+import sys
 from datetime import datetime, timezone
+from pathlib import Path
+from shutil import copyfile
 
 import pytest
 from pydantic import ValidationError
+from fastapi.testclient import TestClient
 
+from main import create_app
 from memory_models import (
+    AuditRecord,
     EntityRecord,
     EventRecord,
     ProvenanceRecord,
@@ -13,7 +20,8 @@ from memory_models import (
     RelationRecord,
     SourceRecord,
 )
-from memory_store import DatabaseCorruptError, MigrationError, SQLiteMemoryStore, REPOSITORY_ROOT, default_database_path
+from memory_store import DatabaseCorruptError, MigrationError, MIGRATIONS_DIR, SQLiteMemoryStore, REPOSITORY_ROOT, default_database_path
+from server_config import LocalServerConfig
 
 
 def now() -> datetime:
@@ -84,8 +92,10 @@ def test_empty_database_migrates_once_uses_wal_and_private_permissions(tmp_path)
 
     with sqlite3.connect(store.path) as connection:
         assert connection.execute("PRAGMA journal_mode").fetchone()[0].lower() == "wal"
-        assert connection.execute("SELECT version FROM schema_migrations").fetchall() == [("0001_initial",)]
-        for table in ("sources", "events", "event_provenance", "entities", "relations", "relation_evidence"):
+        assert connection.execute("SELECT version FROM schema_migrations ORDER BY version").fetchall() == [
+            ("0001_initial",), ("0002_audit_and_relation_domain",)
+        ]
+        for table in ("sources", "events", "event_provenance", "entities", "relations", "relation_evidence", "audit_entries"):
             assert connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] == 0
 
 
@@ -93,6 +103,42 @@ def test_default_database_path_is_outside_repository_and_repo_path_is_rejected(t
     assert REPOSITORY_ROOT not in default_database_path().parents
     with pytest.raises(ValueError, match="fora do repositório"):
         SQLiteMemoryStore(REPOSITORY_ROOT / "should-never-exist.sqlite3")
+
+
+def test_database_from_previous_migration_version_upgrades_without_replaying_ddl(tmp_path):
+    previous_migrations = tmp_path / "previous_migrations"
+    previous_migrations.mkdir()
+    copyfile(MIGRATIONS_DIR / "0001_initial.sql", previous_migrations / "0001_initial.sql")
+    database_path = tmp_path / "private" / "memory.sqlite3"
+    SQLiteMemoryStore(database_path, migrations_dir=previous_migrations).initialize()
+
+    SQLiteMemoryStore(database_path).initialize()
+    with sqlite3.connect(database_path) as connection:
+        versions = connection.execute("SELECT version FROM schema_migrations ORDER BY version").fetchall()
+        columns = {row[1] for row in connection.execute("PRAGMA table_info(relations)")}
+        tables = {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    assert versions == [("0001_initial",), ("0002_audit_and_relation_domain",)]
+    assert "domain_id" in columns
+    assert "audit_entries" in tables
+
+
+def test_existing_shared_directory_is_rejected_without_changing_its_permissions(tmp_path):
+    shared = tmp_path / "shared"
+    shared.mkdir(mode=0o755)
+    store = SQLiteMemoryStore(shared / "memory.sqlite3")
+    with pytest.raises(PermissionError, match="permissões privadas"):
+        store.initialize()
+    assert stat.S_IMODE(shared.stat().st_mode) == 0o755
+    assert not store.path.exists()
+
+
+def test_database_path_symlink_is_rejected_even_when_target_is_missing(tmp_path):
+    private = tmp_path / "private"
+    private.mkdir(mode=0o700)
+    link = private / "memory.sqlite3"
+    link.symlink_to(private / "not-created.sqlite3")
+    with pytest.raises(ValueError, match="link simbólico"):
+        SQLiteMemoryStore(link)
 
 
 def test_migration_failure_rolls_back_ddl_and_does_not_mark_version(tmp_path):
@@ -121,6 +167,16 @@ def test_corrupt_database_fails_closed(tmp_path):
         store.initialize()
 
 
+def test_corrupt_database_prevents_app_lifespan_from_serving(tmp_path):
+    path = tmp_path / "private" / "memory.sqlite3"
+    path.parent.mkdir(mode=0o700)
+    path.write_bytes(b"corrupted database")
+    app = create_app(LocalServerConfig(), database_path=path)
+    with pytest.raises(DatabaseCorruptError):
+        with TestClient(app):
+            pytest.fail("a API não deve servir antes de inicializar o banco")
+
+
 def test_interrupted_transaction_rolls_back_and_reopened_store_keeps_committed_data(tmp_path):
     store = initialized_store(tmp_path)
     source = make_source()
@@ -139,6 +195,25 @@ def test_interrupted_transaction_rolls_back_and_reopened_store_keeps_committed_d
     assert [item.event.id for item in found] == [event.id]
 
 
+def test_committed_synthetic_event_survives_a_real_process_restart(tmp_path):
+    store = initialized_store(tmp_path)
+    event = add_source_and_event(store)
+    child_code = (
+        "import sys; from memory_store import SQLiteMemoryStore; from memory_models import ReadScope; "
+        "store=SQLiteMemoryStore(sys.argv[1]); store.initialize(); "
+        "scope=ReadScope(connector='calendar_sim',resource_id='calendar:synthetic-primary',domain_ids=frozenset({'dom_synthetic_a'})); "
+        "print(','.join(item.event.id for item in store.list_authorized_events([scope])))"
+    )
+    restarted = subprocess.run(
+        [sys.executable, "-c", child_code, str(store.path)],
+        cwd=Path(__file__).parent,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    assert restarted.stdout.strip() == event.id
+
+
 def test_duplicate_external_event_is_idempotent_and_updates_one_record(tmp_path):
     store = initialized_store(tmp_path)
     source = make_source()
@@ -153,6 +228,25 @@ def test_duplicate_external_event_is_idempotent_and_updates_one_record(tmp_path)
     assert result.id == first.id
     assert len(records) == 1
     assert records[0].event.title == "Atualização sintética"
+
+
+def test_audit_trail_contains_only_allowlisted_operation_and_count(tmp_path):
+    store = initialized_store(tmp_path)
+    event = add_source_and_event(store)
+    assert store.list_authorized_events(scope())
+    store.get_authorized_event(event.id, scope())
+
+    with sqlite3.connect(store.path) as connection:
+        rows = connection.execute(
+            "SELECT operation, outcome, record_count, dataset FROM audit_entries ORDER BY rowid"
+        ).fetchall()
+    assert [row[0] for row in rows] == ["source_write", "event_write", "memory_read", "memory_read"]
+    assert [row[2] for row in rows] == [0, 0, 1, 1]
+    assert all(row[1] == "success" and row[3] == "real" for row in rows)
+    assert event.id not in repr(rows)
+    assert event.title not in repr(rows)
+    with pytest.raises(ValidationError):
+        AuditRecord(operation="arbitrary", record_count=1)
 
 
 def test_invalid_models_and_malformed_stored_payload_fail_closed(tmp_path, caplog):
@@ -187,6 +281,21 @@ def test_invalid_models_and_malformed_stored_payload_fail_closed(tmp_path, caplo
     assert event.title not in caplog.text
 
 
+def test_corrupted_unknown_domain_cannot_leak_into_another_scope(tmp_path):
+    store = initialized_store(tmp_path)
+    source = make_source()
+    store.save_source(source)
+    event_a = store.save_event(make_event(source_id=source.id, event_id="synthetic_event_a", domain_id="dom_synthetic_a"))
+    event_b = store.save_event(make_event(source_id=source.id, event_id="synthetic_event_b", domain_id="dom_synthetic_b", external_ref="synthetic-ref-b"))
+    with sqlite3.connect(store.path) as connection:
+        connection.execute("PRAGMA ignore_check_constraints=ON")
+        connection.execute("UPDATE events SET domain_id='dom_unknown' WHERE id=?", (event_a.id,))
+        connection.commit()
+    assert store.list_authorized_events(scope("dom_synthetic_a")) == []
+    assert store.get_authorized_event(event_a.id, scope("dom_synthetic_a")) is None
+    assert [record.event.id for record in store.list_authorized_events(scope("dom_synthetic_b"))] == [event_b.id]
+
+
 def test_source_event_provenance_entity_and_relation_foreign_keys(tmp_path):
     store = initialized_store(tmp_path)
     source = store.save_source(make_source())
@@ -195,7 +304,7 @@ def test_source_event_provenance_entity_and_relation_foreign_keys(tmp_path):
     second = store.save_entity(EntityRecord(id="entity_synthetic_b", entity_type="task", name="Tarefa sintética", domain_id="dom_synthetic_a"))
     relation = RelationRecord(
         id="relation_synthetic_a", from_entity_id=first.id, to_entity_id=second.id,
-        relation_type="supports", evidence_event_ids=(event.id,),
+        relation_type="supports", domain_id="dom_synthetic_a", evidence_event_ids=(event.id,),
     )
     store.save_relation(relation)
 
@@ -207,3 +316,15 @@ def test_source_event_provenance_entity_and_relation_foreign_keys(tmp_path):
     broken = relation.model_copy(update={"id": "relation_missing_evidence", "evidence_event_ids": ("missing",)})
     with pytest.raises(sqlite3.IntegrityError):
         store.save_relation(broken)
+
+    other_event = store.save_event(make_event(source_id=source.id, event_id="synthetic_event_b", domain_id="dom_synthetic_b", external_ref="synthetic-ref-b"))
+    other_entity = store.save_entity(EntityRecord(id="entity_synthetic_c", entity_type="project", name="Outro projeto", domain_id="dom_synthetic_b"))
+    cross_domain_relation = RelationRecord(
+        id="relation_cross_domain", from_entity_id=first.id, to_entity_id=other_entity.id,
+        relation_type="related_to", domain_id="dom_synthetic_a", evidence_event_ids=(event.id,),
+    )
+    with pytest.raises(ValueError, match="cruzar domínios"):
+        store.save_relation(cross_domain_relation)
+    cross_domain_evidence = relation.model_copy(update={"id": "relation_cross_evidence", "evidence_event_ids": (other_event.id,)})
+    with pytest.raises(ValueError, match="outro domínio"):
+        store.save_relation(cross_domain_evidence)
