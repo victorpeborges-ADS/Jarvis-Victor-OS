@@ -106,8 +106,9 @@ def test_empty_database_migrates_once_uses_wal_and_private_permissions(tmp_path)
             ("0001_initial",), ("0002_audit_and_relation_domain",),
             ("0003_event_identity_and_provenance",),
             ("0004_calendar_sync_state",),
+            ("0005_calendar_full_sync_reconciliation",),
         ]
-        for table in ("sources", "events", "event_provenance", "entities", "relations", "relation_evidence", "audit_entries", "calendar_sync_states"):
+        for table in ("sources", "events", "event_provenance", "entities", "relations", "relation_evidence", "audit_entries", "calendar_sync_states", "calendar_sync_seen_events"):
             assert connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] == 0
 
 
@@ -140,9 +141,34 @@ def test_database_from_previous_migration_version_upgrades_without_replaying_ddl
         ("0001_initial",), ("0002_audit_and_relation_domain",),
         ("0003_event_identity_and_provenance",),
         ("0004_calendar_sync_state",),
+        ("0005_calendar_full_sync_reconciliation",),
     ]
     assert "domain_id" in columns
     assert "audit_entries" in tables
+
+
+@pytest.mark.parametrize("applied_count", [1, 2, 3, 4])
+def test_each_previous_schema_version_upgrades_to_calendar_reconciliation(tmp_path, applied_count):
+    previous_migrations = tmp_path / f"previous-{applied_count}"
+    previous_migrations.mkdir()
+    migration_files = sorted(MIGRATIONS_DIR.glob("[0-9][0-9][0-9][0-9]_*.sql"))
+    for migration in migration_files[:applied_count]:
+        copyfile(migration, previous_migrations / migration.name)
+
+    database_path = tmp_path / f"from-{applied_count}" / "memory.sqlite3"
+    SQLiteMemoryStore(database_path, migrations_dir=previous_migrations).initialize()
+    store = SQLiteMemoryStore(database_path)
+    store.initialize()
+    store.initialize()
+    with sqlite3.connect(database_path) as connection:
+        versions = connection.execute(
+            "SELECT version FROM schema_migrations ORDER BY version"
+        ).fetchall()
+        seen_table = connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='calendar_sync_seen_events'"
+        ).fetchone()
+    assert [row[0] for row in versions] == [migration.stem for migration in migration_files]
+    assert seen_table is not None
 
 
 def test_existing_shared_directory_is_rejected_without_changing_its_permissions(tmp_path):

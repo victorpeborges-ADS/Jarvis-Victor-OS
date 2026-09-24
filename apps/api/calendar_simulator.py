@@ -9,6 +9,7 @@ from __future__ import annotations
 import hashlib
 import secrets
 import threading
+from contextlib import nullcontext
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Callable, Literal
@@ -148,7 +149,7 @@ class CalendarProvider:
         self._current: dict[str, dict[str, SimulatedCalendarEvent]] = {}
         self._changes: dict[str, list[tuple[int, SimulatedCalendarEvent]]] = {}
         self._revision: dict[str, int] = {}
-        self._generation: dict[str, int] = {}
+        self._generation: dict[str, str] = {}
         self._page_sessions: dict[str, tuple[str, tuple[SimulatedCalendarEvent, ...], int, str]] = {}
         self._next_failures: dict[str, CalendarProviderError] = {}
         self._load_synthetic_catalog()
@@ -166,7 +167,7 @@ class CalendarProvider:
             self._current[calendar_id] = {}
             self._changes[calendar_id] = []
             self._revision[calendar_id] = 0
-            self._generation[calendar_id] = 1
+            self._generation[calendar_id] = secrets.token_urlsafe(18)
             for offset in range(2):
                 start = now + timedelta(days=index + offset + 1, hours=9 + offset)
                 event = SimulatedCalendarEvent(
@@ -223,7 +224,7 @@ class CalendarProvider:
         with self._lock:
             if calendar_id not in self._calendars:
                 raise ValueError("calendário sintético desconhecido")
-            self._generation[calendar_id] += 1
+            self._generation[calendar_id] = secrets.token_urlsafe(18)
             self._page_sessions = {
                 token: session for token, session in self._page_sessions.items() if session[0] != calendar_id
             }
@@ -249,8 +250,8 @@ class CalendarProvider:
                 else:
                     parsed = cursor.sync_token.split(":")
                     if (
-                        len(parsed) != 3 or parsed[0] != "sim" or not parsed[1].isdigit()
-                        or not parsed[2].isdigit() or int(parsed[1]) != generation
+                        len(parsed) != 3 or parsed[0] != "sim" or parsed[1] != generation
+                        or not parsed[2].isdigit()
                     ):
                         raise CalendarProviderError("invalid_cursor", 410)
                     last_revision = int(parsed[2])
@@ -329,6 +330,7 @@ class CalendarSyncService:
         calendar_id: str | None = None,
         *,
         is_domain_authorized: Callable[[str], bool] | None = None,
+        authorization_guard: Callable[[str], object] | None = None,
     ) -> CalendarSyncReport:
         if not authorized_domains <= CANONICAL_DOMAIN_IDS:
             raise ValueError("escopo autorizado contém domínio desconhecido")
@@ -355,7 +357,7 @@ class CalendarSyncService:
                 quarantine.append(CalendarQuarantine(calendar_id=calendar.calendar_id, reason="grant_missing"))
                 continue
             try:
-                event_count, cancellation_count = self._sync_one(calendar, checker)
+                event_count, cancellation_count = self._sync_one(calendar, checker, authorization_guard)
             except PermissionError:
                 quarantine.append(CalendarQuarantine(calendar_id=calendar.calendar_id, reason="grant_missing"))
                 continue
@@ -375,6 +377,7 @@ class CalendarSyncService:
         self,
         calendar: SimulatedCalendar,
         is_domain_authorized: Callable[[str], bool],
+        authorization_guard: Callable[[str], object] | None,
     ) -> tuple[int, int]:
         written = cancelled = 0
         for _ in range(1000):
@@ -382,7 +385,31 @@ class CalendarSyncService:
             if checkpoint is None or checkpoint.domain_id is None:
                 raise RuntimeError("classificação do calendário desapareceu")
             if not is_domain_authorized(checkpoint.domain_id):
+                self._abandon_incomplete_snapshot(checkpoint)
                 raise PermissionError("concessão do calendário foi revogada")
+            if checkpoint.sync_token is None and checkpoint.page_token is None:
+                try:
+                    checkpoint = self.store.begin_calendar_full_sync(
+                        checkpoint.source_id,
+                        checkpoint.calendar_id,
+                        checkpoint.sync_token,
+                        checkpoint.page_token,
+                        checkpoint.full_sync_id or secrets.token_urlsafe(24),
+                    )
+                except CalendarCursorConflict:
+                    continue
+            elif checkpoint.sync_token is None and checkpoint.page_token is not None and checkpoint.full_sync_id is None:
+                # A pre-D.1 partial scan has no durable seen-set; discard it and
+                # restart safely instead of reconciling from incomplete evidence.
+                try:
+                    self.store.reset_calendar_cursor(
+                        checkpoint.source_id, checkpoint.calendar_id,
+                        checkpoint.sync_token, checkpoint.page_token, checkpoint.full_sync_id,
+                        datetime.now(timezone.utc),
+                    )
+                except CalendarCursorConflict:
+                    continue
+                continue
             attempted_at = datetime.now(timezone.utc)
             try:
                 page = self.provider.list_events(
@@ -394,7 +421,7 @@ class CalendarSyncService:
                     try:
                         self.store.reset_calendar_cursor(
                             checkpoint.source_id, checkpoint.calendar_id, checkpoint.sync_token,
-                            checkpoint.page_token, attempted_at,
+                            checkpoint.page_token, checkpoint.full_sync_id, attempted_at,
                         )
                     except CalendarCursorConflict:
                         continue
@@ -402,13 +429,16 @@ class CalendarSyncService:
                 try:
                     self.store.record_calendar_error(
                         checkpoint.source_id, checkpoint.calendar_id, checkpoint.sync_token,
-                        checkpoint.page_token, exc.code, attempted_at,
+                        checkpoint.page_token, checkpoint.full_sync_id, exc.code, attempted_at,
                     )
                 except CalendarCursorConflict:
                     continue
                 return written, cancelled
 
             normalized: list[EventRecord] = []
+            seen_external_refs = [
+                f"{item.calendar_id}:{item.event_id}" for item in page.events
+            ]
             cancelled_refs = [
                 f"{deletion.calendar_id}:{deletion.event_id}" for deletion in page.deletions
             ]
@@ -449,33 +479,54 @@ class CalendarSyncService:
                     ),
                 ))
 
-            if not is_domain_authorized(checkpoint.domain_id):
-                raise PermissionError("concessão do calendário foi revogada")
-
             final = page.next_page_token is None
             try:
-                changed = self.store.apply_calendar_page(
-                    source_id=checkpoint.source_id,
-                    calendar_id=checkpoint.calendar_id,
-                    domain_id=checkpoint.domain_id,
-                    expected_sync_token=checkpoint.sync_token,
-                    expected_page_token=checkpoint.page_token,
-                    next_sync_token=page.next_sync_token,
-                    next_page_token=page.next_page_token,
-                    events=normalized,
-                    cancelled_external_refs=cancelled_refs,
-                    attempted_at=attempted_at,
-                    completed_at=observed_at if final else None,
-                )
+                guard = authorization_guard(checkpoint.domain_id) if authorization_guard else nullcontext()
+                with guard:
+                    if not is_domain_authorized(checkpoint.domain_id):
+                        raise PermissionError("concessão do calendário foi revogada")
+                    changed = self.store.apply_calendar_page(
+                        source_id=checkpoint.source_id,
+                        calendar_id=checkpoint.calendar_id,
+                        domain_id=checkpoint.domain_id,
+                        expected_sync_token=checkpoint.sync_token,
+                        expected_page_token=checkpoint.page_token,
+                        full_sync_id=checkpoint.full_sync_id,
+                        next_sync_token=page.next_sync_token,
+                        next_page_token=page.next_page_token,
+                        events=normalized,
+                        seen_external_refs=seen_external_refs,
+                        cancelled_external_refs=cancelled_refs,
+                        attempted_at=attempted_at,
+                        completed_at=observed_at if final else None,
+                    )
             except CalendarCursorConflict:
                 continue
+            except PermissionError:
+                self._abandon_incomplete_snapshot(checkpoint)
+                raise
             # The first number counts event upserts; cancellation updates are also
-            # reported by the store's total, so derive each from the page payload.
+            # reported by the store's total, including full-snapshot reconciliation.
             written += len(normalized)
-            cancelled += min(len(cancelled_refs), max(0, changed - len(normalized)))
+            cancelled += max(0, changed - len(normalized))
             if final:
                 return written, cancelled
         raise RuntimeError("sincronização simulada excedeu o limite de páginas")
+
+    def _abandon_incomplete_snapshot(self, checkpoint: CalendarSyncCheckpoint) -> None:
+        if checkpoint.full_sync_id is None:
+            return
+        try:
+            self.store.abandon_calendar_full_sync(
+                checkpoint.source_id,
+                checkpoint.calendar_id,
+                checkpoint.sync_token,
+                checkpoint.page_token,
+                checkpoint.full_sync_id,
+            )
+        except CalendarCursorConflict:
+            # Another worker already advanced or completed the snapshot.
+            return
 
     @staticmethod
     def _state(checkpoint: CalendarSyncCheckpoint, *, now: datetime | None = None) -> CalendarSyncState:

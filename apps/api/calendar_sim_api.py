@@ -9,7 +9,7 @@ from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from domain_registry import CANONICAL_DOMAIN_IDS
-from local_security import _session_from, authorized_calendar_domains
+from local_security import _session_from, authorized_calendar_domains, calendar_grant_guard
 from calendar_simulator import (
     CalendarSyncReport,
     CalendarSyncService,
@@ -69,13 +69,14 @@ def classify_simulated_calendar(
     calendar_id: str, body: ClassificationIn, request: Request
 ) -> CalendarMappingOut:
     session = _session_from(request, mutation=True)
-    if body.domain_id not in authorized_calendar_domains(session.principal):
-        raise HTTPException(status_code=403, detail="concessão de leitura para o domínio ausente")
     try:
-        checkpoint = _service(request).classify(calendar_id, body.domain_id)
+        with calendar_grant_guard(session.principal, frozenset({body.domain_id})):
+            checkpoint = _service(request).classify(calendar_id, body.domain_id)
     except ValueError as exc:
         status_code = 404 if "desconhecido" in str(exc) else 409
         raise HTTPException(status_code=status_code, detail=str(exc)) from exc
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail="concessão de leitura para o domínio ausente") from exc
     assert checkpoint.domain_id is not None and checkpoint.classified_at is not None
     return CalendarMappingOut(
         calendar_id=checkpoint.calendar_id,
@@ -91,13 +92,24 @@ def synchronize_simulated_calendars(body: SyncIn, request: Request) -> CalendarS
     if not domains:
         raise HTTPException(status_code=403, detail="concessão de leitura para Calendar simulado ausente")
     try:
-        return _service(request).sync(
+        report = _service(request).sync(
             domains,
             body.calendar_id,
             is_domain_authorized=lambda domain: domain in authorized_calendar_domains(session.principal),
+            authorization_guard=lambda domain: calendar_grant_guard(
+                session.principal, frozenset({domain})
+            ),
         )
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
+    try:
+        # The report aggregates the request's initial authorized scope. Recheck
+        # that entire scope under the revocation lock before returning any
+        # counts or domain state; a later revocation may still race with delivery.
+        with calendar_grant_guard(session.principal, domains):
+            return report
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail="concessão revogada durante a sincronização") from exc
 
 
 @router.get("/state", response_model=CalendarStatesOut)
@@ -108,4 +120,9 @@ def simulated_sync_state(request: Request) -> CalendarStatesOut:
         state for state in _service(request).states()
         if state.domain_id is not None and state.domain_id in domains
     )
-    return CalendarStatesOut(states=visible)
+    visible_domains = frozenset(state.domain_id for state in visible if state.domain_id is not None)
+    try:
+        with calendar_grant_guard(session.principal, visible_domains):
+            return CalendarStatesOut(states=visible)
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail="concessão revogada") from exc

@@ -2,16 +2,22 @@ from __future__ import annotations
 
 import sqlite3
 import hashlib
+import socket
+import threading
+import time
+from contextlib import contextmanager
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 
+import httpx
 import pytest
+import uvicorn
 from fastapi.testclient import TestClient
 
 from calendar_simulator import (
     CALENDAR_SOURCE, CalendarCursor, CalendarProvider, CalendarProviderError, CalendarSyncService,
 )
-from local_security import reset_state
+from local_security import authorized_calendar_domains, calendar_grant_guard, reset_state
 from main import create_app
 from memory_models import EventRecord, ProvenanceRecord, ReadScope
 from memory_store import EventIdentityConflict, SQLiteMemoryStore
@@ -75,6 +81,40 @@ def sync_one(client: TestClient, csrf: str, letter: str):
         headers={"origin": ORIGIN, "x-csrf-token": csrf},
         json={"calendar_id": f"sim_calendar_{letter}"},
     )
+
+
+@contextmanager
+def actual_http_server(tmp_path):
+    """Run a loopback Uvicorn socket for browser CORS preflight regression tests."""
+    with socket.socket() as reservation:
+        reservation.bind(("127.0.0.1", 0))
+        port = reservation.getsockname()[1]
+    app = create_app(
+        LocalServerConfig(host="127.0.0.1", port=port),
+        database_path=tmp_path / "actual-http" / "memory.sqlite3",
+    )
+    server = uvicorn.Server(uvicorn.Config(
+        app,
+        host="127.0.0.1",
+        port=port,
+        log_level="critical",
+        access_log=False,
+    ))
+    thread = threading.Thread(target=server.run, daemon=True)
+    thread.start()
+    deadline = time.monotonic() + 5
+    while not server.started and thread.is_alive() and time.monotonic() < deadline:
+        threading.Event().wait(0.01)
+    if not server.started:
+        server.should_exit = True
+        thread.join(timeout=5)
+        pytest.fail("servidor HTTP local não iniciou no prazo")
+    try:
+        yield f"http://127.0.0.1:{port}"
+    finally:
+        server.should_exit = True
+        thread.join(timeout=5)
+        assert not thread.is_alive()
 
 
 def test_simulator_is_session_protected_and_demo_remains_separate(client):
@@ -443,3 +483,347 @@ def test_classification_requires_matching_active_domain_grant_and_is_immutable(c
         json={"domain_id": "dom_synthetic_b"},
     )
     assert changed.status_code == 409
+
+
+def test_revocation_completed_before_page_commit_prevents_rows_and_cursor_advance(client):
+    _token, csrf = login(client)
+    grant_id = grant(client, csrf, ["dom_synthetic_a"])
+    classify(client, csrf, "a", "a")
+    service = client.app.state.calendar_sync_service
+    entered_guard = threading.Event()
+    release_guard = threading.Event()
+
+    @contextmanager
+    def pause_before_authorization_lock(domain):
+        entered_guard.set()
+        assert release_guard.wait(timeout=5)
+        with calendar_grant_guard("owner", frozenset({domain})):
+            yield
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        pending = pool.submit(
+            service.sync,
+            frozenset({"dom_synthetic_a"}),
+            "sim_calendar_a",
+            is_domain_authorized=lambda domain: domain in authorized_calendar_domains("owner"),
+            authorization_guard=pause_before_authorization_lock,
+        )
+        assert entered_guard.wait(timeout=5)
+        revoked = client.post(
+            f"/real/grants/{grant_id}/revoke",
+            headers={"origin": ORIGIN, "x-csrf-token": csrf},
+        )
+        assert revoked.status_code == 200
+        release_guard.set()
+        report = pending.result(timeout=5)
+
+    checkpoint = service.store.get_calendar_checkpoint(CALENDAR_SOURCE.id, "sim_calendar_a")
+    with sqlite3.connect(service.store.path) as connection:
+        event_count = connection.execute("SELECT COUNT(*) FROM events").fetchone()[0]
+    assert report.quarantined[0].reason == "grant_missing"
+    assert event_count == 0
+    assert checkpoint is not None
+    assert checkpoint.sync_token is None and checkpoint.page_token is None
+    assert checkpoint.full_sync_id is None
+
+
+def test_revocation_after_commit_before_http_response_suppresses_report(client):
+    _token, csrf = login(client)
+    grant_id = grant(client, csrf, ["dom_synthetic_a"])
+    classify(client, csrf, "a", "a")
+    service = client.app.state.calendar_sync_service
+    original_sync = service.sync
+    sync_committed = threading.Event()
+    release_response = threading.Event()
+
+    def pause_after_sync(*args, **kwargs):
+        report = original_sync(*args, **kwargs)
+        sync_committed.set()
+        assert release_response.wait(timeout=5)
+        return report
+
+    service.sync = pause_after_sync
+    token = client.cookies.get("jarvis_session")
+    parallel_client = TestClient(
+        client.app, base_url="http://127.0.0.1", client=("127.0.0.1", 50992)
+    )
+    parallel_client.cookies.set("jarvis_session", token)
+    request_headers = {"origin": ORIGIN, "x-csrf-token": csrf}
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        pending = pool.submit(
+            client.post,
+            "/real/calendar-sim/sync",
+            json={"calendar_id": "sim_calendar_a"},
+            headers=request_headers,
+        )
+        assert sync_committed.wait(timeout=5)
+        revoked = parallel_client.post(
+            f"/real/grants/{grant_id}/revoke", headers=request_headers
+        )
+        assert revoked.status_code == 200
+        release_response.set()
+        response = pending.result(timeout=5)
+
+    assert response.status_code == 403
+    assert "dom_synthetic_a" not in response.text
+    assert "events_written" not in response.text
+    assert client.get("/real/events").status_code == 403
+    with sqlite3.connect(service.store.path) as connection:
+        assert connection.execute("SELECT COUNT(*) FROM events").fetchone()[0] == 2
+
+
+def test_complete_snapshot_reconciles_missing_event_and_later_reappearance(client):
+    _token, csrf = login(client)
+    grant(client, csrf, ["dom_synthetic_a"])
+    classify(client, csrf, "a", "a")
+    provider = CalendarProvider(page_size=1)
+    service = CalendarSyncService(client.app.state.memory_store, provider)
+    assert service.sync(frozenset({"dom_synthetic_a"}), "sim_calendar_a").events_written == 2
+
+    removed = provider._current["sim_calendar_a"].pop("evt-synth-a-1")
+    incremental = service.sync(frozenset({"dom_synthetic_a"}), "sim_calendar_a")
+    assert incremental.cancellations_applied == 0
+    with sqlite3.connect(service.store.path) as connection:
+        not_inferred_deleted = connection.execute(
+            "SELECT cancelled_at FROM events WHERE id IN "
+            "(SELECT event_id FROM event_provenance WHERE external_ref=?)",
+            ("sim_calendar_a:evt-synth-a-1",),
+        ).fetchone()
+    assert not_inferred_deleted == (None,)
+
+    provider.invalidate_cursors("sim_calendar_a")
+    reconciled = service.sync(frozenset({"dom_synthetic_a"}), "sim_calendar_a")
+    assert reconciled.cancellations_applied == 1
+    with sqlite3.connect(service.store.path) as connection:
+        row = connection.execute(
+            "SELECT e.cancelled_at, p.external_ref FROM events e JOIN event_provenance p ON p.event_id=e.id "
+            "WHERE p.external_ref=?", ("sim_calendar_a:evt-synth-a-1",)
+        ).fetchone()
+    assert row is not None and row[0] is not None
+
+    provider.publish_event(removed.model_copy(update={
+        "summary": "Compromisso sintético reaparecido",
+        "updated_at": datetime.now(timezone.utc),
+    }))
+    reappeared = service.sync(frozenset({"dom_synthetic_a"}), "sim_calendar_a")
+    assert reappeared.events_written == 1
+    records = service.store.list_authorized_events([
+        ReadScope(connector="calendar_sim", resource_id="calendar:synthetic-primary",
+                  domain_ids=frozenset({"dom_synthetic_a"}))
+    ])
+    assert len(records) == 2
+    assert any(item.event.title == "Compromisso sintético reaparecido" for item in records)
+    assert any(item.event.provenance.external_ref == row[1] and item.event.cancelled_at is None
+               for item in records)
+
+
+def test_partial_full_snapshot_failure_does_not_reconcile_until_retry(client):
+    service = client.app.state.calendar_sync_service
+    service.classify("sim_calendar_a", "dom_synthetic_a")
+    provider = CalendarProvider(page_size=1)
+    extra = provider.get_event("sim_calendar_a", "evt-synth-a-1")
+    assert extra is not None
+    provider.publish_event(extra.model_copy(update={
+        "event_id": "evt-synth-a-3",
+        "summary": "Terceiro evento sintético",
+    }))
+    service = CalendarSyncService(service.store, provider)
+    initial = service.sync(frozenset({"dom_synthetic_a"}), "sim_calendar_a")
+    assert initial.events_written == 3
+
+    provider._current["sim_calendar_a"].pop("evt-synth-a-3")
+    provider.invalidate_cursors("sim_calendar_a")
+    original_apply = service.store.apply_calendar_page
+    injected_failure = {"done": False}
+
+    def commit_then_inject_provider_failure(**kwargs):
+        result = original_apply(**kwargs)
+        if not injected_failure["done"] and kwargs["completed_at"] is None:
+            injected_failure["done"] = True
+            provider.fail_next("sim_calendar_a")
+        return result
+
+    service.store.apply_calendar_page = commit_then_inject_provider_failure
+    failed = service.sync(frozenset({"dom_synthetic_a"}), "sim_calendar_a")
+    assert failed.states[0].status == "error"
+    with sqlite3.connect(service.store.path) as connection:
+        before_retry = connection.execute(
+            "SELECT cancelled_at FROM events WHERE id IN "
+            "(SELECT event_id FROM event_provenance WHERE external_ref=?)",
+            ("sim_calendar_a:evt-synth-a-3",),
+        ).fetchone()
+        staged = connection.execute(
+            "SELECT COUNT(*) FROM calendar_sync_seen_events WHERE calendar_id='sim_calendar_a'"
+        ).fetchone()[0]
+    assert before_retry == (None,)
+    assert staged == 1
+
+    service.store.apply_calendar_page = original_apply
+    retried = service.sync(frozenset({"dom_synthetic_a"}), "sim_calendar_a")
+    assert retried.cancellations_applied == 1
+    with sqlite3.connect(service.store.path) as connection:
+        after_retry = connection.execute(
+            "SELECT cancelled_at FROM events WHERE id IN "
+            "(SELECT event_id FROM event_provenance WHERE external_ref=?)",
+            ("sim_calendar_a:evt-synth-a-3",),
+        ).fetchone()
+        staged_after = connection.execute(
+            "SELECT COUNT(*) FROM calendar_sync_seen_events WHERE calendar_id='sim_calendar_a'"
+        ).fetchone()[0]
+    assert after_retry is not None and after_retry[0] is not None
+    assert staged_after == 0
+
+
+def test_revocation_mid_full_snapshot_discards_staging_without_reconciliation(client):
+    _token, csrf = login(client)
+    grant_id = grant(client, csrf, ["dom_synthetic_a"])
+    classify(client, csrf, "a", "a")
+    provider = CalendarProvider(page_size=1)
+    event = provider.get_event("sim_calendar_a", "evt-synth-a-1")
+    assert event is not None
+    provider.publish_event(event.model_copy(update={"event_id": "evt-synth-a-3"}))
+    service = CalendarSyncService(client.app.state.memory_store, provider)
+    authorized = frozenset({"dom_synthetic_a"})
+    checker = lambda domain: domain in authorized_calendar_domains("owner")
+    guard = lambda domain: calendar_grant_guard("owner", frozenset({domain}))
+    assert service.sync(authorized, "sim_calendar_a", is_domain_authorized=checker,
+                        authorization_guard=guard).events_written == 3
+
+    provider._current["sim_calendar_a"].pop("evt-synth-a-3")
+    provider.invalidate_cursors("sim_calendar_a")
+    second_page_guard = threading.Event()
+    release_second_page = threading.Event()
+    calls = {"count": 0}
+
+    @contextmanager
+    def pause_second_page_guard(domain):
+        calls["count"] += 1
+        if calls["count"] == 2:
+            second_page_guard.set()
+            assert release_second_page.wait(timeout=5)
+        with calendar_grant_guard("owner", frozenset({domain})):
+            yield
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        pending = pool.submit(service.sync, authorized, "sim_calendar_a",
+                              is_domain_authorized=checker,
+                              authorization_guard=pause_second_page_guard)
+        assert second_page_guard.wait(timeout=5)
+        revoked = client.post(f"/real/grants/{grant_id}/revoke",
+                              headers={"origin": ORIGIN, "x-csrf-token": csrf})
+        assert revoked.status_code == 200
+        release_second_page.set()
+        report = pending.result(timeout=5)
+
+    assert report.quarantined[0].reason == "grant_missing"
+    checkpoint = service.store.get_calendar_checkpoint(CALENDAR_SOURCE.id, "sim_calendar_a")
+    with sqlite3.connect(service.store.path) as connection:
+        missing_event = connection.execute(
+            "SELECT cancelled_at FROM events WHERE id IN "
+            "(SELECT event_id FROM event_provenance WHERE external_ref=?)",
+            ("sim_calendar_a:evt-synth-a-3",),
+        ).fetchone()
+        staged = connection.execute(
+            "SELECT COUNT(*) FROM calendar_sync_seen_events WHERE calendar_id='sim_calendar_a'"
+        ).fetchone()[0]
+    assert missing_event == (None,)
+    assert staged == 0
+    assert checkpoint is not None and checkpoint.page_token is None and checkpoint.full_sync_id is None
+
+
+def test_new_provider_epoch_forces_full_reconciled_sync_after_restart(client):
+    service = client.app.state.calendar_sync_service
+    service.classify("sim_calendar_a", "dom_synthetic_a")
+    old_provider = service.provider
+    first = service.sync(frozenset({"dom_synthetic_a"}), "sim_calendar_a")
+    assert first.events_written == 2
+    changed = old_provider.get_event("sim_calendar_a", "evt-synth-a-1")
+    assert changed is not None
+    old_provider.publish_event(changed.model_copy(update={"summary": "Alterado antes do reinício"}))
+    assert service.sync(frozenset({"dom_synthetic_a"}), "sim_calendar_a").events_written == 1
+    old_checkpoint = service.store.get_calendar_checkpoint(CALENDAR_SOURCE.id, "sim_calendar_a")
+    assert old_checkpoint is not None and old_checkpoint.sync_token is not None
+
+    new_provider = CalendarProvider()
+    restarted = CalendarSyncService(service.store, new_provider)
+    with pytest.raises(CalendarProviderError) as invalid:
+        new_provider.list_events("sim_calendar_a", CalendarCursor(sync_token=old_checkpoint.sync_token))
+    assert invalid.value.status_code == 410
+
+    recovered = restarted.sync(frozenset({"dom_synthetic_a"}), "sim_calendar_a")
+    assert recovered.events_written == 2
+    checkpoint = service.store.get_calendar_checkpoint(CALENDAR_SOURCE.id, "sim_calendar_a")
+    assert checkpoint is not None and checkpoint.sync_token != old_checkpoint.sync_token
+    assert checkpoint.page_token is None and checkpoint.full_sync_id is None
+    records = service.store.list_authorized_events([
+        ReadScope(connector="calendar_sim", resource_id="calendar:synthetic-primary",
+                  domain_ids=frozenset({"dom_synthetic_a"}))
+    ])
+    assert len(records) == 2
+    assert next(item.event.title for item in records if item.event.provenance.external_ref.endswith("evt-synth-a-1")) == "Compromisso sintético A-1"
+
+
+def test_real_http_cors_preflight_and_classification_put(tmp_path, monkeypatch):
+    reset_state()
+    monkeypatch.setenv("JARVIS_LOCAL_PASSPHRASE", PASSPHRASE)
+    with actual_http_server(tmp_path) as base_url:
+        with httpx.Client(base_url=base_url, timeout=3, trust_env=False) as http:
+            headers = {
+                "origin": ORIGIN,
+                "access-control-request-method": "PUT",
+                "access-control-request-headers": "content-type,x-csrf-token",
+            }
+            preflight = http.options(
+                "/real/calendar-sim/calendars/sim_calendar_a/classification", headers=headers
+            )
+            assert preflight.status_code == 200
+            assert preflight.headers["access-control-allow-origin"] == ORIGIN
+            assert preflight.headers["access-control-allow-credentials"] == "true"
+            assert "PUT" in preflight.headers["access-control-allow-methods"]
+            assert preflight.headers["access-control-allow-origin"] != "*"
+
+            login_response = http.post(
+                "/real/session", headers={"origin": ORIGIN}, json={"passphrase": PASSPHRASE}
+            )
+            assert login_response.status_code == 201
+            csrf = login_response.json()["csrf_token"]
+            grant_response = http.post(
+                "/real/grants",
+                headers={"origin": ORIGIN, "x-csrf-token": csrf},
+                json={
+                    "connector": "calendar_sim", "permission": "read",
+                    "resource_ids": ["calendar:synthetic-primary"],
+                    "domain_ids": ["dom_synthetic_a", "dom_synthetic_b"],
+                    "expires_at": (datetime.now(timezone.utc) + timedelta(days=1)).isoformat(),
+                },
+            )
+            assert grant_response.status_code == 201
+            classified = http.put(
+                "/real/calendar-sim/calendars/sim_calendar_a/classification",
+                headers={"origin": ORIGIN, "x-csrf-token": csrf},
+                json={"domain_id": "dom_synthetic_a"},
+            )
+            assert classified.status_code == 200
+
+            external_origin = http.options(
+                "/real/calendar-sim/calendars/sim_calendar_b/classification",
+                headers={**headers, "origin": "https://outside.invalid"},
+            )
+            disallowed_method = http.options(
+                "/real/calendar-sim/calendars/sim_calendar_b/classification",
+                headers={**headers, "access-control-request-method": "PATCH"},
+            )
+            unexpected_header = http.options(
+                "/real/calendar-sim/calendars/sim_calendar_b/classification",
+                headers={**headers, "access-control-request-headers": "content-type,x-csrf-token,x-unexpected"},
+            )
+            denied_put = http.put(
+                "/real/calendar-sim/calendars/sim_calendar_b/classification",
+                headers={"origin": "https://outside.invalid", "x-csrf-token": csrf},
+                json={"domain_id": "dom_synthetic_b"},
+            )
+            assert external_origin.status_code == 400
+            assert disallowed_method.status_code == 400
+            assert unexpected_header.status_code == 400
+            assert denied_put.status_code == 403

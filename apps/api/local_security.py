@@ -6,8 +6,10 @@ import hmac
 import os
 import secrets
 from collections import defaultdict, deque
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from threading import RLock
 from typing import Literal
 
 from fastapi import APIRouter, HTTPException, Request, Response
@@ -50,6 +52,7 @@ class Grant:
 
 _sessions: dict[str, Session] = {}
 _grants: dict[str, Grant] = {}
+_grant_lock = RLock()
 _login_failures: dict[str, deque[datetime]] = defaultdict(deque)
 _login_blocked_until: dict[str, datetime] = {}
 
@@ -57,7 +60,8 @@ _login_blocked_until: dict[str, datetime] = {}
 def reset_state() -> None:
     """Limpa estado volátil; usado também para modelar reinício do processo."""
     _sessions.clear()
-    _grants.clear()
+    with _grant_lock:
+        _grants.clear()
     _login_failures.clear()
     _login_blocked_until.clear()
 
@@ -203,20 +207,35 @@ def _session_from(request: Request, *, mutation: bool = False) -> Session:
 
 def _active_grants(principal: str, at: datetime | None = None) -> list[Grant]:
     instant = at or _now()
-    return [grant for grant in _grants.values() if grant.principal == principal and not grant.revoked and grant.expires_at > instant]
+    with _grant_lock:
+        return [grant for grant in _grants.values() if grant.principal == principal and not grant.revoked and grant.expires_at > instant]
 
 
 def authorized_calendar_domains(principal: str) -> frozenset[str]:
     """Return only domains covered by an active calendar_sim read grant."""
     allowed: set[str] = set()
-    for grant in _active_grants(principal):
-        if grant.connector != "calendar_sim":
-            continue
-        valid_resources = grant.resource_ids & CANONICAL_RESOURCES["calendar_sim"]
-        if not valid_resources or valid_resources != grant.resource_ids:
-            continue
-        allowed.update(grant.domain_ids & CANONICAL_DOMAIN_IDS)
+    with _grant_lock:
+        for grant in _active_grants(principal):
+            if grant.connector != "calendar_sim":
+                continue
+            valid_resources = grant.resource_ids & CANONICAL_RESOURCES["calendar_sim"]
+            if not valid_resources or valid_resources != grant.resource_ids:
+                continue
+            allowed.update(grant.domain_ids & CANONICAL_DOMAIN_IDS)
     return frozenset(allowed)
+
+
+@contextmanager
+def calendar_grant_guard(principal: str, required_domains: set[str] | frozenset[str]):
+    """Hold grant mutation stable while committing a page or preparing its response.
+
+    Revocation and page commit linearize on ``_grant_lock``. No provider/network
+    operation may run inside this context.
+    """
+    with _grant_lock:
+        if not required_domains <= authorized_calendar_domains(principal):
+            raise PermissionError("concessão de Calendar revogada")
+        yield
 
 
 def _authorized_records(
@@ -353,24 +372,25 @@ def create_grant(body: GrantIn, request: Request) -> dict:
     session = _session_from(request, mutation=True)
     resources = frozenset(body.resource_ids)
     domains = frozenset(body.domain_ids)
-    now = _now()
-    for existing in _active_grants(session.principal, now):
-        overlaps = (
-            existing.connector == body.connector
-            and bool(existing.resource_ids & resources)
-            and bool(existing.domain_ids & domains)
+    with _grant_lock:
+        now = _now()
+        for existing in _active_grants(session.principal, now):
+            overlaps = (
+                existing.connector == body.connector
+                and bool(existing.resource_ids & resources)
+                and bool(existing.domain_ids & domains)
+            )
+            if overlaps:
+                raise HTTPException(status_code=409, detail="grant ativo sobreposto; revogue-o antes de conceder novamente")
+        grant = Grant(
+            id=secrets.token_hex(16),
+            principal=session.principal,
+            connector=body.connector,
+            resource_ids=resources,
+            domain_ids=domains,
+            expires_at=body.expires_at,
         )
-        if overlaps:
-            raise HTTPException(status_code=409, detail="grant ativo sobreposto; revogue-o antes de conceder novamente")
-    grant = Grant(
-        id=secrets.token_hex(16),
-        principal=session.principal,
-        connector=body.connector,
-        resource_ids=resources,
-        domain_ids=domains,
-        expires_at=body.expires_at,
-    )
-    _grants[grant.id] = grant
+        _grants[grant.id] = grant
     return {
         "id": grant.id,
         "principal": grant.principal,
@@ -386,10 +406,11 @@ def create_grant(body: GrantIn, request: Request) -> dict:
 @router.post("/grants/{grant_id}/revoke", status_code=200)
 def revoke_grant(grant_id: str, request: Request) -> dict:
     session = _session_from(request, mutation=True)
-    grant = _grants.get(grant_id)
-    if grant is None or grant.principal != session.principal:
-        raise HTTPException(status_code=404, detail="concessão ausente")
-    grant.revoked = True
+    with _grant_lock:
+        grant = _grants.get(grant_id)
+        if grant is None or grant.principal != session.principal:
+            raise HTTPException(status_code=404, detail="concessão ausente")
+        grant.revoked = True
     return {"id": grant.id, "revoked": True}
 
 
@@ -415,4 +436,5 @@ def read_briefing(request: Request) -> RealBriefingOut:
 
 
 def put_grant_for_tests(grant: Grant) -> None:
-    _grants[grant.id] = grant
+    with _grant_lock:
+        _grants[grant.id] = grant

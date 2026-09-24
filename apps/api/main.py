@@ -124,7 +124,7 @@ def create_app(config: LocalServerConfig, *, database_path: str | Path | None = 
         CORSMiddleware,
         allow_origins=sorted(ALLOWED_ORIGINS),
         allow_credentials=True,
-        allow_methods=["GET", "POST", "DELETE", "OPTIONS"],
+        allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
         allow_headers=["content-type", "x-csrf-token"],
     )
     app.include_router(demo_router)

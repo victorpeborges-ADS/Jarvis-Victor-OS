@@ -521,7 +521,7 @@ class SQLiteMemoryStore:
                 (checkpoint.source_id, checkpoint.calendar_id),
             )
             row = connection.execute(
-                "SELECT source_id, calendar_id, domain_id, classified_at, sync_token, page_token, sync_status, "
+                "SELECT source_id, calendar_id, domain_id, classified_at, sync_token, page_token, full_sync_id, sync_status, "
                 "last_success_at, last_attempt_at, error_code FROM calendar_sync_states WHERE source_id=? AND calendar_id=?",
                 (checkpoint.source_id, checkpoint.calendar_id),
             ).fetchone()
@@ -533,7 +533,7 @@ class SQLiteMemoryStore:
         self._require_initialized()
         with closing(self._connect()) as connection:
             row = connection.execute(
-                "SELECT source_id, calendar_id, domain_id, classified_at, sync_token, page_token, sync_status, "
+                "SELECT source_id, calendar_id, domain_id, classified_at, sync_token, page_token, full_sync_id, sync_status, "
                 "last_success_at, last_attempt_at, error_code FROM calendar_sync_states WHERE source_id=? AND calendar_id=?",
                 (source_id, calendar_id),
             ).fetchone()
@@ -543,7 +543,7 @@ class SQLiteMemoryStore:
         self._require_initialized()
         with closing(self._connect()) as connection:
             rows = connection.execute(
-                "SELECT source_id, calendar_id, domain_id, classified_at, sync_token, page_token, sync_status, "
+                "SELECT source_id, calendar_id, domain_id, classified_at, sync_token, page_token, full_sync_id, sync_status, "
                 "last_success_at, last_attempt_at, error_code FROM calendar_sync_states WHERE source_id=? ORDER BY calendar_id",
                 (source_id,),
             ).fetchall()
@@ -574,13 +574,81 @@ class SQLiteMemoryStore:
                     (domain_id, classified_at.isoformat(), candidate.source_id, candidate.calendar_id),
                 )
             result = connection.execute(
-                "SELECT source_id, calendar_id, domain_id, classified_at, sync_token, page_token, sync_status, "
+                "SELECT source_id, calendar_id, domain_id, classified_at, sync_token, page_token, full_sync_id, sync_status, "
                 "last_success_at, last_attempt_at, error_code FROM calendar_sync_states WHERE source_id=? AND calendar_id=?",
                 (candidate.source_id, candidate.calendar_id),
             ).fetchone()
         if result is None:
             raise MemoryStoreError("estado de sincronização local indisponível")
         return self._checkpoint_from_row(result)
+
+    def begin_calendar_full_sync(
+        self,
+        source_id: str,
+        calendar_id: str,
+        expected_sync_token: str | None,
+        expected_page_token: str | None,
+        full_sync_id: str,
+    ) -> CalendarSyncCheckpoint:
+        if not full_sync_id or len(full_sync_id) > 128:
+            raise ValueError("identificador de ressincronização inválido")
+        with self.transaction() as connection:
+            row = connection.execute(
+                "SELECT source_id, calendar_id, domain_id, classified_at, sync_token, page_token, full_sync_id, "
+                "sync_status, last_success_at, last_attempt_at, error_code FROM calendar_sync_states "
+                "WHERE source_id=? AND calendar_id=?",
+                (source_id, calendar_id),
+            ).fetchone()
+            if row is None or (row["sync_token"], row["page_token"]) != (
+                expected_sync_token, expected_page_token
+            ):
+                raise CalendarCursorConflict("cursor avançado por outra sincronização")
+            if expected_sync_token is not None or expected_page_token is not None:
+                raise ValueError("ressincronização completa exige cursor vazio")
+            if row["full_sync_id"] is not None:
+                return self._checkpoint_from_row(row)
+            connection.execute(
+                "UPDATE calendar_sync_states SET full_sync_id=? WHERE source_id=? AND calendar_id=?",
+                (full_sync_id, source_id, calendar_id),
+            )
+            updated = connection.execute(
+                "SELECT source_id, calendar_id, domain_id, classified_at, sync_token, page_token, full_sync_id, "
+                "sync_status, last_success_at, last_attempt_at, error_code FROM calendar_sync_states "
+                "WHERE source_id=? AND calendar_id=?",
+                (source_id, calendar_id),
+            ).fetchone()
+        if updated is None:
+            raise MemoryStoreError("estado de sincronização local indisponível")
+        return self._checkpoint_from_row(updated)
+
+    def abandon_calendar_full_sync(
+        self,
+        source_id: str,
+        calendar_id: str,
+        expected_sync_token: str | None,
+        expected_page_token: str | None,
+        full_sync_id: str,
+    ) -> None:
+        """Discard only an incomplete full-snapshot scan; never reconcile it."""
+        with self.transaction() as connection:
+            row = connection.execute(
+                "SELECT sync_token, page_token, full_sync_id FROM calendar_sync_states "
+                "WHERE source_id=? AND calendar_id=?",
+                (source_id, calendar_id),
+            ).fetchone()
+            if row is None or (row["sync_token"], row["page_token"], row["full_sync_id"]) != (
+                expected_sync_token, expected_page_token, full_sync_id
+            ):
+                raise CalendarCursorConflict("cursor avançado por outra sincronização")
+            connection.execute(
+                "DELETE FROM calendar_sync_seen_events WHERE source_id=? AND calendar_id=? AND full_sync_id=?",
+                (source_id, calendar_id, full_sync_id),
+            )
+            connection.execute(
+                "UPDATE calendar_sync_states SET sync_token=NULL, page_token=NULL, full_sync_id=NULL "
+                "WHERE source_id=? AND calendar_id=?",
+                (source_id, calendar_id),
+            )
 
     def save_event(self, event_value: EventRecord | dict) -> EventRecord:
         event = _validated(EventRecord, event_value)
@@ -667,9 +735,11 @@ class SQLiteMemoryStore:
         domain_id: str,
         expected_sync_token: str | None,
         expected_page_token: str | None,
+        full_sync_id: str | None,
         next_sync_token: str | None,
         next_page_token: str | None,
         events: Sequence[EventRecord],
+        seen_external_refs: Sequence[str],
         cancelled_external_refs: Sequence[str],
         attempted_at: datetime,
         completed_at: datetime | None,
@@ -689,19 +759,34 @@ class SQLiteMemoryStore:
                 raise ValueError("payload minimizado excede o limite")
         if any(not ref.startswith(f"{calendar_id}:") for ref in cancelled_external_refs):
             raise ValueError("cancelamento não corresponde ao calendário")
+        if any(not ref.startswith(f"{calendar_id}:") for ref in seen_external_refs):
+            raise ValueError("referência observada não corresponde ao calendário")
+        if expected_sync_token is None and not full_sync_id:
+            raise ValueError("snapshot completo exige identificador de sincronização")
+        if expected_sync_token is not None and full_sync_id is not None:
+            raise ValueError("sincronização incremental não aceita identificador de snapshot")
 
         with self.transaction() as connection:
             row = connection.execute(
-                "SELECT domain_id, sync_token, page_token FROM calendar_sync_states WHERE source_id=? AND calendar_id=?",
+                "SELECT domain_id, sync_token, page_token, full_sync_id FROM calendar_sync_states "
+                "WHERE source_id=? AND calendar_id=?",
                 (source_id, calendar_id),
             ).fetchone()
             if row is None or row["domain_id"] != domain_id:
                 raise ValueError("calendário não está classificado para este domínio")
             if row["sync_token"] != expected_sync_token or row["page_token"] != expected_page_token:
                 raise CalendarCursorConflict("cursor avançado por outra sincronização")
+            if row["full_sync_id"] != full_sync_id:
+                raise CalendarCursorConflict("geração de snapshot avançada por outra sincronização")
 
             for event in validated_events:
                 self._save_event_in_connection(connection, event)
+            if full_sync_id is not None:
+                connection.executemany(
+                    "INSERT OR IGNORE INTO calendar_sync_seen_events(source_id, calendar_id, full_sync_id, external_ref) "
+                    "VALUES (?, ?, ?, ?)",
+                    [(source_id, calendar_id, full_sync_id, ref) for ref in set(seen_external_refs)],
+                )
             cancelled_count = 0
             if cancelled_external_refs:
                 for external_ref in set(cancelled_external_refs):
@@ -714,13 +799,31 @@ class SQLiteMemoryStore:
                     )
                     cancelled_count += max(0, cursor.rowcount)
 
+            if full_sync_id is not None and completed_at is not None:
+                missing = connection.execute(
+                    "UPDATE events SET cancelled_at=? WHERE id IN ("
+                    "SELECT e.id FROM events e JOIN event_provenance p ON p.event_id=e.id "
+                    "WHERE e.source_id=? AND e.dataset='real' AND e.domain_id=? AND p.source_id=? "
+                    "AND substr(p.external_ref, 1, ?) = ? AND e.cancelled_at IS NULL "
+                    "AND NOT EXISTS (SELECT 1 FROM calendar_sync_seen_events seen "
+                    "WHERE seen.source_id=? AND seen.calendar_id=? AND seen.full_sync_id=? "
+                    "AND seen.external_ref=p.external_ref))",
+                    (attempted_at.isoformat(), source_id, domain_id, source_id,
+                     len(calendar_id) + 1, f"{calendar_id}:", source_id, calendar_id, full_sync_id),
+                )
+                cancelled_count += max(0, missing.rowcount)
+                connection.execute(
+                    "DELETE FROM calendar_sync_seen_events WHERE source_id=? AND calendar_id=? AND full_sync_id=?",
+                    (source_id, calendar_id, full_sync_id),
+                )
+
             stored_sync_token = next_sync_token if completed_at is not None else expected_sync_token
             stored_page_token = None if completed_at is not None else next_page_token
             connection.execute(
-                "UPDATE calendar_sync_states SET sync_token=?, page_token=?, sync_status='simulated', "
+                "UPDATE calendar_sync_states SET sync_token=?, page_token=?, full_sync_id=?, sync_status='simulated', "
                 "last_attempt_at=?, last_success_at=COALESCE(?, last_success_at), error_code=NULL "
                 "WHERE source_id=? AND calendar_id=?",
-                (stored_sync_token, stored_page_token, attempted_at.isoformat(),
+                (stored_sync_token, stored_page_token, None if completed_at is not None else full_sync_id, attempted_at.isoformat(),
                  completed_at.isoformat() if completed_at else None, source_id, calendar_id),
             )
             change_count = len(validated_events) + cancelled_count
@@ -730,14 +833,18 @@ class SQLiteMemoryStore:
 
     def record_calendar_error(
         self, source_id: str, calendar_id: str, expected_sync_token: str | None,
-        expected_page_token: str | None, error_code: str, attempted_at: datetime,
+        expected_page_token: str | None, expected_full_sync_id: str | None,
+        error_code: str, attempted_at: datetime,
     ) -> None:
         with self.transaction() as connection:
             row = connection.execute(
-                "SELECT sync_token, page_token FROM calendar_sync_states WHERE source_id=? AND calendar_id=?",
+                "SELECT sync_token, page_token, full_sync_id FROM calendar_sync_states "
+                "WHERE source_id=? AND calendar_id=?",
                 (source_id, calendar_id),
             ).fetchone()
-            if row is None or (row["sync_token"], row["page_token"]) != (expected_sync_token, expected_page_token):
+            if row is None or (row["sync_token"], row["page_token"], row["full_sync_id"]) != (
+                expected_sync_token, expected_page_token, expected_full_sync_id
+            ):
                 raise CalendarCursorConflict("cursor avançado por outra sincronização")
             connection.execute(
                 "UPDATE calendar_sync_states SET sync_status='error', error_code=?, last_attempt_at=? "
@@ -747,18 +854,28 @@ class SQLiteMemoryStore:
 
     def reset_calendar_cursor(
         self, source_id: str, calendar_id: str, expected_sync_token: str | None,
-        expected_page_token: str | None, attempted_at: datetime,
+        expected_page_token: str | None, expected_full_sync_id: str | None,
+        attempted_at: datetime,
     ) -> None:
         with self.transaction() as connection:
             row = connection.execute(
-                "SELECT sync_token, page_token FROM calendar_sync_states WHERE source_id=? AND calendar_id=?",
+                "SELECT sync_token, page_token, full_sync_id FROM calendar_sync_states "
+                "WHERE source_id=? AND calendar_id=?",
                 (source_id, calendar_id),
             ).fetchone()
-            if row is None or (row["sync_token"], row["page_token"]) != (expected_sync_token, expected_page_token):
+            if row is None or (row["sync_token"], row["page_token"], row["full_sync_id"]) != (
+                expected_sync_token, expected_page_token, expected_full_sync_id
+            ):
                 raise CalendarCursorConflict("cursor avançado por outra sincronização")
+            if row["full_sync_id"] is not None:
+                connection.execute(
+                    "DELETE FROM calendar_sync_seen_events WHERE source_id=? AND calendar_id=? AND full_sync_id=?",
+                    (source_id, calendar_id, row["full_sync_id"]),
+                )
             connection.execute(
-                "UPDATE calendar_sync_states SET sync_token=NULL, page_token=NULL, sync_status='simulated', "
-                "error_code=NULL, last_attempt_at=? WHERE source_id=? AND calendar_id=?",
+                "UPDATE calendar_sync_states SET sync_token=NULL, page_token=NULL, full_sync_id=NULL, "
+                "sync_status='error', error_code='invalid_cursor', last_attempt_at=? "
+                "WHERE source_id=? AND calendar_id=?",
                 (attempted_at.isoformat(), source_id, calendar_id),
             )
 

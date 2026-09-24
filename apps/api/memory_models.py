@@ -148,6 +148,7 @@ class CalendarSyncCheckpoint(StrictRecord):
     classified_at: datetime | None = None
     sync_token: str | None = Field(default=None, max_length=512)
     page_token: str | None = Field(default=None, max_length=512)
+    full_sync_id: str | None = Field(default=None, max_length=128)
     sync_status: Literal["simulated", "stale", "error"] = "simulated"
     last_success_at: datetime | None = None
     last_attempt_at: datetime | None = None
