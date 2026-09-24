@@ -154,7 +154,8 @@ def test_calendar_requires_explicit_mapping_and_missing_grant_is_quarantined(cli
     assert unclassified.json()["events_written"] == 0
     assert len(unclassified.json()["quarantined"]) == 8
     assert {entry["reason"] for entry in unclassified.json()["quarantined"]} == {"unclassified"}
-    assert client.get("/real/events").status_code == 403
+    assert client.get("/real/events").status_code == 200
+    assert client.get("/real/events").json() == []
     with sqlite3.connect(client.app.state.memory_store.path) as connection:
         assert connection.execute("SELECT COUNT(*) FROM events").fetchone()[0] == 0
 

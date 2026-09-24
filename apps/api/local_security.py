@@ -82,6 +82,35 @@ class LoginIn(BaseModel):
     passphrase: str = Field(min_length=12, max_length=200)
 
 
+class SessionOut(BaseModel):
+    csrf_token: str
+    dataset: Literal["real"] = "real"
+    expires_at: datetime
+
+
+class GrantOut(BaseModel):
+    id: str
+    principal: str
+    connector: Literal["calendar_sim"]
+    permission: Literal["read"] = "read"
+    resource_ids: list[str]
+    domain_ids: list[str]
+    expires_at: datetime
+    revoked: bool = False
+
+
+def _grant_response(grant: Grant) -> GrantOut:
+    return GrantOut(
+        id=grant.id,
+        principal=grant.principal,
+        connector=grant.connector,
+        resource_ids=sorted(grant.resource_ids),
+        domain_ids=sorted(grant.domain_ids),
+        expires_at=grant.expires_at,
+        revoked=grant.revoked,
+    )
+
+
 class GrantIn(BaseModel):
     connector: Literal["calendar_sim"]
     permission: Literal["read"]
@@ -264,6 +293,8 @@ def _authorized_records(
                 ))
     if not scopes:
         raise HTTPException(status_code=403, detail="concessão ausente")
+    if requested_domain is not None and not any(requested_domain in scope.domain_ids for scope in scopes):
+        raise HTTPException(status_code=403, detail="concessão ausente")
 
     if record_id is None:
         found = store.list_authorized_events(scopes, requested_domain)
@@ -285,8 +316,9 @@ def _authorized_records(
     if record_id is not None and not authorized:
         # Resposta uniforme evita revelar se o ID existe fora do escopo concedido.
         raise HTTPException(status_code=404, detail="registro ausente")
-    if not authorized:
-        raise HTTPException(status_code=403, detail="concessão ausente")
+    # A valid scope with no matching rows is an authorized empty collection.
+    # Keep 403 for missing scopes above and 404 for direct IDs to avoid both
+    # false authorization failures and existence leaks.
     return authorized
 
 
@@ -332,7 +364,7 @@ def _record_login_failure(key: str) -> None:
 
 
 @router.post("/session", status_code=201)
-def open_session(body: LoginIn, request: Request, response: Response) -> dict:
+def open_session(body: LoginIn, request: Request, response: Response) -> SessionOut:
     require_allowed_origin(request.headers.get("origin"))
     key = _rate_limit_key(request)
     if not is_loopback_address(key):
@@ -357,7 +389,18 @@ def open_session(body: LoginIn, request: Request, response: Response) -> dict:
     response.headers["Cache-Control"] = "no-store"
     response.headers["Pragma"] = "no-cache"
     _set_cookie(response, token, request.url.scheme == "https")
-    return {"csrf_token": csrf_token, "dataset": "real"}
+    return SessionOut(csrf_token=csrf_token, expires_at=_sessions[token].expires_at)
+
+
+@router.get("/session", response_model=SessionOut)
+def current_session(request: Request, response: Response) -> SessionOut:
+    # Browsers need to recover the session-bound CSRF value after a page reload.
+    # Exact Origin validation and the HttpOnly session cookie remain mandatory.
+    require_allowed_origin(request.headers.get("origin"))
+    session = _session_from(request)
+    response.headers["Cache-Control"] = "no-store"
+    response.headers["Pragma"] = "no-cache"
+    return SessionOut(csrf_token=session.csrf_token, expires_at=session.expires_at)
 
 
 @router.delete("/session", status_code=204)
@@ -367,8 +410,19 @@ def close_session(request: Request, response: Response) -> None:
     response.delete_cookie(SESSION_COOKIE, path="/")
 
 
-@router.post("/grants", status_code=201)
-def create_grant(body: GrantIn, request: Request) -> dict:
+@router.get("/grants", response_model=list[GrantOut])
+def list_active_grants(request: Request, response: Response) -> list[GrantOut]:
+    require_allowed_origin(request.headers.get("origin"))
+    session = _session_from(request)
+    response.headers["Cache-Control"] = "no-store"
+    response.headers["Pragma"] = "no-cache"
+    with _grant_lock:
+        active = _active_grants(session.principal)
+        return [_grant_response(grant) for grant in sorted(active, key=lambda item: item.id)]
+
+
+@router.post("/grants", status_code=201, response_model=GrantOut)
+def create_grant(body: GrantIn, request: Request) -> GrantOut:
     session = _session_from(request, mutation=True)
     resources = frozenset(body.resource_ids)
     domains = frozenset(body.domain_ids)
@@ -391,16 +445,7 @@ def create_grant(body: GrantIn, request: Request) -> dict:
             expires_at=body.expires_at,
         )
         _grants[grant.id] = grant
-    return {
-        "id": grant.id,
-        "principal": grant.principal,
-        "connector": grant.connector,
-        "permission": "read",
-        "resource_ids": sorted(grant.resource_ids),
-        "domain_ids": sorted(grant.domain_ids),
-        "expires_at": grant.expires_at.isoformat(),
-        "revoked": grant.revoked,
-    }
+    return _grant_response(grant)
 
 
 @router.post("/grants/{grant_id}/revoke", status_code=200)

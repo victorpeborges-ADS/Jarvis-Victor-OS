@@ -151,8 +151,11 @@ def test_real_database_starts_empty_and_never_imports_demo_fixture(empty_client)
     assert login(empty_client).status_code == 201
     csrf = csrf_for(empty_client)
     assert grant(empty_client, csrf, ["dom_synthetic_a"]).status_code == 201
-    assert empty_client.get("/real/events").status_code == 403
-    assert empty_client.get("/real/briefing").status_code == 403
+    assert empty_client.get("/real/events").status_code == 200
+    assert empty_client.get("/real/events").json() == []
+    assert empty_client.get("/real/events", params={"domain_id": "dom_synthetic_a"}).json() == []
+    assert empty_client.get("/real/briefing").status_code == 200
+    assert empty_client.get("/real/briefing").json() == {"dataset": "real", "items": []}
     assert empty_client.get("/real/events/evt_001").status_code == 404
     with sqlite3.connect(empty_client.app.state.memory_store.path) as connection:
         assert connection.execute("SELECT COUNT(*) FROM events").fetchone()[0] == 0
@@ -184,9 +187,19 @@ def test_malformed_persisted_record_is_omitted_without_crashing_api(client):
         connection.execute("PRAGMA ignore_check_constraints=ON")
         connection.execute("UPDATE events SET payload_json='{' WHERE id='real_evt_synth_a_1'")
         connection.commit()
-    assert client.get("/real/events").status_code == 403
+    assert client.get("/real/events").status_code == 200
+    assert client.get("/real/events").json() == []
     assert client.get("/real/events/real_evt_synth_a_1").status_code == 404
-    assert client.get("/real/briefing").status_code == 403
+    assert client.get("/real/briefing").status_code == 200
+    assert client.get("/real/briefing").json() == {"dataset": "real", "items": []}
+
+
+def test_empty_authorized_collection_is_not_misreported_as_missing_grant(empty_client):
+    assert login(empty_client).status_code == 201
+    assert grant(empty_client, csrf_for(empty_client), ["dom_synthetic_a"]).status_code == 201
+    response = empty_client.get("/real/events", params={"domain_id": "dom_synthetic_a"})
+    assert response.status_code == 200
+    assert response.json() == []
 
 
 def test_cookie_flags_entropy_expiry_and_no_store(client):
@@ -218,6 +231,7 @@ def test_absent_tampered_expired_logout_and_restarted_sessions_fail_closed(clien
     session = _sessions[old_token]
     session.expires_at = datetime.now(timezone.utc) - timedelta(seconds=1)
     assert client.get("/real/briefing").status_code == 401
+    assert client.get("/real/session", headers={"origin": ALLOWED_ORIGIN}).status_code == 401
     assert old_token not in _sessions
 
     login(client)
@@ -236,6 +250,42 @@ def test_absent_tampered_expired_logout_and_restarted_sessions_fail_closed(clien
     )
     result = subprocess.run([sys.executable, "-c", child_code], cwd=Path(__file__).parent, env=child_env, capture_output=True, text=True, check=True)
     assert result.stdout.strip().endswith("401")
+
+
+def test_browser_session_bootstrap_and_active_grant_list_are_private_and_uncacheable(client):
+    assert client.get("/real/session", headers={"origin": ALLOWED_ORIGIN}).status_code == 401
+    assert client.get("/real/grants", headers={"origin": ALLOWED_ORIGIN}).status_code == 401
+
+    opened = login(client)
+    assert opened.status_code == 201
+    csrf = opened.json()["csrf_token"]
+    assert opened.json()["expires_at"]
+
+    resumed = client.get("/real/session", headers={"origin": ALLOWED_ORIGIN})
+    assert resumed.status_code == 200
+    assert resumed.json()["csrf_token"] == csrf
+    assert resumed.json()["dataset"] == "real"
+    assert resumed.headers["cache-control"] == "no-store"
+    assert resumed.headers["pragma"] == "no-cache"
+    assert client.get("/real/session").status_code == 403
+    assert client.get("/real/session", headers={"origin": "https://evil.example"}).status_code == 403
+    assert client.get("/real/grants").status_code == 403
+    assert client.get("/real/grants", headers={"origin": "https://evil.example"}).status_code == 403
+
+    created = grant(client, csrf, ["dom_synthetic_a"])
+    assert created.status_code == 201
+    listed = client.get("/real/grants", headers={"origin": ALLOWED_ORIGIN})
+    assert listed.status_code == 200
+    assert listed.headers["cache-control"] == "no-store"
+    assert [item["id"] for item in listed.json()] == [created.json()["id"]]
+    assert listed.json()[0]["domain_ids"] == ["dom_synthetic_a"]
+
+    revoked = client.post(
+        f"/real/grants/{created.json()['id']}/revoke",
+        headers={"origin": ALLOWED_ORIGIN, "x-csrf-token": csrf},
+    )
+    assert revoked.status_code == 200
+    assert client.get("/real/grants", headers={"origin": ALLOWED_ORIGIN}).json() == []
 
 
 def test_login_rejects_external_and_missing_origin(client):
