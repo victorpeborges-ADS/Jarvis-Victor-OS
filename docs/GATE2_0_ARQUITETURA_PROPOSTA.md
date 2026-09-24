@@ -1,6 +1,6 @@
 # Gate 2.0 — Proposta de arquitetura
 
-**Estado:** referência arquitetural aprovada. A fundação B e o C.1 foram tecnicamente aceitos. C.2 foi implementado em branch dedicada, somente para backup cifrado e restauração sintética, e aguarda auditoria independente.
+**Estado:** referência arquitetural aprovada. A fundação B, o C.1 e o C.2 foram tecnicamente aceitos nos escopos documentados. O C.2 limita-se a backup cifrado e restauração isolada com bancos sintéticos.
 **Base original da proposta:** `main` @ `ef5d3cd`, tag `gate1-accepted-v0.1`. A aprovação e consolidação B estão registradas em `docs/GATE2_0B_2_HARDENING.md`.
 **Data:** 23/09/2026.  
 **Restrição:** qualquer implementação depende de aceite explícito e delimitado. C.1 está aceito; o aceite separado do C.2 cobre apenas backup cifrado e restauração isolada com bancos sintéticos, não dados reais, OAuth ou conectores.
@@ -86,7 +86,7 @@ O estado implementado e os seus limites estão documentados em [`docs/GATE2_0C_1
 
 ### Implementação delimitada C.2
 
-O backup cifrado e a restauração em diretório novo estão descritos em [`docs/GATE2_0C_2_BACKUP_RECOVERY.md`](GATE2_0C_2_BACKUP_RECOVERY.md). A implementação aguarda auditoria independente e continua restrita a bancos sintéticos descartáveis; não ativa a restauração, não substitui a base padrão e não altera as decisões pendentes de retenção ou gestão de chaves.
+O backup cifrado e a restauração em diretório novo estão descritos em [`docs/GATE2_0C_2_BACKUP_RECOVERY.md`](GATE2_0C_2_BACKUP_RECOVERY.md). O aceite independente, registrado em [`docs/GATE2_0C_2_ACEITE.md`](GATE2_0C_2_ACEITE.md), continua restrito a bancos sintéticos descartáveis; não ativa a restauração, não substitui a base padrão e não altera as decisões pendentes de retenção ou gestão de chaves.
 
 ## 4. Primeira integração
 

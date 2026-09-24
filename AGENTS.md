@@ -69,7 +69,7 @@ uv run --locked python serve.py  # loopback; não executar uvicorn main:app
 - **Gate 1 (tecnicamente aceito):** somente mocks sinalizados. Nenhuma escrita externa. Tag `gate1-accepted-v0.1`. Aprovação humana continua obrigatória para qualquer ação que toque Google ou produção.
 - **Gate 2.0-B:** tecnicamente aceito; encerramento em `docs/GATE2_0B_2_HARDENING.md`, tag local `gate2-b-accepted-v0.1`.
 - **Gate 2.0-C.1:** tecnicamente aceito em `gate2-c1-accepted-v0.1`, no commit `2609bdb`. A base SQLite permanece separada das fixtures DEMO; sessões e concessões são voláteis.
-- **Gate 2.0-C.2:** implementação de backup cifrado e restauração local sintética em `feat/gate2.0-c2-backup-recovery`, aguardando auditoria independente. A autorização não cobre usar/restaurar o banco padrão em testes, dados pessoais/institucionais, retenção automática, persistência de chaves, ativação ou substituição de banco.
+- **Gate 2.0-C.2:** tecnicamente aceito para backup cifrado e restauração isolada de bancos sintéticos; tag local `gate2-c2-accepted-v0.1` aponta para `c6f7ce5`. O registro da auditoria independente está em `docs/GATE2_0C_2_ACEITE.md`. A aceitação não cobre usar/restaurar o banco padrão em testes, dados pessoais/institucionais, retenção automática, Keychain, ativação ou substituição de banco.
 - **Próximas etapas:** Calendar real, OAuth, Gmail, Drive, LLM, acesso remoto e deploy exigem autorização separada. Escrita externa permanece desativada.
 - **Gate 3+:** escrita só após testes de idempotência, concorrência, revogação e consentimento.
 

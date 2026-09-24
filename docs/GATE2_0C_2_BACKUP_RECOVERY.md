@@ -1,6 +1,6 @@
 # Gate 2.0-C.2 — Backup cifrado e restauração isolada
 
-**Estado:** implementação em `feat/gate2.0-c2-backup-recovery`, aguardando auditoria independente.
+**Estado:** tecnicamente aceito para backup cifrado e restauração isolada exclusivamente com bancos sintéticos. A auditoria independente e seus limites estão registrados em [`docs/GATE2_0C_2_ACEITE.md`](GATE2_0C_2_ACEITE.md). A tag `gate2-c2-accepted-v0.1` aponta para o commit de implementação `c6f7ce5`.
 **Limite autorizado:** backups e restaurações exclusivamente sintéticos e descartáveis. Esta entrega não autoriza uso do banco padrão, dados pessoais/institucionais, conectores ou dados reais.
 **Pré-requisito:** Gate 2.0-C.1 aceito em `gate2-c1-accepted-v0.1`.
 
@@ -49,8 +49,17 @@ O backup usa o caminho padrão configurado em C.1 e grava em `backups/` ao lado 
 - Não há retenção automática, rotação/limpeza de backups, cópia para armazenamento externo, agendamento, recuperação para a base ativa ou política de exclusão. Esses itens dependem de decisão explícita do proprietário.
 - Uma falha de hardware ou falta de espaço pode impedir publicação. A operação não sobrescreve arquivo existente e limpa staging quando possível; a integridade do backup deve ser verificada por restauração periódica.
 - O limite de 256 MiB e os parâmetros Argon2id são fixos no formato v1. Mudá-los requer formato/versão compatível e testes de migração de backup.
+- O banco SQLite ativo não possui criptografia própria. O limite de 256 MiB não representa o pico de memória: snapshot, arquivo cifrado e plaintext são materializados integralmente e podem coexistir como cópias durante a operação.
+- A senha não pode ser recuperada se perdida. Não há armazenamento no Keychain nem política de rotação de chaves nesta etapa.
+- A restauração usa plaintext temporário em área privada e tenta remover os artefatos ao final; isso não oferece apagamento físico garantido em SSD/APFS.
 - C.2 não cria OAuth, Calendar real, Gmail, Drive, LLM, serviço de rede, acesso remoto, deploy, retenção de dados ou importação DEMO.
 
 ## Resultados desta implementação
 
-Verificações reproduzidas na implementação: instalação limpa `uv sync --locked --python 3.12` em ambiente/cache temporários — PASS, incluindo build de fonte de `cryptography==50.0.1`; smoke Argon2id/AES-GCM — PASS; `uv run --locked pytest -q` — **109 testes passaram**; `npm ci`; typecheck, lint, build e Vitest — PASS (**31 testes**); Playwright — **24 passaram** (desktop/mobile, build novo e servidor isolado); `npm audit` e `npm audit --omit=dev` — zero vulnerabilidades; `pip-audit` sobre export runtime de `uv.lock` após atualizar para 50.0.1 — zero vulnerabilidades. Pytest reporta avisos existentes de depreciação de `TestClient/httpx` e cookies. npm reportou avisos de depreciação do ESLint e do `next lint`; não são falhas. Os testes adversariais versionados estão em `test_backup_recovery.py`; resultados externos de auditoria ainda não existem.
+Verificações reproduzidas pela implementação: instalação limpa `uv sync --locked --python 3.12` em ambiente/cache temporários — PASS, incluindo build de fonte de `cryptography==50.0.1`; smoke Argon2id/AES-GCM — PASS; `uv run --locked pytest -q` — **109 testes passaram**; `npm ci`; typecheck, lint, build e Vitest — PASS (**31 testes**); Playwright — **24 passaram** (desktop/mobile, build novo e servidor isolado); `npm audit` e `npm audit --omit=dev` — zero vulnerabilidades; `pip-audit` sobre export runtime de `uv.lock` após atualizar para 50.0.1 — zero vulnerabilidades. Pytest reporta avisos existentes de depreciação de `TestClient/httpx` e cookies. npm reportou avisos de depreciação do ESLint e do `next lint`; não são falhas. Os testes adversariais versionados estão em `test_backup_recovery.py`. A auditoria independente está registrada na seção seguinte e em `docs/GATE2_0C_2_ACEITE.md`.
+
+## Auditoria independente e aceite
+
+A auditoria independente reproduziu, em cópia temporária e sem abrir o banco padrão, `uv sync --locked --python 3.12` e **109 testes da API**; `npm ci`, **31 Vitest**, `npm audit`, `npm audit --omit=dev` e `pip-audit` também passaram. Probes independentes confirmaram snapshot de WAL com transações confirmadas, sobreposição real de gravações concorrentes com contagens consistentes de eventos/proveniência/auditoria, rejeição de adulterações criptográficas e restauração isolada validada. Uma falha `ENOSPC` foi simulada após escrita parcial; a origem permaneceu inalterada e não sobrou backup parcial.
+
+Nesta auditoria, **build, lint, typecheck e Playwright não foram reproduzidos** porque nenhum arquivo frontend foi alterado; a implementação reportou essas verificações aprovadas, sem que isso conte como repetição independente. Consulte a matriz e o parecer completos em [`docs/GATE2_0C_2_ACEITE.md`](GATE2_0C_2_ACEITE.md). O aceite não amplia o limite sintético definido neste handoff.
