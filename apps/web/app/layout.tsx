@@ -4,6 +4,7 @@ import "./globals.css";
 import { Header } from "@/components/ui/Header";
 import { BottomNav } from "@/components/ui/BottomNav";
 import { Sidebar } from "@/components/ui/Sidebar";
+import { LocalIntegrationProvider } from "@/components/integration/LocalIntegrationProvider";
 
 const inter = Inter({
   subsets: ["latin"],
@@ -38,14 +39,16 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
         >
           Pular para o conteúdo
         </a>
-        <Header />
-        <div className="mx-auto flex max-w-[1280px]">
-          <Sidebar />
-          <main id="conteudo" className="main-with-bottom-nav min-h-[calc(100vh-64px)] flex-1">
-            <div className="animate-fadeIn">{children}</div>
-          </main>
-        </div>
-        <BottomNav />
+        <LocalIntegrationProvider>
+          <Header />
+          <div className="mx-auto flex max-w-[1280px]">
+            <Sidebar />
+            <main id="conteudo" className="main-with-bottom-nav min-h-[calc(100vh-64px)] flex-1">
+              <div className="animate-fadeIn">{children}</div>
+            </main>
+          </div>
+          <BottomNav />
+        </LocalIntegrationProvider>
       </body>
     </html>
   );

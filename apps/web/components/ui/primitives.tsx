@@ -3,19 +3,20 @@
 import React from "react";
 import { Dialog } from "@/components/ui/Dialog";
 
-export function Badge({ children, tone = "neutral" }: { children: React.ReactNode; tone?: "neutral" | "amber" | "emerald" | "violet" | "slate" }) {
+export function Badge({ children, tone = "neutral" }: { children: React.ReactNode; tone?: "neutral" | "amber" | "emerald" | "violet" | "slate" | "red" }) {
   const map: Record<string, string> = {
     neutral: "bg-paper-muted text-ink-subtle ring-paper-border",
     amber: "bg-amber-50 text-amber-800 ring-amber-200",
     emerald: "bg-emerald-50 text-emerald-700 ring-emerald-200",
     violet: "bg-violet-50 text-violet-700 ring-violet-200",
-    slate: "bg-slate-900 text-white ring-slate-900"
+    slate: "bg-slate-900 text-white ring-slate-900",
+    red: "bg-red-50 text-red-800 ring-red-200"
   };
   return <span className={["inline-flex items-center rounded-full px-2.5 py-1 text-xs font-medium ring-1", map[tone]].join(" ")}>{children}</span>;
 }
 
-export function Card({ children, className = "", id }: { children: React.ReactNode; className?: string; id?: string }) {
-  return <div id={id} className={["rounded-2xl border border-paper-border bg-white shadow-soft", className].join(" ")}>{children}</div>;
+export function Card({ children, className = "", ...props }: React.HTMLAttributes<HTMLDivElement>) {
+  return <div {...props} className={["rounded-2xl border border-paper-border bg-white shadow-soft", className].join(" ")}>{children}</div>;
 }
 
 export function Button({

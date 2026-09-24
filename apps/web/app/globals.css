@@ -94,6 +94,14 @@ body {
   }
 }
 
+/* Keep browser-scrolled controls clear of the sticky header and fixed mobile nav. */
+@media (max-width: 767px) {
+  .main-with-bottom-nav :is(a, button, input, select, textarea, [tabindex]) {
+    scroll-margin-top: 5rem;
+    scroll-margin-bottom: calc(var(--bottom-nav-height) + env(safe-area-inset-bottom, 0px) + 1rem);
+  }
+}
+
 /* Scroll horizontal de chips com máscara e snap */
 .chip-scroll {
   display: flex;

@@ -9,6 +9,7 @@
     "lint": "next lint",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
+    "e2e": "node scripts/run-e2e.mjs",
     "test:watch": "vitest"
   },
   "dependencies": {
