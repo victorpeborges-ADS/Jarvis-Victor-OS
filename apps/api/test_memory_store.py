@@ -2,6 +2,7 @@ import sqlite3
 import stat
 import subprocess
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
 from shutil import copyfile
@@ -20,7 +21,15 @@ from memory_models import (
     RelationRecord,
     SourceRecord,
 )
-from memory_store import DatabaseCorruptError, MigrationError, MIGRATIONS_DIR, SQLiteMemoryStore, REPOSITORY_ROOT, default_database_path
+from memory_store import (
+    DatabaseCorruptError,
+    EventIdentityConflict,
+    MigrationError,
+    MIGRATIONS_DIR,
+    SQLiteMemoryStore,
+    REPOSITORY_ROOT,
+    default_database_path,
+)
 from server_config import LocalServerConfig
 
 
@@ -39,7 +48,7 @@ def make_source(source_id: str = "src_test_calendar") -> SourceRecord:
 
 def make_event(
     source_id: str = "src_test_calendar",
-    event_id: str = "synthetic_event_a",
+    event_id: str = "real_evt_synthetic_event_a",
     domain_id: str | None = "dom_synthetic_a",
     external_ref: str | None = "synthetic-ref-a",
 ) -> EventRecord:
@@ -93,7 +102,8 @@ def test_empty_database_migrates_once_uses_wal_and_private_permissions(tmp_path)
     with sqlite3.connect(store.path) as connection:
         assert connection.execute("PRAGMA journal_mode").fetchone()[0].lower() == "wal"
         assert connection.execute("SELECT version FROM schema_migrations ORDER BY version").fetchall() == [
-            ("0001_initial",), ("0002_audit_and_relation_domain",)
+            ("0001_initial",), ("0002_audit_and_relation_domain",),
+            ("0003_event_identity_and_provenance",),
         ]
         for table in ("sources", "events", "event_provenance", "entities", "relations", "relation_evidence", "audit_entries"):
             assert connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] == 0
@@ -109,15 +119,25 @@ def test_database_from_previous_migration_version_upgrades_without_replaying_ddl
     previous_migrations = tmp_path / "previous_migrations"
     previous_migrations.mkdir()
     copyfile(MIGRATIONS_DIR / "0001_initial.sql", previous_migrations / "0001_initial.sql")
+    copyfile(MIGRATIONS_DIR / "0002_audit_and_relation_domain.sql", previous_migrations / "0002_audit_and_relation_domain.sql")
     database_path = tmp_path / "private" / "memory.sqlite3"
     SQLiteMemoryStore(database_path, migrations_dir=previous_migrations).initialize()
+
+    with sqlite3.connect(database_path) as connection:
+        assert connection.execute("SELECT version FROM schema_migrations ORDER BY version").fetchall() == [
+            ("0001_initial",), ("0002_audit_and_relation_domain",),
+        ]
+        assert connection.execute("SELECT COUNT(*) FROM audit_entries").fetchone()[0] == 0
 
     SQLiteMemoryStore(database_path).initialize()
     with sqlite3.connect(database_path) as connection:
         versions = connection.execute("SELECT version FROM schema_migrations ORDER BY version").fetchall()
         columns = {row[1] for row in connection.execute("PRAGMA table_info(relations)")}
         tables = {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")}
-    assert versions == [("0001_initial",), ("0002_audit_and_relation_domain",)]
+    assert versions == [
+        ("0001_initial",), ("0002_audit_and_relation_domain",),
+        ("0003_event_identity_and_provenance",),
+    ]
     assert "domain_id" in columns
     assert "audit_entries" in tables
 
@@ -218,9 +238,9 @@ def test_duplicate_external_event_is_idempotent_and_updates_one_record(tmp_path)
     store = initialized_store(tmp_path)
     source = make_source()
     store.save_source(source)
-    first = make_event(source_id=source.id, event_id="synthetic_event_first")
+    first = make_event(source_id=source.id, event_id="real_evt_synthetic_event_first")
     store.save_event(first)
-    duplicate = make_event(source_id=source.id, event_id="synthetic_event_duplicate")
+    duplicate = make_event(source_id=source.id, event_id="real_evt_synthetic_event_duplicate")
     duplicate = duplicate.model_copy(update={"title": "Atualização sintética"})
     result = store.save_event(duplicate)
 
@@ -285,8 +305,8 @@ def test_corrupted_unknown_domain_cannot_leak_into_another_scope(tmp_path):
     store = initialized_store(tmp_path)
     source = make_source()
     store.save_source(source)
-    event_a = store.save_event(make_event(source_id=source.id, event_id="synthetic_event_a", domain_id="dom_synthetic_a"))
-    event_b = store.save_event(make_event(source_id=source.id, event_id="synthetic_event_b", domain_id="dom_synthetic_b", external_ref="synthetic-ref-b"))
+    event_a = store.save_event(make_event(source_id=source.id, event_id="real_evt_synthetic_event_a", domain_id="dom_synthetic_a"))
+    event_b = store.save_event(make_event(source_id=source.id, event_id="real_evt_synthetic_event_b", domain_id="dom_synthetic_b", external_ref="synthetic-ref-b"))
     with sqlite3.connect(store.path) as connection:
         connection.execute("PRAGMA ignore_check_constraints=ON")
         connection.execute("UPDATE events SET domain_id='dom_unknown' WHERE id=?", (event_a.id,))
@@ -317,7 +337,7 @@ def test_source_event_provenance_entity_and_relation_foreign_keys(tmp_path):
     with pytest.raises(sqlite3.IntegrityError):
         store.save_relation(broken)
 
-    other_event = store.save_event(make_event(source_id=source.id, event_id="synthetic_event_b", domain_id="dom_synthetic_b", external_ref="synthetic-ref-b"))
+    other_event = store.save_event(make_event(source_id=source.id, event_id="real_evt_synthetic_event_b", domain_id="dom_synthetic_b", external_ref="synthetic-ref-b"))
     other_entity = store.save_entity(EntityRecord(id="entity_synthetic_c", entity_type="project", name="Outro projeto", domain_id="dom_synthetic_b"))
     cross_domain_relation = RelationRecord(
         id="relation_cross_domain", from_entity_id=first.id, to_entity_id=other_entity.id,
@@ -328,3 +348,155 @@ def test_source_event_provenance_entity_and_relation_foreign_keys(tmp_path):
     cross_domain_evidence = relation.model_copy(update={"id": "relation_cross_evidence", "evidence_event_ids": (other_event.id,)})
     with pytest.raises(ValueError, match="outro domínio"):
         store.save_relation(cross_domain_evidence)
+
+
+def test_event_id_namespace_rejects_demo_fixture_ids():
+    with pytest.raises(ValidationError):
+        make_event(event_id="evt_001")
+    with pytest.raises(ValidationError):
+        make_event(event_id="real_evt_bad/id")
+
+
+def test_sqlite_rejects_fixture_id_even_if_model_validation_is_bypassed(tmp_path):
+    store = initialized_store(tmp_path)
+    source = make_source()
+    store.save_source(source)
+    with sqlite3.connect(store.path) as connection, pytest.raises(sqlite3.IntegrityError):
+        connection.execute(
+            "INSERT INTO events(id, source_id, event_type, title, sensitivity, payload_json, dataset, created_at) "
+            "VALUES (?, ?, 'note', 'synthetic', 'normal', '{}', 'real', ?)",
+            ("evt_001", source.id, now().isoformat()),
+        )
+
+
+def test_initialize_rejects_missing_audit_table_without_rebuilding_it(tmp_path):
+    store = initialized_store(tmp_path)
+    with sqlite3.connect(store.path) as connection:
+        connection.execute("DROP TABLE audit_entries")
+        connection.commit()
+
+    with pytest.raises(DatabaseCorruptError, match="diverge"):
+        SQLiteMemoryStore(store.path).initialize()
+    with sqlite3.connect(store.path) as connection:
+        names = {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    assert "audit_entries" not in names
+
+
+def test_initialize_rejects_missing_required_index(tmp_path):
+    store = initialized_store(tmp_path)
+    with sqlite3.connect(store.path) as connection:
+        connection.execute("DROP INDEX idx_audit_entries_occurred_at")
+        connection.commit()
+    with pytest.raises(DatabaseCorruptError, match="diverge"):
+        SQLiteMemoryStore(store.path).initialize()
+
+
+def test_initialize_rejects_incompatible_column_type(tmp_path):
+    store = initialized_store(tmp_path)
+    with sqlite3.connect(store.path) as connection:
+        connection.execute("DROP TABLE audit_entries")
+        connection.execute(
+            "CREATE TABLE audit_entries (id TEXT PRIMARY KEY, operation TEXT NOT NULL, "
+            "outcome TEXT NOT NULL, record_count TEXT NOT NULL DEFAULT '0', "
+            "dataset TEXT NOT NULL DEFAULT 'real', occurred_at TEXT NOT NULL)"
+        )
+        connection.execute("CREATE INDEX idx_audit_entries_occurred_at ON audit_entries(occurred_at)")
+        connection.commit()
+    with pytest.raises(DatabaseCorruptError, match="diverge"):
+        SQLiteMemoryStore(store.path).initialize()
+
+
+def test_internal_id_collision_from_another_source_is_rejected_without_mutation(tmp_path):
+    store = initialized_store(tmp_path)
+    source_a = make_source("src_calendar_a")
+    source_b = make_source("src_calendar_b")
+    store.save_source(source_a)
+    store.save_source(source_b)
+    first = make_event(
+        source_id=source_a.id, event_id="real_evt_shared_001", domain_id="dom_synthetic_a",
+        external_ref="external-a",
+    )
+    store.save_event(first)
+    with sqlite3.connect(store.path) as connection:
+        before_audit = connection.execute("SELECT COUNT(*) FROM audit_entries").fetchone()[0]
+
+    conflicting = make_event(
+        source_id=source_b.id, event_id="real_evt_shared_001", domain_id="dom_synthetic_b",
+        external_ref="external-b",
+    ).model_copy(update={"title": "Ataque de substituição"})
+    with pytest.raises(EventIdentityConflict, match="outra identidade"):
+        store.save_event(conflicting)
+
+    with sqlite3.connect(store.path) as connection:
+        row = connection.execute(
+            "SELECT source_id, title, domain_id FROM events WHERE id=?", (first.id,)
+        ).fetchone()
+        provenance = connection.execute(
+            "SELECT source_id, external_ref FROM event_provenance WHERE event_id=?", (first.id,)
+        ).fetchone()
+        after_audit = connection.execute("SELECT COUNT(*) FROM audit_entries").fetchone()[0]
+    assert row == (source_a.id, first.title, "dom_synthetic_a")
+    assert provenance == (source_a.id, "external-a")
+    assert after_audit == before_audit
+    assert [item.event.id for item in store.list_authorized_events(scope("dom_synthetic_a"))] == [first.id]
+    assert store.list_authorized_events(scope("dom_synthetic_b")) == []
+
+
+def test_sqlite_triggers_keep_event_and_provenance_identity_immutable(tmp_path):
+    store = initialized_store(tmp_path)
+    source_a = make_source("src_calendar_a")
+    source_b = make_source("src_calendar_b")
+    store.save_source(source_a)
+    store.save_source(source_b)
+    event = store.save_event(make_event(source_id=source_a.id, event_id="real_evt_immutable_01"))
+    with sqlite3.connect(store.path) as connection:
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute("UPDATE events SET source_id=? WHERE id=?", (source_b.id, event.id))
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute(
+                "UPDATE event_provenance SET external_ref='different-reference' WHERE event_id=?",
+                (event.id,),
+            )
+
+
+def test_failed_audit_write_rolls_back_event_and_provenance(tmp_path):
+    store = initialized_store(tmp_path)
+    source = make_source()
+    store.save_source(source)
+    with sqlite3.connect(store.path) as connection:
+        connection.execute(
+            "CREATE TRIGGER reject_event_audit BEFORE INSERT ON audit_entries "
+            "WHEN NEW.operation='event_write' BEGIN SELECT RAISE(ABORT, 'injected'); END"
+        )
+        connection.commit()
+    event = make_event(source_id=source.id)
+    with pytest.raises(sqlite3.IntegrityError):
+        store.save_event(event)
+    with sqlite3.connect(store.path) as connection:
+        assert connection.execute("SELECT COUNT(*) FROM events WHERE id=?", (event.id,)).fetchone()[0] == 0
+        assert connection.execute("SELECT COUNT(*) FROM event_provenance WHERE event_id=?", (event.id,)).fetchone()[0] == 0
+
+
+def test_concurrent_same_external_identity_remains_idempotent(tmp_path):
+    store = initialized_store(tmp_path)
+    source = make_source()
+    store.save_source(source)
+    events = [
+        make_event(
+            source_id=source.id,
+            event_id=f"real_evt_concurrent_{index}",
+            external_ref="external-concurrent-singleton",
+        )
+        for index in range(8)
+    ]
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        saved = list(executor.map(store.save_event, events))
+    assert len({event.id for event in saved}) == 1
+    with sqlite3.connect(store.path) as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM events WHERE source_id=?", (source.id,)
+        ).fetchone()[0] == 1
+        assert connection.execute(
+            "SELECT COUNT(*) FROM event_provenance WHERE source_id=? AND external_ref=?",
+            (source.id, "external-concurrent-singleton"),
+        ).fetchone()[0] == 1

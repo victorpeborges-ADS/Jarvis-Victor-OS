@@ -76,10 +76,10 @@ def _seed_test_catalog(store):
     for index, letter in enumerate(letters):
         domain_id = f"dom_synthetic_{letter}"
         mentioned_domain = f"dom_synthetic_{letters[-index - 1]}"
-        event_id = f"synth_{letter}_1"
+        event_id = f"real_evt_synth_{letter}_1"
         title = f"evento sintético classificado em {domain_id}; título menciona {mentioned_domain}"
         eight_domain_records.append((event_id, domain_id, title))
-    eight_domain_records.append(("synth_unclassified_1", None, "registro sintético não classificado"))
+    eight_domain_records.append(("real_evt_synth_unclassified_1", None, "registro sintético não classificado"))
     for event_id, domain_id, title in eight_domain_records:
         classified = domain_id is not None
         store.save_event(EventRecord(
@@ -142,7 +142,7 @@ def test_session_without_grant_cannot_list_read_by_id_or_build_briefing(client, 
     monkeypatch.setattr(client.app.state.memory_store, "list_authorized_events", query_without_grant)
     monkeypatch.setattr(client.app.state.memory_store, "get_authorized_event", query_without_grant)
     assert client.get("/real/events").status_code == 403
-    assert client.get("/real/events/synth_a_1").status_code == 403
+    assert client.get("/real/events/real_evt_synth_a_1").status_code == 403
     assert client.get("/real/briefing").status_code == 403
 
 
@@ -182,10 +182,10 @@ def test_malformed_persisted_record_is_omitted_without_crashing_api(client):
     assert grant(client, csrf, ["dom_synthetic_a"]).status_code == 201
     with sqlite3.connect(client.app.state.memory_store.path) as connection:
         connection.execute("PRAGMA ignore_check_constraints=ON")
-        connection.execute("UPDATE events SET payload_json='{' WHERE id='synth_a_1'")
+        connection.execute("UPDATE events SET payload_json='{' WHERE id='real_evt_synth_a_1'")
         connection.commit()
     assert client.get("/real/events").status_code == 403
-    assert client.get("/real/events/synth_a_1").status_code == 404
+    assert client.get("/real/events/real_evt_synth_a_1").status_code == 404
     assert client.get("/real/briefing").status_code == 403
 
 
@@ -377,7 +377,7 @@ def test_grant_expiration_denies_aggregate_and_direct_reads(client, monkeypatch)
     monkeypatch.setattr(local_security, "_now", lambda: base_now + timedelta(days=8))
     assert client.get("/real/events").status_code == 403
     assert client.get("/real/briefing").status_code == 403
-    assert client.get("/real/events/synth_a_1").status_code == 403
+    assert client.get("/real/events/real_evt_synth_a_1").status_code == 403
     assert _grants[grant_id].expires_at < local_security._now()
 
 
@@ -394,7 +394,7 @@ def test_duplicate_and_overlapping_grants_are_rejected_and_revoke_is_effective(c
     revoke = client.post(f"/real/grants/{first.json()['id']}/revoke", headers={"origin": ALLOWED_ORIGIN, "x-csrf-token": csrf})
     assert revoke.status_code == 200
     assert client.get("/real/events").status_code == 403
-    assert client.get("/real/events/synth_a_1").status_code == 403
+    assert client.get("/real/events/real_evt_synth_a_1").status_code == 403
     assert client.get("/real/briefing").status_code == 403
     assert grant(client, csrf, ["dom_synthetic_a"]).status_code == 201
 
@@ -405,13 +405,13 @@ def test_aggregate_and_direct_retrieval_respect_connector_resource_and_domain(cl
     assert grant(client, csrf, ["dom_synthetic_a"]).status_code == 201
     aggregate = client.get("/real/events")
     assert aggregate.status_code == 200
-    assert [record["id"] for record in aggregate.json()] == ["synth_a_1"]
+    assert [record["id"] for record in aggregate.json()] == ["real_evt_synth_a_1"]
     assert client.get("/real/events", params={"domain_id": "dom_synthetic_b"}).status_code == 403
     assert client.get("/real/events", params={"domain_id": "dom_unknown"}).status_code == 403
-    assert client.get("/real/events/synth_a_1").status_code == 200
-    assert client.get("/real/events/synth_b_1").status_code == 404
-    assert client.get("/real/events/synth_unclassified_1").status_code == 404
-    assert [item["id"] for item in client.get("/real/briefing").json()["items"]] == ["synth_a_1"]
+    assert client.get("/real/events/real_evt_synth_a_1").status_code == 200
+    assert client.get("/real/events/real_evt_synth_b_1").status_code == 404
+    assert client.get("/real/events/real_evt_synth_unclassified_1").status_code == 404
+    assert [item["id"] for item in client.get("/real/briefing").json()["items"]] == ["real_evt_synth_a_1"]
 
 
 def test_all_eight_synthetic_domains_are_isolated_by_explicit_domain_id(client):
@@ -420,9 +420,9 @@ def test_all_eight_synthetic_domains_are_isolated_by_explicit_domain_id(client):
     letters = "abcdefgh"
     for index, letter in enumerate(letters):
         domain_id = f"dom_synthetic_{letter}"
-        expected_id = f"synth_{letter}_1"
+        expected_id = f"real_evt_synth_{letter}_1"
         next_letter = letters[(index + 1) % len(letters)]
-        next_id = f"synth_{next_letter}_1"
+        next_id = f"real_evt_synth_{next_letter}_1"
 
         grant_response = grant(client, csrf, [domain_id])
         assert grant_response.status_code == 201
@@ -449,7 +449,7 @@ def test_grants_are_volatile_even_when_database_survives_process_restart(client)
     assert login(client).status_code == 201
     csrf = csrf_for(client)
     assert grant(client, csrf, ["dom_synthetic_a"]).status_code == 201
-    assert [event["id"] for event in client.get("/real/events").json()] == ["synth_a_1"]
+    assert [event["id"] for event in client.get("/real/events").json()] == ["real_evt_synth_a_1"]
 
     child_env = {**os.environ, "JARVIS_LOCAL_PASSPHRASE": PASSPHRASE}
     child_code = (
@@ -458,7 +458,7 @@ def test_grants_are_volatile_even_when_database_survives_process_restart(client)
         "from server_config import LocalServerConfig\n"
         "with TestClient(create_app(LocalServerConfig()),base_url='http://127.0.0.1',client=('127.0.0.1',51004)) as c:\n"
         f" assert c.post('/real/session',json={{'passphrase':'{PASSPHRASE}'}},headers={{'origin':'{ALLOWED_ORIGIN}'}}).status_code==201\n"
-        " print(c.get('/real/events').status_code,c.get('/real/events/synth_a_1').status_code,c.get('/real/briefing').status_code)"
+        " print(c.get('/real/events').status_code,c.get('/real/events/real_evt_synth_a_1').status_code,c.get('/real/briefing').status_code)"
     )
     restarted = subprocess.run(
         [sys.executable, "-c", child_code], cwd=Path(__file__).parent,
@@ -485,8 +485,8 @@ def test_records_with_unknown_connector_resource_or_domain_fail_closed(client):
             ),
         )
     assert client.get("/real/events").status_code == 200
-    assert [event["id"] for event in client.get("/real/events").json()] == ["synth_a_1"]
-    assert client.get("/real/events/synth_unclassified_1").status_code == 404
+    assert [event["id"] for event in client.get("/real/events").json()] == ["real_evt_synth_a_1"]
+    assert client.get("/real/events/real_evt_synth_unclassified_1").status_code == 404
 
 
 def test_grant_from_other_principal_does_not_authorize(client):

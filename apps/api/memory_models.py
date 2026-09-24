@@ -98,7 +98,7 @@ class AuditRecord(StrictRecord):
 
 
 class EventRecord(StrictRecord):
-    id: str = Field(min_length=1, max_length=128)
+    id: str = Field(min_length=11, max_length=128, pattern=r"^real_evt_[A-Za-z0-9_-]+$")
     event_type: Literal["appointment", "task", "message", "note", "reference", "project"]
     title: str = Field(min_length=1, max_length=500)
     domain_id: str | None = None
@@ -112,8 +112,8 @@ class EventRecord(StrictRecord):
     @field_validator("id")
     @classmethod
     def id_is_safe(cls, value: str) -> str:
-        if any(char.isspace() for char in value) or "\x00" in value:
-            raise ValueError("event id inválido")
+        if not value.startswith("real_evt_") or any(char.isspace() for char in value) or "\x00" in value:
+            raise ValueError("event id precisa do namespace real_evt_")
         return value
 
     @field_validator("domain_id")

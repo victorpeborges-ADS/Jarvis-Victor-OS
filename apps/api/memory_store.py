@@ -38,6 +38,10 @@ class DatabaseCorruptError(MemoryStoreError):
     pass
 
 
+class EventIdentityConflict(ValueError):
+    """An internal event ID or source reference was reused for another event."""
+
+
 class StoredEvent(StrictRecord):
     source: SourceRecord
     event: EventRecord
@@ -96,6 +100,7 @@ class SQLiteMemoryStore:
                 raise MemoryStoreError("não foi possível habilitar WAL")
             connection.execute("PRAGMA synchronous=FULL")
             self._apply_migrations(connection)
+            self._validate_schema(connection)
             check = connection.execute("PRAGMA quick_check").fetchone()[0]
             if check != "ok":
                 raise DatabaseCorruptError("banco local corrompido")
@@ -139,12 +144,25 @@ class SQLiteMemoryStore:
         return connection
 
     def _apply_migrations(self, connection: sqlite3.Connection) -> None:
+        files = sorted(self.migrations_dir.glob("[0-9][0-9][0-9][0-9]_*.sql"))
+        if not files:
+            raise MigrationError("nenhuma migração local disponível")
+        known_versions = {file.stem for file in files}
+        if self.migrations_dir.resolve() == MIGRATIONS_DIR.resolve() and (
+            "0003_event_identity_and_provenance" not in known_versions
+        ):
+            raise MigrationError("migração estrutural obrigatória indisponível")
+        existing_tables = {
+            row[0] for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
+            )
+        }
+        if "schema_migrations" not in existing_tables and existing_tables:
+            raise DatabaseCorruptError("estrutura do banco local sem histórico de migrações")
         connection.execute(
             "CREATE TABLE IF NOT EXISTS schema_migrations ("
             "version TEXT PRIMARY KEY, checksum TEXT NOT NULL, applied_at TEXT NOT NULL)"
         )
-        files = sorted(self.migrations_dir.glob("[0-9][0-9][0-9][0-9]_*.sql"))
-        known_versions = {file.stem for file in files}
         applied = {
             row["version"]: row["checksum"]
             for row in connection.execute("SELECT version, checksum FROM schema_migrations")
@@ -173,6 +191,106 @@ class SQLiteMemoryStore:
                 if isinstance(exc, sqlite3.DatabaseError):
                     raise MigrationError("migração local falhou e foi revertida") from exc
                 raise
+
+    def _validate_schema(self, connection: sqlite3.Connection) -> None:
+        """Compare the effective database with a fresh schema built from its migrations."""
+        migration_files = sorted(self.migrations_dir.glob("[0-9][0-9][0-9][0-9]_*.sql"))
+        if not migration_files:
+            raise MigrationError("nenhuma migração local disponível")
+        applied = [
+            row[0] for row in connection.execute(
+                "SELECT version FROM schema_migrations ORDER BY version"
+            )
+        ]
+        expected_versions = [migration.stem for migration in migration_files]
+        if applied != expected_versions:
+            raise DatabaseCorruptError("histórico de migrações do banco local inconsistente")
+        expected = sqlite3.connect(":memory:")
+        try:
+            expected.execute(
+                "CREATE TABLE schema_migrations ("
+                "version TEXT PRIMARY KEY, checksum TEXT NOT NULL, applied_at TEXT NOT NULL)"
+            )
+            for migration in migration_files:
+                self._execute_sql_transactionally(
+                    expected, migration.read_text(encoding="utf-8")
+                )
+            differences = self._schema_differences(connection, expected)
+        except sqlite3.DatabaseError as exc:
+            raise MigrationError("não foi possível validar o esquema esperado") from exc
+        finally:
+            expected.close()
+        if differences:
+            logger.error("SQLite schema validation failed: %s", ", ".join(differences))
+            raise DatabaseCorruptError("estrutura do banco local diverge das migrações aplicadas")
+
+    @staticmethod
+    def _schema_differences(actual: sqlite3.Connection, expected: sqlite3.Connection) -> list[str]:
+        differences: list[str] = []
+
+        def objects(connection: sqlite3.Connection) -> dict[tuple[str, str], tuple[str, str]]:
+            rows = connection.execute(
+                "SELECT type, name, tbl_name, sql FROM sqlite_master "
+                "WHERE name NOT LIKE 'sqlite_%' ORDER BY type, name"
+            )
+            return {
+                (row[0], row[1]): (row[2], " ".join((row[3] or "").split()).casefold())
+                for row in rows
+            }
+
+        actual_objects = objects(actual)
+        expected_objects = objects(expected)
+        if actual_objects != expected_objects:
+            differences.append("objects")
+
+        tables = {
+            name for kind, name in expected_objects if kind == "table"
+        } | {name for kind, name in actual_objects if kind == "table"}
+
+        def identifier(value: str) -> str:
+            return '"' + value.replace('"', '""') + '"'
+
+        for table in sorted(tables):
+            quoted = identifier(table)
+            for pragma in ("table_xinfo",):
+                actual_rows = actual.execute(f"PRAGMA {pragma}({quoted})").fetchall()
+                expected_rows = expected.execute(f"PRAGMA {pragma}({quoted})").fetchall()
+                actual_signature = [
+                    (row[1], (row[2] or "").upper(), row[3], row[4], row[5], row[6])
+                    for row in actual_rows
+                ]
+                expected_signature = [
+                    (row[1], (row[2] or "").upper(), row[3], row[4], row[5], row[6])
+                    for row in expected_rows
+                ]
+                if actual_signature != expected_signature:
+                    differences.append(f"columns:{table}")
+
+            def indexes(connection: sqlite3.Connection) -> dict[str, tuple]:
+                result: dict[str, tuple] = {}
+                for row in connection.execute(f"PRAGMA index_list({quoted})"):
+                    name = row[1]
+                    index_rows = connection.execute(
+                        f"PRAGMA index_xinfo({identifier(name)})"
+                    ).fetchall()
+                    result[name] = (
+                        row[2], row[3], row[4],
+                        tuple((entry[0], entry[1], entry[2], entry[3], entry[4], entry[5]) for entry in index_rows),
+                    )
+                return result
+
+            if indexes(actual) != indexes(expected):
+                differences.append(f"indexes:{table}")
+
+            def foreign_keys(connection: sqlite3.Connection) -> tuple:
+                return tuple(sorted(
+                    (row[0], row[1], row[2], row[3], row[4], row[5], row[6], row[7])
+                    for row in connection.execute(f"PRAGMA foreign_key_list({quoted})")
+                ))
+
+            if foreign_keys(actual) != foreign_keys(expected):
+                differences.append(f"foreign-keys:{table}")
+        return differences
 
     @staticmethod
     def _execute_sql_transactionally(connection: sqlite3.Connection, sql: str) -> None:
@@ -242,7 +360,7 @@ class SQLiteMemoryStore:
         provenance = event.provenance
         with self.transaction() as connection:
             source = connection.execute(
-                "SELECT provider, resource_id, dataset FROM sources WHERE id=?", (provenance.source_id,)
+                "SELECT id, provider, resource_id, dataset FROM sources WHERE id=?", (provenance.source_id,)
             ).fetchone()
             if source is None:
                 raise ValueError("origem do evento não existe")
@@ -252,16 +370,30 @@ class SQLiteMemoryStore:
                 raise ValueError("recurso da origem não é autorizável")
 
             duplicate = connection.execute(
-                "SELECT id FROM events WHERE id=?", (event.id,)
+                "SELECT e.id, e.dataset, e.source_id, p.source_id AS provenance_source_id, "
+                "p.external_ref, s.provider, s.resource_id, s.dataset AS source_dataset "
+                "FROM events e LEFT JOIN event_provenance p ON p.event_id=e.id "
+                "LEFT JOIN sources s ON s.id=e.source_id WHERE e.id=?", (event.id,)
             ).fetchone()
             by_external_ref = None
             if provenance.external_ref is not None:
                 by_external_ref = connection.execute(
-                    "SELECT event_id AS id FROM event_provenance WHERE source_id=? AND external_ref=?",
+                    "SELECT e.id, e.dataset, e.source_id, p.source_id AS provenance_source_id, "
+                    "p.external_ref, s.provider, s.resource_id, s.dataset AS source_dataset "
+                    "FROM event_provenance p JOIN events e ON e.id=p.event_id "
+                    "JOIN sources s ON s.id=e.source_id WHERE p.source_id=? AND p.external_ref=?",
                     (provenance.source_id, provenance.external_ref),
                 ).fetchone()
+            incoming_identity = (
+                event.dataset, source["id"], source["provider"], source["resource_id"],
+                provenance.external_ref,
+            )
+            if duplicate and not self._same_event_identity(duplicate, incoming_identity):
+                raise EventIdentityConflict("ID interno já pertence a outra identidade de evento")
+            if by_external_ref and not self._same_event_identity(by_external_ref, incoming_identity):
+                raise EventIdentityConflict("referência externa já pertence a outra identidade de evento")
             if duplicate and by_external_ref and duplicate["id"] != by_external_ref["id"]:
-                raise ValueError("identidade do evento conflita com a referência da origem")
+                raise EventIdentityConflict("ID interno e referência externa apontam para eventos distintos")
             existing = duplicate or by_external_ref
             event_id = existing["id"] if existing else event.id
             values = (
@@ -272,9 +404,9 @@ class SQLiteMemoryStore:
             )
             if existing:
                 connection.execute(
-                    "UPDATE events SET source_id=?, event_type=?, title=?, domain_id=?, sensitivity=?, "
+                    "UPDATE events SET event_type=?, title=?, domain_id=?, sensitivity=?, "
                     "occurred_at=?, payload_json=?, dataset=? WHERE id=?",
-                    (*values, event_id),
+                    (*values[1:], event_id),
                 )
             else:
                 connection.execute(
@@ -285,8 +417,8 @@ class SQLiteMemoryStore:
             connection.execute(
                 "INSERT INTO event_provenance(event_id, source_id, external_ref, observed_at, last_verified_at, valid_until, "
                 "confidence, classification_method, classified_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) "
-                "ON CONFLICT(event_id) DO UPDATE SET source_id=excluded.source_id, external_ref=excluded.external_ref, "
-                "observed_at=excluded.observed_at, last_verified_at=excluded.last_verified_at, valid_until=excluded.valid_until, "
+                "ON CONFLICT(event_id) DO UPDATE SET observed_at=excluded.observed_at, "
+                "last_verified_at=excluded.last_verified_at, valid_until=excluded.valid_until, "
                 "confidence=excluded.confidence, classification_method=excluded.classification_method, classified_at=excluded.classified_at",
                 (event_id, provenance.source_id, provenance.external_ref, provenance.observed_at.isoformat(),
                  _aware_iso(provenance.last_verified_at), _aware_iso(provenance.valid_until), provenance.confidence,
@@ -294,6 +426,14 @@ class SQLiteMemoryStore:
             )
             self._insert_audit(connection, "event_write")
         return event.model_copy(update={"id": event_id})
+
+    @staticmethod
+    def _same_event_identity(row: sqlite3.Row, incoming: tuple[str, str, str, str, str | None]) -> bool:
+        existing_identity = (
+            row["dataset"], row["source_id"], row["provider"], row["resource_id"], row["external_ref"],
+        )
+        provenance_source_id = row["provenance_source_id"]
+        return provenance_source_id == row["source_id"] and existing_identity == incoming
 
     def save_entity(self, entity_value: EntityRecord | dict) -> EntityRecord:
         entity = _validated(EntityRecord, entity_value)
