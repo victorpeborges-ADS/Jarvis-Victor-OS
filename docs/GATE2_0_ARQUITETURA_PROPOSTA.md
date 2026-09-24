@@ -1,9 +1,11 @@
 # Gate 2.0 — Proposta de arquitetura
 
-**Estado:** proposta para aprovação humana. Nada neste documento foi implementado.  
-**Base:** `main` @ `ef5d3cd`, tag `gate1-accepted-v0.1`.  
+**Estado:** referência arquitetural aprovada. A fundação B foi aceita; C.1 está em implementação na branch dedicada.
+**Base original da proposta:** `main` @ `ef5d3cd`, tag `gate1-accepted-v0.1`. A aprovação e consolidação B estão registradas em `docs/GATE2_0B_2_HARDENING.md`.
 **Data:** 23/09/2026.  
-**Restrição:** não conectar contas, não criar OAuth, não fazer deploy e não iniciar a implementação sem novo aceite.
+**Restrição:** qualquer implementação depende de aceite explícito e delimitado. O aceite posterior cobre apenas C.1, conforme a nota abaixo; não cobre dados reais, OAuth ou conectores.
+
+> O aceite posterior autorizou apenas C.1 (SQLite local vazio e testes sintéticos temporários). Essa autorização delimitada não substitui os aceites específicos pendentes para dados reais, backup cifrado, OAuth ou conectores.
 
 O Blueprint descreve o Gate 2 como Calendar e Gmail somente leitura. Esta proposta estreita a primeira conexão real para **uma conta pessoal do Google Calendar, somente leitura**. Gmail, Drive e conversa com modelo ficam como contratos, não como entrega.
 
@@ -77,6 +79,10 @@ Migração das fixtures:
 - A base real nasce vazia, com `dataset = real`.
 - Nenhuma rotina copia DEMO para a base real.
 - A interface não mistura os dois conjuntos na mesma lista. Trocar de modo é explícito e o modo real não usa o badge DEMO.
+
+### Implementação delimitada C.1
+
+O estado implementado e os seus limites estão documentados em [`docs/GATE2_0C_1_MEMORIA.md`](GATE2_0C_1_MEMORIA.md). C.1 materializa o armazenamento local vazio, modelos e consultas protegidas por sessão e concessão voláteis; não implementa o restante esquema futuro descrito nesta proposta, sincronização, backup ou qualquer fonte externa.
 
 ## 4. Primeira integração
 

@@ -1,4 +1,4 @@
-# AGENTS.md — JARVIS (Victor OS + Victor Context Hub) · Gate 1
+# AGENTS.md — JARVIS (Victor OS + Victor Context Hub)
 
 > Contrato canônico para todos os agentes (OpenCode, Codex, Cursor). Leia `JARVIS_Blueprint_v0.1.md` e `JARVIS_PromptPack_OpenCode_Codex_Cursor.md` antes de qualquer alteração.
 
@@ -12,12 +12,13 @@
 7. Mobile-first e acessível: PT-BR, WCAG 2.2 AA, teclado/screen reader, claro/escuro, redução de movimento, estados de rede claros.
 8. Proteger rotina real: automação não incentiva sobrecarga.
 
-## 2. Arquitetura decidida (Gate 1)
+## 2. Arquitetura e estado dos Gates
 - **Raiz:** `/Users/vic/Freela/Jarvis-Victor-OS` (não criar subdir `jarvis`). Preservar `JARVIS_Blueprint_v0.1.md` e `JARVIS_PromptPack_OpenCode_Codex_Cursor.md`.
 - **Frontend:** `apps/web` — Next.js 15.5.26 + React 19.1 + TypeScript 5 + Tailwind CSS 3. App Router, PWA responsiva, animação frugal. Design system em `apps/web/components/ui` + `apps/web/app/globals.css` (tokens).
-- **Backend:** `apps/api` — FastAPI + Uvicorn + Pydantic v2. Endpoints mock em Gate 1 (sem DB persistente); SQLite só se necessário. OpenAPI tipado em `/docs`.
+- **Backend:** `apps/api` — FastAPI + Uvicorn + Pydantic v2. A interface Gate 1 usa endpoints/fixtures DEMO; a API real local C.1 usa SQLite fora do repositório e filtros de leitura autorizados no servidor.
 - **Fixtures:** `fixtures/demo.json` — dados DEMO fictícios, sinalizados explicitamente. Única fonte de dados no Gate 1.
-- **Infra Gate 1:** sem OAuth real, sem DB externo, sem n8n, sem LLM, sem túnel, sem deploy público. Tudo mock sinalizado.
+- **Memória C.1:** banco separado das fixtures DEMO, vazio por padrão, WAL e migrações versionadas. Sessões e concessões permanecem apenas em memória; `domain_id` classifica e nunca concede acesso.
+- **Infra:** sem OAuth, conectores externos, LLM, túnel, acesso remoto ou deploy. C.1 não importa fixtures DEMO; os registros sintéticos de regressão são criados somente em bancos temporários de teste.
 - **Node:** global v26.7.0 (não LTS) compatível com Next.js 15.5.26 (>=18.17). Preferir LTS 22.x em produção futura via `.nvmrc` sem alterar global. Validado: `node --version` + `next --version`.
 - **Python:** 3.12 fixado por `apps/api/.python-version` e `apps/api/uv.lock`; instalar com `uv sync --locked --python 3.12`. O runner oficial da API é `python serve.py` via `uv run`; não iniciar `main:app` diretamente pelo Uvicorn.
 
@@ -66,7 +67,9 @@ uv run --locked python serve.py  # loopback; não executar uvicorn main:app
 
 ## 6. Gates de ações
 - **Gate 1 (tecnicamente aceito):** somente mocks sinalizados. Nenhuma escrita externa. Tag `gate1-accepted-v0.1`. Aprovação humana continua obrigatória para qualquer ação que toque Google ou produção.
-- **Gate 2 (não iniciado):** readonly Calendar/Gmail com OAuth menor privilégio, conta pessoal autorizada apenas. Escrita permanece DESATIVADA. Não começar sem nova autorização.
+- **Gate 2.0-B:** tecnicamente aceito; encerramento em `docs/GATE2_0B_2_HARDENING.md`, tag local `gate2-b-accepted-v0.1`.
+- **Gate 2.0-C.1:** em implementação/auditoria na branch `feat/gate2.0-c1-memoria`; autorizado somente armazenamento SQLite local vazio e testes sintéticos isolados. Não autoriza importar dados reais ou DEMO.
+- **Próximas etapas:** backup cifrado, adaptador Calendar, OAuth, Gmail, Drive, LLM e acesso remoto exigem autorização separada. Escrita externa permanece desativada.
 - **Gate 3+:** escrita só após testes de idempotência, concorrência, revogação e consentimento.
 
 ## 7. Convenções
