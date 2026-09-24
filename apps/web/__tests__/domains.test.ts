@@ -1,6 +1,7 @@
 import { fixtures } from "@/lib/demo";
-import { countForDomain, isKnownDomainId, partitionByDomain, recordsForDomain } from "@/lib/domains";
-import { appendCapture, mergeCaptures, readExtraCaptures, DEMO_INBOX_STORAGE_KEY } from "@/lib/demo-inbox-store";
+import { eventsForDomain, countForDomain, isKnownDomainId, partitionByDomain, recordsForDomain } from "@/lib/domains";
+import { appendCapture, mergeCaptures, readExtraCaptures, resetDemoInboxStore } from "@/lib/demo-inbox-store";
+import { newLocalCaptureId } from "@/lib/validate";
 
 describe("Isolamento por domain_id", () => {
   const medsynMention = fixtures.events.find((event) => event.id === "evt_006");
@@ -19,11 +20,14 @@ describe("Isolamento por domain_id", () => {
       expect(rows.every((event) => event.domain_id === domain.id)).toBe(true);
       expect(rows.some((event) => event.domain_id !== domain.id)).toBe(false);
     }
-    const crivoEvents = recordsForDomain(fixtures.events, "dom_crivo");
+    const crivoEvents = eventsForDomain(fixtures.events, "dom_crivo");
     expect(crivoEvents.some((event) => /medsyn/i.test(event.title) && event.domain_id !== "dom_crivo")).toBe(false);
   });
 
   it("domínio ausente ou desconhecido não lança e não vaza para filtros", () => {
+    expect(() => recordsForDomain([null, undefined, "texto", 7] as unknown[], "dom_medsyn")).not.toThrow();
+    expect(recordsForDomain([null, undefined, "texto", 7] as unknown[], "dom_medsyn")).toEqual([]);
+    expect(() => partitionByDomain([null, undefined, "texto", 7] as unknown[])).not.toThrow();
     expect(() => recordsForDomain(fixtures.events, "dom_fantasma")).not.toThrow();
     expect(recordsForDomain(fixtures.events, "dom_fantasma")).toEqual([]);
     expect(recordsForDomain(fixtures.events, "")).toEqual([]);
@@ -44,33 +48,36 @@ describe("Isolamento por domain_id", () => {
 describe("Persistência DEMO do Inbox", () => {
   beforeEach(() => {
     window.localStorage.clear();
+    resetDemoInboxStore();
   });
 
-  it("grava captura com id estável e recusa domínio desconhecido sem exceção", () => {
+  it("grava captura com id local e recusa domínio desconhecido sem exceção", () => {
+    const id = newLocalCaptureId();
     const saved = appendCapture({
-      id: "inb_trace_1",
+      id,
       domain_id: "dom_crivo",
       type: "nota",
-      title: "Nota inb_trace_1",
+      title: `Nota ${id}`,
       status: "classified",
       created_at: "2026-09-23T10:00:00-03:00",
       evidence: "local"
     });
-    expect(saved.find((item) => item.id === "inb_trace_1")?.domain_id).toBe("dom_crivo");
-    expect(JSON.parse(window.localStorage.getItem(DEMO_INBOX_STORAGE_KEY) ?? "[]")[0].id).toBe("inb_trace_1");
+    expect(saved.accepted).toBe(true);
+    expect(saved.persisted).toBe(true);
+    expect(saved.items.find((item) => item.id === id)?.domain_id).toBe("dom_crivo");
 
-    expect(() =>
-      appendCapture({
-        id: "inb_bad",
-        domain_id: "dom_fantasma",
-        type: "nota",
-        title: "não deve entrar",
-        status: "classified",
-        created_at: "2026-09-23T10:00:00-03:00",
-        evidence: "local"
-      })
-    ).not.toThrow();
-    expect(readExtraCaptures().some((item) => item.id === "inb_bad")).toBe(false);
+    const rejected = appendCapture({
+      id: newLocalCaptureId(),
+      domain_id: "dom_fantasma",
+      type: "nota",
+      title: "não deve entrar",
+      status: "classified",
+      created_at: "2026-09-23T10:00:00-03:00",
+      evidence: "local"
+    });
+    expect(rejected.accepted).toBe(false);
+    expect(rejected.reason).toBe("unknown-domain");
+    expect(readExtraCaptures().some((item) => item.domain_id === "dom_fantasma")).toBe(false);
     expect(mergeCaptures().some((item) => item.domain_id === "dom_fantasma")).toBe(false);
   });
 });

@@ -1,45 +1,72 @@
 import { fixtures } from "@/lib/demo";
+import { domainName, isKnownDomainId, type DomainId } from "@/lib/domain-registry";
+import { parseEvent, parseFixtureCapture, parseLocalCapture, type CaptureRecord } from "@/lib/validate";
 
-export type DomainId = (typeof fixtures.domains)[number]["id"];
+export type { DomainId };
+export { domainName, isKnownDomainId };
 
 export type DomainScoped = {
   domain_id?: string | null;
 };
 
-const KNOWN = new Set(fixtures.domains.map((d) => d.id));
-
-/** Identificador explícito. Título, sensibilidade e proveniência não contam. */
-export function isKnownDomainId(domainId: string | null | undefined): domainId is DomainId {
-  return typeof domainId === "string" && KNOWN.has(domainId as DomainId);
+function asArray(records: readonly unknown[] | null | undefined): readonly unknown[] {
+  return Array.isArray(records) ? records : [];
 }
 
-export function domainName(domainId: string | null | undefined): string {
-  const found = fixtures.domains.find((d) => d.id === domainId);
-  return found?.name ?? "sem domínio";
-}
+type DomainRecord = { id: string; domain_id?: string | null; title?: string };
 
 /**
- * Filtro por domínio. Id desconhecido ou ausente devolve lista vazia — sem lançar.
- * Não há compartilhamento: só entra quem tem exatamente esse domain_id.
+ * Filtro seguro. Entrada nula, primitiva ou sem domain_id é ignorada.
+ * Domínio desconhecido devolve lista vazia, sem lançar.
  */
-export function recordsForDomain<T extends DomainScoped>(records: readonly T[], domainId: string): T[] {
+export function recordsForDomain<T extends DomainRecord = DomainRecord>(
+  records: readonly unknown[] | null | undefined,
+  domainId: string
+): T[] {
   if (!isKnownDomainId(domainId)) return [];
-  return records.filter((record) => record.domain_id === domainId);
+  const out: T[] = [];
+  for (const record of asArray(records)) {
+    if (!record || typeof record !== "object") continue;
+    const id = (record as { domain_id?: unknown }).domain_id;
+    if (id === domainId) out.push(record as T);
+  }
+  return out;
 }
 
-export function partitionByDomain<T extends DomainScoped>(records: readonly T[]): {
-  assigned: T[];
-  unassigned: T[];
-} {
-  const assigned: T[] = [];
-  const unassigned: T[] = [];
-  for (const record of records) {
-    if (isKnownDomainId(record.domain_id)) assigned.push(record);
-    else unassigned.push(record);
+export function eventsForDomain(records: readonly unknown[] | null | undefined, domainId: string) {
+  if (!isKnownDomainId(domainId)) return [];
+  return asArray(records)
+    .map(parseEvent)
+    .filter((item): item is NonNullable<typeof item> => item?.placement === "assigned" && item.event.domain_id === domainId)
+    .map((item) => item.event);
+}
+
+export function capturesForDomain(records: readonly unknown[] | null | undefined, domainId: string): CaptureRecord[] {
+  if (!isKnownDomainId(domainId)) return [];
+  const out: CaptureRecord[] = [];
+  for (const record of asArray(records)) {
+    const capture = parseLocalCapture(record) ?? parseFixtureCapture(record);
+    if (capture?.domain_id === domainId) out.push(capture);
+  }
+  return out;
+}
+
+export function partitionByDomain(records: readonly unknown[] | null | undefined) {
+  const assigned = [];
+  const unassigned = [];
+  for (const record of asArray(records)) {
+    const parsed = parseEvent(record);
+    if (!parsed) continue;
+    if (parsed.placement === "assigned") assigned.push(parsed.event);
+    else unassigned.push(parsed.event);
   }
   return { assigned, unassigned };
 }
 
-export function countForDomain(domainId: string, events = fixtures.events, captures: DomainScoped[] = fixtures.inbox): number {
-  return recordsForDomain(events, domainId).length + recordsForDomain(captures, domainId).length;
+export function countForDomain(
+  domainId: string,
+  events: readonly unknown[] = fixtures.events,
+  captures: readonly unknown[] = fixtures.inbox
+): number {
+  return eventsForDomain(events, domainId).length + capturesForDomain(captures, domainId).length;
 }

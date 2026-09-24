@@ -1,11 +1,25 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-import json
-from pathlib import Path
+
+from pydantic import ValidationError
+
+from contract import (
+    CaptureOut,
+    DomainOut,
+    EventOut,
+    FixtureError,
+    HealthOut,
+    SourceOut,
+    parse_collection,
+    read_raw_fixture,
+)
 
 app = FastAPI(
     title="JARVIS API — Gate 1 mock",
-    description="Endpoints mock com dados DEMO fictícios. Nenhuma integração real.",
+    description=(
+        "Endpoints mock com dados DEMO fictícios. Nenhuma integração real. "
+        "domain_id é classificação de memória, não autorização de acesso."
+    ),
     version="0.1.0",
 )
 
@@ -17,48 +31,60 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-FIXTURES = Path(__file__).resolve().parents[2] / "fixtures" / "demo.json"
 
-def load_fixtures():
-    if not FIXTURES.exists():
-        return {"meta": {"demo": True}, "events": [], "sources": [], "briefing": {}}
-    return json.loads(FIXTURES.read_text())
+def fixture_or_422() -> dict:
+    try:
+        return read_raw_fixture()
+    except FixtureError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
 
-@app.get("/health")
-def health():
-    return {"status": "ok", "gate": 1, "mode": "mock", "demo": True}
+
+@app.get("/health", response_model=HealthOut)
+def health() -> HealthOut:
+    return HealthOut(status="ok", gate=1, mode="mock", demo=True)
+
 
 @app.get("/briefing")
-def briefing():
-    data = load_fixtures()
-    return data.get("briefing", {})
+def briefing() -> dict:
+    return fixture_or_422().get("briefing", {})
 
-@app.get("/events")
-def events():
-    data = load_fixtures()
-    return data.get("events", [])
 
-@app.get("/sources")
-def sources():
-    data = load_fixtures()
-    return data.get("sources", [])
+@app.get("/events", response_model=list[EventOut])
+def events() -> list[EventOut]:
+    return parse_collection(fixture_or_422().get("events"), EventOut, "Event")
+
+
+@app.get("/sources", response_model=list[SourceOut])
+def sources() -> list[SourceOut]:
+    data = fixture_or_422().get("sources", [])
+    if not isinstance(data, list):
+        return []
+    parsed = []
+    for item in data:
+        try:
+            parsed.append(SourceOut.model_validate(item))
+        except ValidationError:
+            continue
+    return parsed
+
+
+@app.get("/inbox", response_model=list[CaptureOut])
+def inbox() -> list[CaptureOut]:
+    return parse_collection(fixture_or_422().get("inbox"), CaptureOut, "FixtureCapture")
+
+
+@app.get("/domains", response_model=list[DomainOut])
+def domains() -> list[DomainOut]:
+    return parse_collection(fixture_or_422().get("domains"), DomainOut, "Domain")
+
 
 @app.get("/proposals")
-def proposals():
-    data = load_fixtures()
-    return data.get("proposals", [])
+def proposals() -> list:
+    data = fixture_or_422().get("proposals", [])
+    return data if isinstance(data, list) else []
 
-@app.get("/inbox")
-def inbox():
-    data = load_fixtures()
-    return data.get("inbox", [])
 
 @app.get("/approvals")
-def approvals():
-    data = load_fixtures()
-    return data.get("approvals", [])
-
-@app.get("/domains")
-def domains():
-    data = load_fixtures()
-    return data.get("domains", [])
+def approvals() -> list:
+    data = fixture_or_422().get("approvals", [])
+    return data if isinstance(data, list) else []

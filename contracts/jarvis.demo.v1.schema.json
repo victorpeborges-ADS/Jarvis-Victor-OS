@@ -1,0 +1,108 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "jarvis.demo.v1",
+  "title": "JARVIS DEMO v1",
+  "type": "object",
+  "required": ["meta", "events", "inbox", "domains"],
+  "additionalProperties": true,
+  "properties": {
+    "meta": { "$ref": "#/definitions/Meta" },
+    "events": {
+      "type": "array",
+      "items": { "$ref": "#/definitions/Event" }
+    },
+    "inbox": {
+      "type": "array",
+      "items": { "$ref": "#/definitions/FixtureCapture" }
+    },
+    "domains": {
+      "type": "array",
+      "minItems": 8,
+      "maxItems": 8,
+      "items": { "$ref": "#/definitions/Domain" }
+    }
+  },
+  "definitions": {
+    "Meta": {
+      "type": "object",
+      "required": ["demo", "schema"],
+      "additionalProperties": true,
+      "properties": {
+        "demo": { "const": true },
+        "schema": { "const": "jarvis.demo.v1" }
+      }
+    },
+    "Domain": {
+      "type": "object",
+      "required": ["id", "name"],
+      "additionalProperties": true,
+      "properties": {
+        "id": { "type": "string", "minLength": 1 },
+        "name": { "type": "string", "minLength": 1 },
+        "count": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "Provenance": {
+      "type": "object",
+      "required": ["origin", "last_checked", "confidence"],
+      "additionalProperties": true,
+      "properties": {
+        "origin": { "type": "string", "minLength": 1 },
+        "last_checked": { "type": "string", "minLength": 1 },
+        "confidence": { "type": "string", "enum": ["alta", "média", "baixa"] },
+        "url": { "type": "string" },
+        "scope": { "type": "string" },
+        "note": { "type": "string" }
+      }
+    },
+    "Event": {
+      "type": "object",
+      "required": ["id", "title", "event_type", "sensitivity", "occurred_at", "source_id", "domain_id", "provenance"],
+      "additionalProperties": true,
+      "properties": {
+        "id": { "type": "string", "minLength": 1 },
+        "title": { "type": "string", "minLength": 1 },
+        "event_type": { "type": "string", "enum": ["commitment", "communication"] },
+        "sensitivity": { "type": "string", "enum": ["internal", "personal", "public"] },
+        "occurred_at": { "type": "string", "minLength": 1 },
+        "source_id": { "type": "string", "minLength": 1 },
+        "domain_id": { "type": ["string", "null"] },
+        "show_in_agora": { "type": "boolean" },
+        "provenance": { "$ref": "#/definitions/Provenance" }
+      }
+    },
+    "FixtureCapture": {
+      "type": "object",
+      "required": ["id", "domain_id", "type", "title", "status", "created_at", "evidence"],
+      "additionalProperties": true,
+      "properties": {
+        "id": { "type": "string", "pattern": "^inb_[A-Za-z0-9_-]+$" },
+        "domain_id": { "type": "string", "minLength": 1 },
+        "type": { "type": "string", "minLength": 1 },
+        "title": { "type": "string", "minLength": 1, "maxLength": 280 },
+        "status": { "type": "string", "minLength": 1 },
+        "created_at": { "type": "string", "minLength": 1 },
+        "evidence": { "type": "string", "minLength": 1 },
+        "entity_ref": { "type": "string" }
+      }
+    },
+    "LocalCapture": {
+      "type": "object",
+      "required": ["id", "domain_id", "type", "title", "status", "created_at", "evidence"],
+      "additionalProperties": true,
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^local_[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+        },
+        "domain_id": { "type": "string", "minLength": 1 },
+        "type": { "type": "string", "minLength": 1 },
+        "title": { "type": "string", "minLength": 1, "maxLength": 280 },
+        "status": { "type": "string", "minLength": 1 },
+        "created_at": { "type": "string", "minLength": 1 },
+        "evidence": { "type": "string", "minLength": 1 },
+        "entity_ref": { "type": "string" }
+      }
+    }
+  }
+}

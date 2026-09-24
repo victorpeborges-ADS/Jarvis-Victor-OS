@@ -40,6 +40,25 @@ test.describe("Gate 1.3 — isolamento e persistência DEMO", () => {
     await expect(page.getByTestId("domain-captures").getByText(trace)).toHaveCount(0);
   });
 
+  test("quota não anuncia persistência e some no recarregamento", async ({ page }) => {
+    const trace = `quota-${Date.now()}-${test.info().project.name}`;
+    await page.addInitScript(() => {
+      const original = Storage.prototype.setItem;
+      Storage.prototype.setItem = function (key, value) {
+        if (key === "jarvis.demo.inbox.v1") throw new DOMException("quota audit", "QuotaExceededError");
+        return original.call(this, key, value);
+      };
+    });
+    await page.goto("/inbox");
+    await page.getByTestId("capture-input").fill(trace);
+    await page.getByTestId("capture-save").click();
+    await expect(page.getByTestId("capture-feedback")).toContainText("perdida ao recarregar");
+    await expect(page.getByText("Captura classificada e salva")).toHaveCount(0);
+    await expect(page.getByText(trace)).toBeVisible();
+    await page.reload();
+    await expect(page.getByText(trace)).toHaveCount(0);
+  });
+
   test("oito domínios isolados, menção CRIVO não vaza, sem domínio fica de fora", async ({ page }) => {
     await page.goto("/dominios");
 

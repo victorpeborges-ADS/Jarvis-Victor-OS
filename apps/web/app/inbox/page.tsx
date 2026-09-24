@@ -2,8 +2,9 @@
 import { useState } from "react";
 import Link from "next/link";
 import { fixtures, inboxStatusLabel, formatTimeH } from "@/lib/demo";
-import { domainName, recordsForDomain } from "@/lib/domains";
-import { appendCapture, DEMO_STORAGE_LIMITS, useDemoCaptures } from "@/lib/demo-inbox-store";
+import { capturesForDomain, domainName } from "@/lib/domains";
+import { appendCapture, DEMO_STORAGE_LIMITS, EPHEMERAL_NOTICE, useDemoCaptures } from "@/lib/demo-inbox-store";
+import { newLocalCaptureId } from "@/lib/validate";
 import { Badge, Card, Button, ProvenanceDrawer, EmptyState } from "@/components/ui/primitives";
 
 type InboxType = "tarefa" | "evento" | "referência" | "projeto" | "pessoa" | "nota";
@@ -12,17 +13,16 @@ export default function InboxPage() {
   const [text, setText] = useState("");
   const [type, setType] = useState<InboxType>("referência");
   const [domainId, setDomainId] = useState("dom_crivo");
-  const items = useDemoCaptures();
+  const { items, ephemeral } = useDemoCaptures();
   const [drawer, setDrawer] = useState<string | null>(null);
   const [filter, setFilter] = useState<string>("todos");
-  const [feedback, setFeedback] = useState<string | null>(null);
+  const [feedback, setFeedback] = useState<{ tone: "ok" | "warn" | "error"; title: string; detail: string } | null>(null);
 
   function handleCapture() {
     if (!text.trim()) return;
     const title = text.slice(0, 80);
-    const id = `inb_${crypto.randomUUID()}`;
-    appendCapture({
-      id,
+    const result = appendCapture({
+      id: newLocalCaptureId(),
       type,
       title,
       domain_id: domainId,
@@ -31,11 +31,27 @@ export default function InboxPage() {
       created_at: new Date().toISOString(),
       evidence: "Classificada localmente — sem criação de evento/e-mail externo"
     });
+    if (!result.accepted) {
+      setFeedback({
+        tone: "error",
+        title: "Captura não salva",
+        detail: "O registro é inválido ou o domínio não é conhecido. Nada foi gravado."
+      });
+      return;
+    }
     setText("");
-    setFeedback(`Salvo como ${type} em ${domainName(domainId)}. Nenhuma reunião ou e-mail foi criado — revisão humana preservada.`);
+    if (!result.persisted) {
+      setFeedback({ tone: "warn", title: "Só nesta sessão", detail: EPHEMERAL_NOTICE });
+      return;
+    }
+    setFeedback({
+      tone: "ok",
+      title: "Captura classificada e salva",
+      detail: `Salvo como ${type} em ${domainName(domainId)}. Nenhuma reunião ou e-mail foi criado — revisão humana preservada.`
+    });
   }
 
-  const filtered = filter === "todos" ? items : recordsForDomain(items, filter);
+  const filtered = filter === "todos" ? items : capturesForDomain(items, filter);
 
   return (
     <div className="mx-auto max-w-[880px] px-4 py-6 md:px-8">
@@ -47,6 +63,11 @@ export default function InboxPage() {
           <p className="mt-1 max-w-[560px] text-xs leading-relaxed text-ink-faint" data-testid="demo-storage-limits">
             {DEMO_STORAGE_LIMITS}
           </p>
+          {ephemeral && (
+            <p className="mt-1 max-w-[560px] text-xs leading-relaxed text-amber-800" data-testid="ephemeral-warning">
+              {EPHEMERAL_NOTICE}
+            </p>
+          )}
         </div>
         <Badge tone="amber">DEMO</Badge>
       </div>
@@ -54,11 +75,16 @@ export default function InboxPage() {
       {feedback && (
         <div
           role="status"
-          className="mt-4 flex items-start justify-between gap-3 rounded-xl bg-emerald-50 px-4 py-3 text-sm text-emerald-900 ring-1 ring-emerald-200"
+          data-testid="capture-feedback"
+          data-persisted={feedback.tone === "ok" ? "true" : "false"}
+          className={[
+            "mt-4 flex items-start justify-between gap-3 rounded-xl px-4 py-3 text-sm ring-1",
+            feedback.tone === "ok" ? "bg-emerald-50 text-emerald-900 ring-emerald-200" : "bg-amber-50 text-amber-900 ring-amber-200"
+          ].join(" ")}
         >
           <div>
-            <div className="font-medium">Captura classificada e salva</div>
-            <div className="mt-0.5 text-xs leading-relaxed text-emerald-800">{feedback}</div>
+            <div className="font-medium">{feedback.title}</div>
+            <div className="mt-0.5 text-xs leading-relaxed">{feedback.detail}</div>
           </div>
           <button type="button" className="shrink-0 text-xs font-medium underline" onClick={() => setFeedback(null)} aria-label="Dispensar feedback">
             Ok

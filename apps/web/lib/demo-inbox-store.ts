@@ -2,80 +2,169 @@
 
 import { useCallback, useEffect, useState } from "react";
 import { fixtures } from "@/lib/demo";
-import { isKnownDomainId } from "@/lib/domains";
+import { parseFixtureCapture, parseLocalCapture, localCaptureIssue, type CaptureRecord } from "@/lib/validate";
 
-/** Só fixtures DEMO. Não é nuvem, não sobrevive a limpar dados do site, teto de 50 capturas extras. */
+/** Só fixtures DEMO. Não é nuvem, não sobrevive a limpar o site, teto de 50 capturas extras. */
 export const DEMO_INBOX_STORAGE_KEY = "jarvis.demo.inbox.v1";
 export const DEMO_INBOX_STORAGE_LIMIT = 50;
 export const DEMO_STORAGE_LIMITS =
   "Armazenamento local do navegador, apenas dados DEMO. Não sincroniza entre aparelhos e some ao limpar os dados do site. Máximo de 50 capturas extras.";
+export const EPHEMERAL_NOTICE =
+  "O navegador recusou a gravação. Esta nota fica só nesta sessão e será perdida ao recarregar.";
 
-export type DemoCapture = {
-  id: string;
-  domain_id: string;
-  type: string;
-  title: string;
-  status: string;
-  created_at: string;
-  evidence: string;
-  entity_ref?: string;
+export type DemoCapture = CaptureRecord;
+export type StorageMode = "persistent" | "memory";
+export type StorageFailure = "quota" | "blocked" | "unavailable" | "malformed";
+
+export type AppendResult = {
+  accepted: boolean;
+  persisted: boolean;
+  mode: StorageMode;
+  reason?: "invalid" | "unknown-domain" | "collision" | StorageFailure;
+  items: DemoCapture[];
 };
 
 const CHANGE_EVENT = "jarvis-demo-inbox";
 
-function fromFixtures(): DemoCapture[] {
-  return fixtures.inbox.map((item) => ({
-    id: item.id,
-    domain_id: item.domain_id,
-    type: item.type,
-    title: item.title,
-    status: item.status,
-    created_at: item.created_at,
-    evidence: item.evidence,
-    entity_ref: item.entity_ref
-  }));
+let memoryExtras: DemoCapture[] | null = null;
+
+function fixtureCaptures(): DemoCapture[] {
+  return fixtures.inbox.flatMap((item) => {
+    const parsed = parseFixtureCapture(item);
+    return parsed ? [parsed] : [];
+  });
 }
 
-function isCapture(value: unknown): value is DemoCapture {
-  if (!value || typeof value !== "object") return false;
-  const item = value as Partial<DemoCapture>;
-  return typeof item.id === "string" && typeof item.title === "string" && typeof item.domain_id === "string" && isKnownDomainId(item.domain_id);
+function fixtureIds(): Set<string> {
+  return new Set(fixtureCaptures().map((item) => item.id));
+}
+
+function failureKind(error: unknown): StorageFailure {
+  if (error instanceof DOMException) {
+    if (error.name === "QuotaExceededError" || error.code === 22) return "quota";
+    if (error.name === "SecurityError") return "blocked";
+  }
+  return "unavailable";
+}
+
+function dedupeLocals(items: DemoCapture[]): DemoCapture[] {
+  const reserved = fixtureIds();
+  const seen = new Set<string>();
+  const out: DemoCapture[] = [];
+  for (const item of items) {
+    if (reserved.has(item.id) || seen.has(item.id) || !item.id.startsWith("local_")) continue;
+    seen.add(item.id);
+    out.push(item);
+    if (out.length >= DEMO_INBOX_STORAGE_LIMIT) break;
+  }
+  return out;
+}
+
+function normalizeStored(value: unknown): DemoCapture[] {
+  if (!Array.isArray(value)) return [];
+  const parsed = value.flatMap((item) => {
+    const capture = parseLocalCapture(item);
+    return capture ? [capture] : [];
+  });
+  return dedupeLocals(parsed);
+}
+
+function readPersistent(): { ok: true; items: DemoCapture[] } | { ok: false; reason: StorageFailure } {
+  try {
+    if (typeof window === "undefined" || !window.localStorage) return { ok: false, reason: "unavailable" };
+    const raw = window.localStorage.getItem(DEMO_INBOX_STORAGE_KEY);
+    if (!raw) return { ok: true, items: [] };
+    try {
+      return { ok: true, items: normalizeStored(JSON.parse(raw)) };
+    } catch {
+      return { ok: false, reason: "malformed" };
+    }
+  } catch (error) {
+    return { ok: false, reason: failureKind(error) };
+  }
+}
+
+function writePersistent(items: DemoCapture[]): { persisted: boolean; mode: StorageMode; reason?: StorageFailure } {
+  try {
+    if (typeof window === "undefined" || !window.localStorage) {
+      memoryExtras = items;
+      return { persisted: false, mode: "memory", reason: "unavailable" };
+    }
+    window.localStorage.setItem(DEMO_INBOX_STORAGE_KEY, JSON.stringify(items));
+    memoryExtras = null;
+    return { persisted: true, mode: "persistent" };
+  } catch (error) {
+    memoryExtras = items;
+    return { persisted: false, mode: "memory", reason: failureKind(error) };
+  }
+}
+
+export function isEphemeralSession(): boolean {
+  return memoryExtras !== null;
 }
 
 export function readExtraCaptures(): DemoCapture[] {
-  if (typeof window === "undefined") return [];
-  try {
-    const raw = window.localStorage.getItem(DEMO_INBOX_STORAGE_KEY);
-    if (!raw) return [];
-    const parsed: unknown = JSON.parse(raw);
-    if (!Array.isArray(parsed)) return [];
-    return parsed.filter(isCapture).slice(0, DEMO_INBOX_STORAGE_LIMIT);
-  } catch {
-    return [];
-  }
+  if (memoryExtras) return memoryExtras;
+  const stored = readPersistent();
+  return stored.ok ? stored.items : [];
 }
 
 export function mergeCaptures(extra = readExtraCaptures()): DemoCapture[] {
-  const base = fromFixtures();
-  const seen = new Set(extra.map((item) => item.id));
-  return [...extra, ...base.filter((item) => !seen.has(item.id))];
+  const base = fixtureCaptures();
+  const reserved = new Set(base.map((item) => item.id));
+  return [...extra.filter((item) => !reserved.has(item.id)), ...base];
 }
 
-export function appendCapture(capture: DemoCapture): DemoCapture[] {
-  if (!isKnownDomainId(capture.domain_id)) {
-    return mergeCaptures();
+export function appendCapture(capture: CaptureRecord): AppendResult {
+  const issue = localCaptureIssue(capture);
+  if (issue || !parseLocalCapture(capture)) {
+    return {
+      accepted: false,
+      persisted: false,
+      mode: isEphemeralSession() ? "memory" : "persistent",
+      reason: issue ?? "invalid",
+      items: mergeCaptures()
+    };
   }
-  const next = [capture, ...readExtraCaptures().filter((item) => item.id !== capture.id)].slice(0, DEMO_INBOX_STORAGE_LIMIT);
-  window.localStorage.setItem(DEMO_INBOX_STORAGE_KEY, JSON.stringify(next));
-  window.dispatchEvent(new Event(CHANGE_EVENT));
-  return mergeCaptures(next);
+  const parsed = parseLocalCapture(capture)!;
+  if (fixtureIds().has(parsed.id)) {
+    return {
+      accepted: false,
+      persisted: false,
+      mode: isEphemeralSession() ? "memory" : "persistent",
+      reason: "collision",
+      items: mergeCaptures()
+    };
+  }
+  const next = dedupeLocals([parsed, ...readExtraCaptures().filter((item) => item.id !== parsed.id)]);
+  const write = writePersistent(next);
+  if (typeof window !== "undefined") window.dispatchEvent(new Event(CHANGE_EVENT));
+  return { accepted: true, persisted: write.persisted, mode: write.mode, reason: write.reason, items: mergeCaptures(next) };
 }
 
-export function useDemoCaptures(): DemoCapture[] {
-  const [items, setItems] = useState<DemoCapture[]>(fromFixtures);
+export function clearDemoCaptures(): { cleared: boolean; mode: StorageMode } {
+  memoryExtras = null;
+  try {
+    if (typeof window === "undefined" || !window.localStorage) return { cleared: false, mode: "memory" };
+    window.localStorage.removeItem(DEMO_INBOX_STORAGE_KEY);
+    if (typeof window !== "undefined") window.dispatchEvent(new Event(CHANGE_EVENT));
+    return { cleared: true, mode: "persistent" };
+  } catch {
+    return { cleared: false, mode: "memory" };
+  }
+}
+
+export function resetDemoInboxStore(): void {
+  memoryExtras = null;
+}
+
+export function useDemoCaptures(): { items: DemoCapture[]; ephemeral: boolean } {
+  const [items, setItems] = useState<DemoCapture[]>(fixtureCaptures);
+  const [ephemeral, setEphemeral] = useState(false);
 
   const sync = useCallback(() => {
     setItems(mergeCaptures());
+    setEphemeral(isEphemeralSession());
   }, []);
 
   useEffect(() => {
@@ -88,5 +177,5 @@ export function useDemoCaptures(): DemoCapture[] {
     };
   }, [sync]);
 
-  return items;
+  return { items, ephemeral };
 }

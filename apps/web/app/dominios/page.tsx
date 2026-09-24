@@ -2,19 +2,18 @@
 import { useEffect, useState } from "react";
 import Link from "next/link";
 import { fixtures, sensitivityLabel } from "@/lib/demo";
-import { countForDomain, domainName, isKnownDomainId, partitionByDomain, recordsForDomain } from "@/lib/domains";
+import { capturesForDomain, countForDomain, domainName, eventsForDomain, isKnownDomainId, partitionByDomain } from "@/lib/domains";
 import { DEMO_STORAGE_LIMITS, useDemoCaptures } from "@/lib/demo-inbox-store";
 import { Badge, Card, EmptyState } from "@/components/ui/primitives";
 
 export default function DominiosPage() {
   const [active, setActive] = useState("todos");
   const domains = fixtures.domains;
-  const captures = useDemoCaptures();
+  const { items: captures, ephemeral } = useDemoCaptures();
   const activeDomain = domains.find((d) => d.id === active);
   const { assigned: assignedEvents, unassigned } = partitionByDomain(fixtures.events);
-  const filteredEvents = active === "todos" ? assignedEvents : recordsForDomain(fixtures.events, active);
-  const knownCaptures = captures.filter((item) => isKnownDomainId(item.domain_id));
-  const inboxFiltered = active === "todos" ? knownCaptures : recordsForDomain(captures, active);
+  const filteredEvents = active === "todos" ? assignedEvents : eventsForDomain(fixtures.events, active);
+  const inboxFiltered = active === "todos" ? captures.filter((item) => isKnownDomainId(item.domain_id)) : capturesForDomain(captures, active);
 
   useEffect(() => {
     const requested = new URLSearchParams(window.location.search).get("dominio");
@@ -137,6 +136,11 @@ export default function DominiosPage() {
           <h2 className="text-sm font-semibold text-ink">Capturas vinculadas</h2>
           <p className="mt-1 text-xs leading-relaxed text-ink-subtle">Mesma lista do Inbox (armazenamento local DEMO). Sem vazamento entre domínios.</p>
           <p className="mt-1 text-[11px] leading-relaxed text-ink-faint">{DEMO_STORAGE_LIMITS}</p>
+          {ephemeral && (
+            <p className="mt-1 text-[11px] leading-relaxed text-amber-800" data-testid="ephemeral-warning">
+              Estas capturas extras estão só nesta sessão e serão perdidas ao recarregar.
+            </p>
+          )}
           <div className="mt-4 space-y-2" data-testid="domain-captures">
             {inboxFiltered.length === 0 ? (
               <div className="rounded-xl border border-dashed border-paper-border bg-paper-muted/50 px-4 py-6 text-center text-sm text-ink-subtle">
