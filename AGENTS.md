@@ -18,7 +18,7 @@
 - **Backend:** `apps/api` — FastAPI + Uvicorn + Pydantic v2. A interface Gate 1 usa endpoints/fixtures DEMO; a API real local C.1 usa SQLite fora do repositório e filtros de leitura autorizados no servidor.
 - **Fixtures:** `fixtures/demo.json` — dados DEMO fictícios, sinalizados explicitamente. Única fonte de dados no Gate 1.
 - **Memória C.1:** banco separado das fixtures DEMO, vazio por padrão, WAL e migrações versionadas. Sessões e concessões permanecem apenas em memória; `domain_id` classifica e nunca concede acesso.
-- **Infra:** sem OAuth, conectores externos, LLM, túnel, acesso remoto ou deploy. C.1/C.2 não importam fixtures DEMO; testes e ensaios C.2 usam somente bancos sintéticos temporários.
+- **Infra:** sem OAuth, fontes externas reais, LLM, túnel, acesso remoto ou deploy. C.1/C.2 não importam fixtures DEMO; testes e ensaios C.2 usam somente bancos sintéticos temporários. Gate D contém exclusivamente um provider Calendar simulado.
 - **Node:** global v26.7.0 (não LTS) compatível com Next.js 15.5.26 (>=18.17). Preferir LTS 22.x em produção futura via `.nvmrc` sem alterar global. Validado: `node --version` + `next --version`.
 - **Python:** 3.12 fixado por `apps/api/.python-version` e `apps/api/uv.lock`; instalar com `uv sync --locked --python 3.12`. O runner oficial da API é `python serve.py` via `uv run`; não iniciar `main:app` diretamente pelo Uvicorn.
 
@@ -70,7 +70,9 @@ uv run --locked python serve.py  # loopback; não executar uvicorn main:app
 - **Gate 2.0-B:** tecnicamente aceito; encerramento em `docs/GATE2_0B_2_HARDENING.md`, tag local `gate2-b-accepted-v0.1`.
 - **Gate 2.0-C.1:** tecnicamente aceito em `gate2-c1-accepted-v0.1`, no commit `2609bdb`. A base SQLite permanece separada das fixtures DEMO; sessões e concessões são voláteis.
 - **Gate 2.0-C.2:** tecnicamente aceito para backup cifrado e restauração isolada de bancos sintéticos; tag local `gate2-c2-accepted-v0.1` aponta para `c6f7ce5`. O registro da auditoria independente está em `docs/GATE2_0C_2_ACEITE.md`. A aceitação não cobre usar/restaurar o banco padrão em testes, dados pessoais/institucionais, retenção automática, Keychain, ativação ou substituição de banco.
-- **Próximas etapas:** Calendar real, OAuth, Gmail, Drive, LLM, acesso remoto e deploy exigem autorização separada. Escrita externa permanece desativada.
+- **Gate 2.0-D:** tecnicamente aceito exclusivamente para Calendar simulado; tag local anotada `gate2-d-accepted-v0.1` aponta para `3175c0f`. A auditoria independente reportou 136 testes da API, 7 probes adversariais e 31 Vitest aprovados; veja `docs/GATE2_0D_ACEITE.md`. Limites: grants coordenados em um processo, GET decidido antes de revogação pode responder depois e eventos de dia inteiro ainda não são suportados.
+- **Gate 2.0-E:** autorizado para integração sintética da interface web com a API local, sujeito a nova auditoria antes de consolidação. Isso não autoriza OAuth, dados pessoais/institucionais, Google Calendar real, Gmail, Drive, LLM, acesso remoto ou deploy. Escrita externa permanece desativada.
+- **Próximas etapas externas:** Calendar real, OAuth, Gmail, Drive, LLM, acesso remoto e deploy exigem autorização específica. Eventos de dia inteiro precisam de contrato aprovado antes de uma integração real.
 - **Gate 3+:** escrita só após testes de idempotência, concorrência, revogação e consentimento.
 
 ## 7. Convenções

@@ -1,8 +1,8 @@
 # JARVIS — Victor OS + Victor Context Hub
 
-Gate 1 tecnicamente aceito em `gate1-accepted-v0.1`. Gate 2.0-B foi aceito em `gate2-b-accepted-v0.1`. Gate 2.0-C.1 foi tecnicamente aceito em `gate2-c1-accepted-v0.1`. Gate 2.0-C.2 foi tecnicamente aceito para backup cifrado e restauração isolada exclusivamente com bancos sintéticos, em `gate2-c2-accepted-v0.1`.
+Gate 1 tecnicamente aceito em `gate1-accepted-v0.1`. Gate 2.0-B foi aceito em `gate2-b-accepted-v0.1`. Gate 2.0-C.1 foi tecnicamente aceito em `gate2-c1-accepted-v0.1`. Gate 2.0-C.2 foi tecnicamente aceito para backup cifrado e restauração isolada exclusivamente com bancos sintéticos, em `gate2-c2-accepted-v0.1`. Gate 2.0-D foi aceito exclusivamente para o adaptador Calendar simulado, em `gate2-d-accepted-v0.1` (código auditado `3175c0f`).
 
-> **Estado dos dados:** A interface Gate 1 continua usando exclusivamente fixtures DEMO. A API C.1 dispõe de SQLite local separado; o aceite C.2 limita-se a backup/restauração com dados sintéticos em diretórios descartáveis. O CLI não inicializa nem substitui o banco padrão. Não há integração com Google Calendar/Gmail/Drive nem importação de fixtures.
+> **Estado dos dados:** A interface Gate 1 continua usando exclusivamente fixtures DEMO. A API C.1 dispõe de SQLite local separado; C.2 cobre backup/restauração de bancos sintéticos descartáveis; D cobre somente o provider Calendar simulado. Não há autorização para dados pessoais/institucionais, OAuth, Google Calendar real, Gmail, Drive ou importação de fixtures.
 
 **Raiz:** `/Users/vic/Freela/Jarvis-Victor-OS`. Aceite técnico registrado a partir de `feat/gate1.3.2-a11y` @ `de1e26b`, com a correção pontual de contraste no cartão selecionado.
 
@@ -89,4 +89,4 @@ Agora · Conversa JARVIS · Inbox · Domínios · Aprovações · Fontes/Privaci
 
 ## Gates
 
-Gate 1, Gate 2.0-B, Gate 2.0-C.1 e Gate 2.0-C.2 estão tecnicamente aceitos, cada qual dentro do seu escopo. O C.2 cobre exclusivamente backup cifrado e restauração isolada com bancos sintéticos; não cobre importar fixtures, usar/restaurar o banco padrão em testes, ativar banco restaurado, dados reais, OAuth, conectores, LLM, acesso remoto ou deploy. Consulte `docs/GATE2_0C_1_1_INTEGRIDADE.md`, `docs/GATE2_0C_2_BACKUP_RECOVERY.md`, `docs/GATE2_0C_2_ACEITE.md` e `AGENTS.md`.
+Gate 1, Gate 2.0-B, Gate 2.0-C.1, Gate 2.0-C.2 e Gate 2.0-D estão tecnicamente aceitos, cada qual dentro do seu escopo. D cobre exclusivamente Calendar simulado e não autoriza dados pessoais/institucionais, OAuth ou Google real. A auditoria independente reportou 136 testes da API, 7 probes adversariais adicionais e 31 testes Vitest aprovados; esse resultado externo está documentado em `docs/GATE2_0D_ACEITE.md` e os probes externos não foram incorporados à suíte versionada. Riscos: coordenação de grants limitada a um processo; um GET decidido antes de revogação pode responder depois; eventos de dia inteiro não são suportados. A integração sintética da interface no Gate E está autorizada separadamente; não amplia a autorização para fontes ou dados reais.
