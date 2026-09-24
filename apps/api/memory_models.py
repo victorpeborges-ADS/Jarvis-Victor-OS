@@ -104,6 +104,7 @@ class EventRecord(StrictRecord):
     domain_id: str | None = None
     sensitivity: Literal["normal", "sensitive", "restricted"] = "normal"
     occurred_at: datetime | None = None
+    cancelled_at: datetime | None = None
     payload_minimized: dict[str, Any] = Field(default_factory=dict)
     provenance: ProvenanceRecord
     dataset: Literal["real"] = "real"
@@ -123,7 +124,7 @@ class EventRecord(StrictRecord):
             raise ValueError("domain_id desconhecido")
         return value
 
-    @field_validator("occurred_at", "created_at")
+    @field_validator("occurred_at", "cancelled_at", "created_at")
     @classmethod
     def timestamps_are_aware(cls, value: datetime | None) -> datetime | None:
         return _require_aware(value)
@@ -135,6 +136,41 @@ class EventRecord(StrictRecord):
                 raise ValueError("registro sem domínio precisa permanecer não classificado")
         elif self.provenance.classification_method == "unclassified" or self.provenance.classified_at is None:
             raise ValueError("classificação do domínio precisa de método e instante")
+        return self
+
+
+class CalendarSyncCheckpoint(StrictRecord):
+    """Persisted mapping and opaque simulated-provider continuation state."""
+
+    source_id: str = Field(min_length=1, max_length=128)
+    calendar_id: str = Field(pattern=r"^sim_calendar_[a-h]$")
+    domain_id: str | None = None
+    classified_at: datetime | None = None
+    sync_token: str | None = Field(default=None, max_length=512)
+    page_token: str | None = Field(default=None, max_length=512)
+    sync_status: Literal["simulated", "stale", "error"] = "simulated"
+    last_success_at: datetime | None = None
+    last_attempt_at: datetime | None = None
+    error_code: Literal["simulated_network", "invalid_cursor", "provider_error"] | None = None
+
+    @field_validator("domain_id")
+    @classmethod
+    def domain_is_canonical(cls, value: str | None) -> str | None:
+        if value is not None and value not in CANONICAL_DOMAIN_IDS:
+            raise ValueError("domínio de calendário desconhecido")
+        return value
+
+    @field_validator("classified_at", "last_success_at", "last_attempt_at")
+    @classmethod
+    def timestamps_are_aware(cls, value: datetime | None) -> datetime | None:
+        return _require_aware(value)
+
+    @model_validator(mode="after")
+    def classification_is_complete(self) -> CalendarSyncCheckpoint:
+        if (self.domain_id is None) != (self.classified_at is None):
+            raise ValueError("classificação do calendário incompleta")
+        if self.sync_status != "error" and self.error_code is not None:
+            raise ValueError("estado sem erro não pode conter código de erro")
         return self
 
 

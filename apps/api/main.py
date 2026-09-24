@@ -9,6 +9,8 @@ from fastapi.responses import JSONResponse
 
 from pydantic import ValidationError
 
+from calendar_sim_api import router as calendar_sim_router
+from calendar_simulator import CalendarProvider, CalendarSyncService
 from contract import (
     CaptureOut,
     DomainOut,
@@ -93,6 +95,8 @@ def create_app(config: LocalServerConfig, *, database_path: str | Path | None = 
     """
     validate_local_server_config(config)
     store = SQLiteMemoryStore(database_path)
+    calendar_provider = CalendarProvider()
+    calendar_sync_service = CalendarSyncService(store, calendar_provider)
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
@@ -106,6 +110,7 @@ def create_app(config: LocalServerConfig, *, database_path: str | Path | None = 
         title="JARVIS API — Gate 1 mock",
         description=(
             "Endpoints mock com dados DEMO fictícios. Nenhuma integração real. "
+            "O Calendar do Gate 2.0-D é inteiramente simulado. "
             "domain_id é classificação de memória, não autorização de acesso. "
             "Rotas /real exigem sessão local e concessão."
         ),
@@ -113,6 +118,8 @@ def create_app(config: LocalServerConfig, *, database_path: str | Path | None = 
         lifespan=lifespan,
     )
     app.state.memory_store = store
+    app.state.calendar_sim_provider = calendar_provider
+    app.state.calendar_sync_service = calendar_sync_service
     app.add_middleware(
         CORSMiddleware,
         allow_origins=sorted(ALLOWED_ORIGINS),
@@ -122,6 +129,7 @@ def create_app(config: LocalServerConfig, *, database_path: str | Path | None = 
     )
     app.include_router(demo_router)
     app.include_router(real_router)
+    app.include_router(calendar_sim_router)
 
     @app.middleware("http")
     async def local_transport_boundary(request: Request, call_next):

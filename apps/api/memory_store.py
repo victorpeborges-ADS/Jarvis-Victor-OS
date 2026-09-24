@@ -18,7 +18,10 @@ from typing import Iterator, Sequence
 from pydantic import BaseModel, ValidationError
 
 from domain_registry import CANONICAL_CONNECTORS, CANONICAL_DOMAIN_IDS, CANONICAL_RESOURCES
-from memory_models import AuditRecord, EntityRecord, EventRecord, ReadScope, RelationRecord, SourceRecord, StrictRecord
+from memory_models import (
+    AuditRecord, CalendarSyncCheckpoint, EntityRecord, EventRecord, ReadScope,
+    RelationRecord, SourceRecord, StrictRecord,
+)
 
 logger = logging.getLogger(__name__)
 API_ROOT = Path(__file__).resolve().parent
@@ -164,6 +167,10 @@ class DatabaseCorruptError(MemoryStoreError):
 
 class EventIdentityConflict(ValueError):
     """An internal event ID or source reference was reused for another event."""
+
+
+class CalendarCursorConflict(ValueError):
+    """A concurrent sync advanced the persisted cursor before this page committed."""
 
 
 class StoredEvent(StrictRecord):
@@ -480,80 +487,280 @@ class SQLiteMemoryStore:
             self._insert_audit(connection, "source_write")
         return source
 
+    def ensure_source(self, source_value: SourceRecord | dict) -> SourceRecord:
+        """Create the fixed synthetic source once, safely under concurrent syncs."""
+        source = _validated(SourceRecord, source_value)
+        scopes_json = json.dumps(list(source.scopes), ensure_ascii=False, allow_nan=False)
+        with self.transaction() as connection:
+            cursor = connection.execute(
+                "INSERT OR IGNORE INTO sources(id, provider, resource_id, account_ref, scopes_json, sync_status, dataset, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (source.id, source.provider, source.resource_id, source.account_ref, scopes_json,
+                 source.sync_status, source.dataset, source.created_at.isoformat()),
+            )
+            row = connection.execute(
+                "SELECT provider, resource_id, dataset FROM sources WHERE id=?", (source.id,)
+            ).fetchone()
+            if row is None or (row["provider"], row["resource_id"], row["dataset"]) != (
+                source.provider, source.resource_id, source.dataset
+            ):
+                raise ValueError("identidade da origem sintética diverge")
+            if cursor.rowcount:
+                self._insert_audit(connection, "source_write")
+        return source
+
+    @staticmethod
+    def _checkpoint_from_row(row: sqlite3.Row) -> CalendarSyncCheckpoint:
+        return CalendarSyncCheckpoint.model_validate(dict(row))
+
+    def ensure_calendar_checkpoint(self, source_id: str, calendar_id: str) -> CalendarSyncCheckpoint:
+        checkpoint = CalendarSyncCheckpoint(source_id=source_id, calendar_id=calendar_id)
+        with self.transaction() as connection:
+            connection.execute(
+                "INSERT OR IGNORE INTO calendar_sync_states(source_id, calendar_id, sync_status) VALUES (?, ?, 'simulated')",
+                (checkpoint.source_id, checkpoint.calendar_id),
+            )
+            row = connection.execute(
+                "SELECT source_id, calendar_id, domain_id, classified_at, sync_token, page_token, sync_status, "
+                "last_success_at, last_attempt_at, error_code FROM calendar_sync_states WHERE source_id=? AND calendar_id=?",
+                (checkpoint.source_id, checkpoint.calendar_id),
+            ).fetchone()
+            if row is None:
+                raise MemoryStoreError("estado de sincronização local indisponível")
+            return self._checkpoint_from_row(row)
+
+    def get_calendar_checkpoint(self, source_id: str, calendar_id: str) -> CalendarSyncCheckpoint | None:
+        self._require_initialized()
+        with closing(self._connect()) as connection:
+            row = connection.execute(
+                "SELECT source_id, calendar_id, domain_id, classified_at, sync_token, page_token, sync_status, "
+                "last_success_at, last_attempt_at, error_code FROM calendar_sync_states WHERE source_id=? AND calendar_id=?",
+                (source_id, calendar_id),
+            ).fetchone()
+        return self._checkpoint_from_row(row) if row is not None else None
+
+    def list_calendar_checkpoints(self, source_id: str) -> list[CalendarSyncCheckpoint]:
+        self._require_initialized()
+        with closing(self._connect()) as connection:
+            rows = connection.execute(
+                "SELECT source_id, calendar_id, domain_id, classified_at, sync_token, page_token, sync_status, "
+                "last_success_at, last_attempt_at, error_code FROM calendar_sync_states WHERE source_id=? ORDER BY calendar_id",
+                (source_id,),
+            ).fetchall()
+        return [self._checkpoint_from_row(row) for row in rows]
+
+    def classify_calendar(
+        self, source_id: str, calendar_id: str, domain_id: str, classified_at: datetime
+    ) -> CalendarSyncCheckpoint:
+        candidate = CalendarSyncCheckpoint(
+            source_id=source_id, calendar_id=calendar_id, domain_id=domain_id, classified_at=classified_at
+        )
+        with self.transaction() as connection:
+            connection.execute(
+                "INSERT OR IGNORE INTO calendar_sync_states(source_id, calendar_id, sync_status) VALUES (?, ?, 'simulated')",
+                (candidate.source_id, candidate.calendar_id),
+            )
+            row = connection.execute(
+                "SELECT domain_id, classified_at FROM calendar_sync_states WHERE source_id=? AND calendar_id=?",
+                (candidate.source_id, candidate.calendar_id),
+            ).fetchone()
+            if row is None:
+                raise MemoryStoreError("estado de sincronização local indisponível")
+            if row["domain_id"] is not None and row["domain_id"] != domain_id:
+                raise ValueError("calendário já classificado; reclassificação exige fluxo explícito")
+            if row["domain_id"] is None:
+                connection.execute(
+                    "UPDATE calendar_sync_states SET domain_id=?, classified_at=? WHERE source_id=? AND calendar_id=?",
+                    (domain_id, classified_at.isoformat(), candidate.source_id, candidate.calendar_id),
+                )
+            result = connection.execute(
+                "SELECT source_id, calendar_id, domain_id, classified_at, sync_token, page_token, sync_status, "
+                "last_success_at, last_attempt_at, error_code FROM calendar_sync_states WHERE source_id=? AND calendar_id=?",
+                (candidate.source_id, candidate.calendar_id),
+            ).fetchone()
+        if result is None:
+            raise MemoryStoreError("estado de sincronização local indisponível")
+        return self._checkpoint_from_row(result)
+
     def save_event(self, event_value: EventRecord | dict) -> EventRecord:
         event = _validated(EventRecord, event_value)
         if len(json.dumps(event.payload_minimized, ensure_ascii=False, allow_nan=False)) > 65536:
             raise ValueError("payload minimizado excede o limite")
-
-        provenance = event.provenance
         with self.transaction() as connection:
-            source = connection.execute(
-                "SELECT id, provider, resource_id, dataset FROM sources WHERE id=?", (provenance.source_id,)
-            ).fetchone()
-            if source is None:
-                raise ValueError("origem do evento não existe")
-            if source["dataset"] != "real" or source["provider"] not in CANONICAL_CONNECTORS:
-                raise ValueError("origem do evento não é autorizável")
-            if source["resource_id"] not in CANONICAL_RESOURCES.get(source["provider"], frozenset()):
-                raise ValueError("recurso da origem não é autorizável")
+            saved = self._save_event_in_connection(connection, event)
+            self._insert_audit(connection, "event_write")
+        return saved
 
-            duplicate = connection.execute(
+    def _save_event_in_connection(self, connection: sqlite3.Connection, event: EventRecord) -> EventRecord:
+        provenance = event.provenance
+        source = connection.execute(
+            "SELECT id, provider, resource_id, dataset FROM sources WHERE id=?", (provenance.source_id,)
+        ).fetchone()
+        if source is None:
+            raise ValueError("origem do evento não existe")
+        if source["dataset"] != "real" or source["provider"] not in CANONICAL_CONNECTORS:
+            raise ValueError("origem do evento não é autorizável")
+        if source["resource_id"] not in CANONICAL_RESOURCES.get(source["provider"], frozenset()):
+            raise ValueError("recurso da origem não é autorizável")
+
+        duplicate = connection.execute(
+            "SELECT e.id, e.dataset, e.source_id, p.source_id AS provenance_source_id, "
+            "p.external_ref, s.provider, s.resource_id, s.dataset AS source_dataset "
+            "FROM events e LEFT JOIN event_provenance p ON p.event_id=e.id "
+            "LEFT JOIN sources s ON s.id=e.source_id WHERE e.id=?", (event.id,)
+        ).fetchone()
+        by_external_ref = None
+        if provenance.external_ref is not None:
+            by_external_ref = connection.execute(
                 "SELECT e.id, e.dataset, e.source_id, p.source_id AS provenance_source_id, "
                 "p.external_ref, s.provider, s.resource_id, s.dataset AS source_dataset "
-                "FROM events e LEFT JOIN event_provenance p ON p.event_id=e.id "
-                "LEFT JOIN sources s ON s.id=e.source_id WHERE e.id=?", (event.id,)
+                "FROM event_provenance p JOIN events e ON e.id=p.event_id "
+                "JOIN sources s ON s.id=e.source_id WHERE p.source_id=? AND p.external_ref=?",
+                (provenance.source_id, provenance.external_ref),
             ).fetchone()
-            by_external_ref = None
-            if provenance.external_ref is not None:
-                by_external_ref = connection.execute(
-                    "SELECT e.id, e.dataset, e.source_id, p.source_id AS provenance_source_id, "
-                    "p.external_ref, s.provider, s.resource_id, s.dataset AS source_dataset "
-                    "FROM event_provenance p JOIN events e ON e.id=p.event_id "
-                    "JOIN sources s ON s.id=e.source_id WHERE p.source_id=? AND p.external_ref=?",
-                    (provenance.source_id, provenance.external_ref),
-                ).fetchone()
-            incoming_identity = (
-                event.dataset, source["id"], source["provider"], source["resource_id"],
-                provenance.external_ref,
-            )
-            if duplicate and not self._same_event_identity(duplicate, incoming_identity):
-                raise EventIdentityConflict("ID interno já pertence a outra identidade de evento")
-            if by_external_ref and not self._same_event_identity(by_external_ref, incoming_identity):
-                raise EventIdentityConflict("referência externa já pertence a outra identidade de evento")
-            if duplicate and by_external_ref and duplicate["id"] != by_external_ref["id"]:
-                raise EventIdentityConflict("ID interno e referência externa apontam para eventos distintos")
-            existing = duplicate or by_external_ref
-            event_id = existing["id"] if existing else event.id
-            values = (
-                provenance.source_id, event.event_type, event.title, event.domain_id,
-                event.sensitivity, _aware_iso(event.occurred_at),
-                json.dumps(event.payload_minimized, ensure_ascii=False, allow_nan=False, separators=(",", ":")),
-                event.dataset,
-            )
-            if existing:
-                connection.execute(
-                    "UPDATE events SET event_type=?, title=?, domain_id=?, sensitivity=?, "
-                    "occurred_at=?, payload_json=?, dataset=? WHERE id=?",
-                    (*values[1:], event_id),
-                )
-            else:
-                connection.execute(
-                    "INSERT INTO events(id, source_id, event_type, title, domain_id, sensitivity, occurred_at, payload_json, dataset, created_at) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                    (event.id, *values, event.created_at.isoformat()),
-                )
+        incoming_identity = (
+            event.dataset, source["id"], source["provider"], source["resource_id"], provenance.external_ref,
+        )
+        if duplicate and not self._same_event_identity(duplicate, incoming_identity):
+            raise EventIdentityConflict("ID interno já pertence a outra identidade de evento")
+        if by_external_ref and not self._same_event_identity(by_external_ref, incoming_identity):
+            raise EventIdentityConflict("referência externa já pertence a outra identidade de evento")
+        if duplicate and by_external_ref and duplicate["id"] != by_external_ref["id"]:
+            raise EventIdentityConflict("ID interno e referência externa apontam para eventos distintos")
+        existing = duplicate or by_external_ref
+        event_id = existing["id"] if existing else event.id
+        values = (
+            provenance.source_id, event.event_type, event.title, event.domain_id,
+            event.sensitivity, _aware_iso(event.occurred_at),
+            json.dumps(event.payload_minimized, ensure_ascii=False, allow_nan=False, separators=(",", ":")),
+            event.dataset, _aware_iso(event.cancelled_at),
+        )
+        if existing:
             connection.execute(
-                "INSERT INTO event_provenance(event_id, source_id, external_ref, observed_at, last_verified_at, valid_until, "
-                "confidence, classification_method, classified_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) "
-                "ON CONFLICT(event_id) DO UPDATE SET observed_at=excluded.observed_at, "
-                "last_verified_at=excluded.last_verified_at, valid_until=excluded.valid_until, "
-                "confidence=excluded.confidence, classification_method=excluded.classification_method, classified_at=excluded.classified_at",
-                (event_id, provenance.source_id, provenance.external_ref, provenance.observed_at.isoformat(),
-                 _aware_iso(provenance.last_verified_at), _aware_iso(provenance.valid_until), provenance.confidence,
-                 provenance.classification_method, _aware_iso(provenance.classified_at)),
+                "UPDATE events SET event_type=?, title=?, domain_id=?, sensitivity=?, occurred_at=?, "
+                "payload_json=?, dataset=?, cancelled_at=? WHERE id=?",
+                (*values[1:], event_id),
             )
-            self._insert_audit(connection, "event_write")
+        else:
+            connection.execute(
+                "INSERT INTO events(id, source_id, event_type, title, domain_id, sensitivity, occurred_at, payload_json, dataset, created_at, cancelled_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (event.id, *values[:8], event.created_at.isoformat(), values[8]),
+            )
+        connection.execute(
+            "INSERT INTO event_provenance(event_id, source_id, external_ref, observed_at, last_verified_at, valid_until, "
+            "confidence, classification_method, classified_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT(event_id) DO UPDATE SET observed_at=excluded.observed_at, "
+            "last_verified_at=excluded.last_verified_at, valid_until=excluded.valid_until, "
+            "confidence=excluded.confidence, classification_method=excluded.classification_method, classified_at=excluded.classified_at",
+            (event_id, provenance.source_id, provenance.external_ref, provenance.observed_at.isoformat(),
+             _aware_iso(provenance.last_verified_at), _aware_iso(provenance.valid_until), provenance.confidence,
+             provenance.classification_method, _aware_iso(provenance.classified_at)),
+        )
         return event.model_copy(update={"id": event_id})
+
+    def apply_calendar_page(
+        self,
+        *,
+        source_id: str,
+        calendar_id: str,
+        domain_id: str,
+        expected_sync_token: str | None,
+        expected_page_token: str | None,
+        next_sync_token: str | None,
+        next_page_token: str | None,
+        events: Sequence[EventRecord],
+        cancelled_external_refs: Sequence[str],
+        attempted_at: datetime,
+        completed_at: datetime | None,
+    ) -> int:
+        """Atomically commit one page, cancellations, provenance and its cursor."""
+        if completed_at is not None and (next_page_token is not None or next_sync_token is None):
+            raise ValueError("página final precisa concluir com cursor de sincronização")
+        if completed_at is None and (next_page_token is None or next_sync_token is not None):
+            raise ValueError("página intermediária precisa de cursor de página")
+        validated_events = [_validated(EventRecord, item) for item in events]
+        for event in validated_events:
+            if event.domain_id != domain_id or event.provenance.source_id != source_id:
+                raise ValueError("evento não corresponde à classificação do calendário")
+            if not (event.provenance.external_ref or "").startswith(f"{calendar_id}:"):
+                raise ValueError("referência externa não corresponde ao calendário")
+            if len(json.dumps(event.payload_minimized, ensure_ascii=False, allow_nan=False)) > 65536:
+                raise ValueError("payload minimizado excede o limite")
+        if any(not ref.startswith(f"{calendar_id}:") for ref in cancelled_external_refs):
+            raise ValueError("cancelamento não corresponde ao calendário")
+
+        with self.transaction() as connection:
+            row = connection.execute(
+                "SELECT domain_id, sync_token, page_token FROM calendar_sync_states WHERE source_id=? AND calendar_id=?",
+                (source_id, calendar_id),
+            ).fetchone()
+            if row is None or row["domain_id"] != domain_id:
+                raise ValueError("calendário não está classificado para este domínio")
+            if row["sync_token"] != expected_sync_token or row["page_token"] != expected_page_token:
+                raise CalendarCursorConflict("cursor avançado por outra sincronização")
+
+            for event in validated_events:
+                self._save_event_in_connection(connection, event)
+            cancelled_count = 0
+            if cancelled_external_refs:
+                for external_ref in set(cancelled_external_refs):
+                    cursor = connection.execute(
+                        "UPDATE events SET cancelled_at=? WHERE id IN ("
+                        "SELECT e.id FROM events e JOIN event_provenance p ON p.event_id=e.id "
+                        "WHERE e.source_id=? AND e.dataset='real' AND p.source_id=? AND p.external_ref=?"
+                        ") AND cancelled_at IS NULL",
+                        (attempted_at.isoformat(), source_id, source_id, external_ref),
+                    )
+                    cancelled_count += max(0, cursor.rowcount)
+
+            stored_sync_token = next_sync_token if completed_at is not None else expected_sync_token
+            stored_page_token = None if completed_at is not None else next_page_token
+            connection.execute(
+                "UPDATE calendar_sync_states SET sync_token=?, page_token=?, sync_status='simulated', "
+                "last_attempt_at=?, last_success_at=COALESCE(?, last_success_at), error_code=NULL "
+                "WHERE source_id=? AND calendar_id=?",
+                (stored_sync_token, stored_page_token, attempted_at.isoformat(),
+                 completed_at.isoformat() if completed_at else None, source_id, calendar_id),
+            )
+            change_count = len(validated_events) + cancelled_count
+            if change_count:
+                self._insert_audit(connection, "event_write", change_count)
+        return len(validated_events) + cancelled_count
+
+    def record_calendar_error(
+        self, source_id: str, calendar_id: str, expected_sync_token: str | None,
+        expected_page_token: str | None, error_code: str, attempted_at: datetime,
+    ) -> None:
+        with self.transaction() as connection:
+            row = connection.execute(
+                "SELECT sync_token, page_token FROM calendar_sync_states WHERE source_id=? AND calendar_id=?",
+                (source_id, calendar_id),
+            ).fetchone()
+            if row is None or (row["sync_token"], row["page_token"]) != (expected_sync_token, expected_page_token):
+                raise CalendarCursorConflict("cursor avançado por outra sincronização")
+            connection.execute(
+                "UPDATE calendar_sync_states SET sync_status='error', error_code=?, last_attempt_at=? "
+                "WHERE source_id=? AND calendar_id=?",
+                (error_code, attempted_at.isoformat(), source_id, calendar_id),
+            )
+
+    def reset_calendar_cursor(
+        self, source_id: str, calendar_id: str, expected_sync_token: str | None,
+        expected_page_token: str | None, attempted_at: datetime,
+    ) -> None:
+        with self.transaction() as connection:
+            row = connection.execute(
+                "SELECT sync_token, page_token FROM calendar_sync_states WHERE source_id=? AND calendar_id=?",
+                (source_id, calendar_id),
+            ).fetchone()
+            if row is None or (row["sync_token"], row["page_token"]) != (expected_sync_token, expected_page_token):
+                raise CalendarCursorConflict("cursor avançado por outra sincronização")
+            connection.execute(
+                "UPDATE calendar_sync_states SET sync_token=NULL, page_token=NULL, sync_status='simulated', "
+                "error_code=NULL, last_attempt_at=? WHERE source_id=? AND calendar_id=?",
+                (attempted_at.isoformat(), source_id, calendar_id),
+            )
 
     @staticmethod
     def _same_event_identity(row: sqlite3.Row, incoming: tuple[str, str, str, str, str | None]) -> bool:
@@ -655,14 +862,14 @@ class SQLiteMemoryStore:
             parameters.extend([scope.connector, scope.resource_id, *domains])
         query = (
             "SELECT e.id AS event_id, e.event_type, e.title, e.domain_id, e.sensitivity, e.occurred_at, "
-            "e.payload_json, e.dataset AS event_dataset, e.created_at AS event_created_at, "
+            "e.payload_json, e.dataset AS event_dataset, e.created_at AS event_created_at, e.cancelled_at AS event_cancelled_at, "
             "p.source_id AS provenance_source_id, p.external_ref, p.observed_at, p.last_verified_at, "
             "p.valid_until, p.confidence, p.classification_method, p.classified_at, "
             "s.id AS source_id, s.provider, s.resource_id, s.account_ref, s.scopes_json, "
             "s.sync_status, s.dataset AS source_dataset, s.created_at AS source_created_at "
             "FROM events e JOIN event_provenance p ON p.event_id=e.id "
             "JOIN sources s ON s.id=e.source_id "
-            "WHERE e.dataset='real' AND s.dataset='real' AND e.domain_id IS NOT NULL AND ("
+            "WHERE e.dataset='real' AND s.dataset='real' AND e.domain_id IS NOT NULL AND e.cancelled_at IS NULL AND ("
             + " OR ".join(predicates)
             + ")"
         )
@@ -692,7 +899,8 @@ class SQLiteMemoryStore:
                 {
                     "id": row["event_id"], "event_type": row["event_type"], "title": row["title"],
                     "domain_id": row["domain_id"], "sensitivity": row["sensitivity"],
-                    "occurred_at": row["occurred_at"], "payload_minimized": json.loads(row["payload_json"]),
+                    "occurred_at": row["occurred_at"], "cancelled_at": row["event_cancelled_at"],
+                    "payload_minimized": json.loads(row["payload_json"]),
                     "provenance": provenance, "dataset": row["event_dataset"],
                     "created_at": row["event_created_at"],
                 }

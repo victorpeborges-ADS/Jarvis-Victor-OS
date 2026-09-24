@@ -105,8 +105,9 @@ def test_empty_database_migrates_once_uses_wal_and_private_permissions(tmp_path)
         assert connection.execute("SELECT version FROM schema_migrations ORDER BY version").fetchall() == [
             ("0001_initial",), ("0002_audit_and_relation_domain",),
             ("0003_event_identity_and_provenance",),
+            ("0004_calendar_sync_state",),
         ]
-        for table in ("sources", "events", "event_provenance", "entities", "relations", "relation_evidence", "audit_entries"):
+        for table in ("sources", "events", "event_provenance", "entities", "relations", "relation_evidence", "audit_entries", "calendar_sync_states"):
             assert connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] == 0
 
 
@@ -138,6 +139,7 @@ def test_database_from_previous_migration_version_upgrades_without_replaying_ddl
     assert versions == [
         ("0001_initial",), ("0002_audit_and_relation_domain",),
         ("0003_event_identity_and_provenance",),
+        ("0004_calendar_sync_state",),
     ]
     assert "domain_id" in columns
     assert "audit_entries" in tables

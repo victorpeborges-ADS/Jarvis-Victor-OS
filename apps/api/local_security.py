@@ -114,6 +114,7 @@ class GrantIn(BaseModel):
 
 class RealEventOut(BaseModel):
     id: str
+    source_id: str
     connector: str
     resource_id: str
     domain_id: str
@@ -121,6 +122,12 @@ class RealEventOut(BaseModel):
     event_type: str
     sensitivity: str
     occurred_at: datetime | None
+    end_at: datetime | None = None
+    calendar_id: str | None = None
+    calendar_name: str | None = None
+    calendar_time_zone: str | None = None
+    event_time_zone: str | None = None
+    provider_updated_at: datetime | None = None
     provenance: ProvenanceRecord
     dataset: str = "real"
 
@@ -134,8 +141,21 @@ def _event_response(record: StoredEvent) -> RealEventOut:
     event = record.event
     if event.domain_id is None:
         raise HTTPException(status_code=404, detail="registro ausente")
+    payload = event.payload_minimized
+
+    def payload_datetime(key: str) -> datetime | None:
+        value = payload.get(key)
+        if not isinstance(value, str):
+            return None
+        try:
+            parsed = datetime.fromisoformat(value)
+        except ValueError:
+            return None
+        return parsed if parsed.tzinfo is not None and parsed.utcoffset() is not None else None
+
     return RealEventOut(
         id=event.id,
+        source_id=record.source.id,
         connector=record.source.provider,
         resource_id=record.source.resource_id,
         domain_id=event.domain_id,
@@ -143,6 +163,12 @@ def _event_response(record: StoredEvent) -> RealEventOut:
         event_type=event.event_type,
         sensitivity=event.sensitivity,
         occurred_at=event.occurred_at,
+        end_at=payload_datetime("end_at"),
+        calendar_id=payload.get("calendar_id") if isinstance(payload.get("calendar_id"), str) else None,
+        calendar_name=payload.get("calendar_name") if isinstance(payload.get("calendar_name"), str) else None,
+        calendar_time_zone=payload.get("calendar_time_zone") if isinstance(payload.get("calendar_time_zone"), str) else None,
+        event_time_zone=payload.get("event_time_zone") if isinstance(payload.get("event_time_zone"), str) else None,
+        provider_updated_at=payload_datetime("provider_updated_at"),
         provenance=event.provenance,
     )
 
@@ -178,6 +204,19 @@ def _session_from(request: Request, *, mutation: bool = False) -> Session:
 def _active_grants(principal: str, at: datetime | None = None) -> list[Grant]:
     instant = at or _now()
     return [grant for grant in _grants.values() if grant.principal == principal and not grant.revoked and grant.expires_at > instant]
+
+
+def authorized_calendar_domains(principal: str) -> frozenset[str]:
+    """Return only domains covered by an active calendar_sim read grant."""
+    allowed: set[str] = set()
+    for grant in _active_grants(principal):
+        if grant.connector != "calendar_sim":
+            continue
+        valid_resources = grant.resource_ids & CANONICAL_RESOURCES["calendar_sim"]
+        if not valid_resources or valid_resources != grant.resource_ids:
+            continue
+        allowed.update(grant.domain_ids & CANONICAL_DOMAIN_IDS)
+    return frozenset(allowed)
 
 
 def _authorized_records(
