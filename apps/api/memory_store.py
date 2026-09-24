@@ -25,6 +25,130 @@ API_ROOT = Path(__file__).resolve().parent
 REPOSITORY_ROOT = API_ROOT.parents[1]
 MIGRATIONS_DIR = API_ROOT / "migrations"
 
+_SCHEMA_SQL_KEYWORDS = frozenset({
+    "ABORT", "ADD", "ALTER", "AND", "BEFORE", "BEGIN", "BETWEEN", "CASCADE", "CHECK",
+    "COLUMN", "CREATE", "DEFAULT", "DELETE", "END", "GLOB", "IN", "INDEX", "INSERT",
+    "INTEGER", "INTO", "IS", "KEY", "NOT", "NULL", "OF", "ON", "OR", "PRIMARY",
+    "RAISE", "REAL", "REFERENCES", "SELECT", "TABLE", "TEXT", "THEN", "TRIGGER", "UNIQUE",
+    "UPDATE", "WHEN",
+})
+_SCHEMA_SQL_OPERATORS = ("->>", "->", "||", "<<", ">>", "<=", ">=", "==", "!=", "<>")
+
+
+def _normalize_schema_sql(sql: str) -> tuple[tuple[str, str], ...] | None:
+    """Tokenize migration DDL while preserving literals and quoted identifiers.
+
+    Only SQL keyword casing, comments, and whitespace between tokens are
+    normalized. Unknown or malformed quoting returns None so callers compare
+    the original SQL byte-for-byte instead of guessing at its meaning.
+    """
+    tokens: list[tuple[str, str]] = []
+    index = 0
+    length = len(sql)
+    while index < length:
+        char = sql[index]
+        if char in " \t\r\n\f\v":
+            index += 1
+            continue
+        if char == "-" and sql[index:index + 2] == "--":
+            newline = sql.find("\n", index + 2)
+            index = length if newline < 0 else newline + 1
+            continue
+        if char == "/" and sql[index:index + 2] == "/*":
+            end = sql.find("*/", index + 2)
+            if end < 0:
+                return None
+            index = end + 2
+            continue
+        if char == "\x00":
+            return None
+
+        if char in "'\"`[":
+            closing = "]" if char == "[" else char
+            cursor = index + 1
+            closed = False
+            while cursor < length:
+                if sql[cursor] == closing:
+                    if char != "[" and cursor + 1 < length and sql[cursor + 1] == closing:
+                        cursor += 2
+                        continue
+                    cursor += 1
+                    closed = True
+                    break
+                cursor += 1
+            if not closed:
+                return None
+            kind = "string-literal" if char == "'" else "quoted-identifier"
+            tokens.append((kind, sql[index:cursor]))
+            index = cursor
+            continue
+
+        if (
+            char == "_" or char == "$" or (char.isascii() and char.isalpha()) or ord(char) >= 0x80
+        ):
+            cursor = index + 1
+            while cursor < length:
+                candidate = sql[cursor]
+                if (
+                    candidate == "_" or candidate == "$"
+                    or (candidate.isascii() and candidate.isalnum()) or ord(candidate) >= 0x80
+                ):
+                    cursor += 1
+                else:
+                    break
+            word = sql[index:cursor]
+            if word.isascii() and word.upper() in _SCHEMA_SQL_KEYWORDS:
+                tokens.append(("keyword", word.upper()))
+            else:
+                tokens.append(("identifier", word))
+            index = cursor
+            continue
+
+        if (
+            (char.isascii() and char.isdigit())
+            or (char == "." and index + 1 < length and sql[index + 1].isascii() and sql[index + 1].isdigit())
+        ):
+            cursor = index
+            if sql[index:index + 2].lower() == "0x":
+                cursor += 2
+                digits_start = cursor
+                while (
+                    cursor < length and sql[cursor].isascii()
+                    and sql[cursor].lower() in "0123456789abcdef"
+                ):
+                    cursor += 1
+                if cursor == digits_start:
+                    return None
+            else:
+                while cursor < length and sql[cursor].isascii() and sql[cursor].isdigit():
+                    cursor += 1
+                if cursor < length and sql[cursor] == ".":
+                    cursor += 1
+                    while cursor < length and sql[cursor].isascii() and sql[cursor].isdigit():
+                        cursor += 1
+                if cursor < length and sql[cursor] in "eE":
+                    exponent = cursor + 1
+                    if exponent < length and sql[exponent] in "+-":
+                        exponent += 1
+                    digits_start = exponent
+                    while exponent < length and sql[exponent].isascii() and sql[exponent].isdigit():
+                        exponent += 1
+                    if exponent == digits_start:
+                        return None
+                    cursor = exponent
+            tokens.append(("number-literal", sql[index:cursor]))
+            index = cursor
+            continue
+
+        operator = next((candidate for candidate in _SCHEMA_SQL_OPERATORS if sql.startswith(candidate, index)), None)
+        if operator is not None:
+            tokens.append(("operator", operator))
+            index += len(operator)
+            continue
+        tokens.append(("symbol", char))
+        index += 1
+    return tuple(tokens)
+
 
 class MemoryStoreError(RuntimeError):
     """A storage error safe to report without including record contents."""
@@ -228,15 +352,19 @@ class SQLiteMemoryStore:
     def _schema_differences(actual: sqlite3.Connection, expected: sqlite3.Connection) -> list[str]:
         differences: list[str] = []
 
-        def objects(connection: sqlite3.Connection) -> dict[tuple[str, str], tuple[str, str]]:
+        def objects(connection: sqlite3.Connection) -> dict[tuple[str, str], tuple[str, object]]:
             rows = connection.execute(
                 "SELECT type, name, tbl_name, sql FROM sqlite_master "
                 "WHERE name NOT LIKE 'sqlite_%' ORDER BY type, name"
             )
-            return {
-                (row[0], row[1]): (row[2], " ".join((row[3] or "").split()).casefold())
-                for row in rows
-            }
+            result: dict[tuple[str, str], tuple[str, object]] = {}
+            for row in rows:
+                sql = row[3]
+                normalized = _normalize_schema_sql(sql) if sql is not None else None
+                # If tokenization is uncertain, exact SQL is the only safe comparison.
+                signature: object = ("tokens", normalized) if normalized is not None else ("raw", sql)
+                result[(row[0], row[1])] = (row[2], signature)
+            return result
 
         actual_objects = objects(actual)
         expected_objects = objects(expected)

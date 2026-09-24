@@ -28,6 +28,7 @@ from memory_store import (
     MIGRATIONS_DIR,
     SQLiteMemoryStore,
     REPOSITORY_ROOT,
+    _normalize_schema_sql,
     default_database_path,
 )
 from server_config import LocalServerConfig
@@ -404,6 +405,123 @@ def test_initialize_rejects_incompatible_column_type(tmp_path):
         connection.commit()
     with pytest.raises(DatabaseCorruptError, match="diverge"):
         SQLiteMemoryStore(store.path).initialize()
+
+
+def test_schema_ddl_tokenizer_normalizes_only_safe_cosmetic_changes():
+    canonical = "CREATE TABLE t (id TEXT CHECK (id = 'it''s /* literal */ CHECK'))"
+    cosmetic = " create /* harmless */ table t ( id text check ( id = 'it''s /* literal */ CHECK' ) ) -- tail\n"
+    assert _normalize_schema_sql(canonical) == _normalize_schema_sql(cosmetic)
+    assert _normalize_schema_sql(canonical) != _normalize_schema_sql(
+        canonical.replace("it''s /* literal */ CHECK", "it''s /* literal */ check")
+    )
+    for quoted_identifier in ('"MixedName"', '"Mixed""Name"', '`Mixed``Name`', "[MixedName]"):
+        assert _normalize_schema_sql(f"CREATE TABLE {quoted_identifier} (id TEXT)") == _normalize_schema_sql(
+            f"create /* cosmetic */ table {quoted_identifier} ( id text )"
+        )
+        altered_identifier = quoted_identifier.replace("Mixed", "mixed", 1)
+        assert _normalize_schema_sql(f"CREATE TABLE {quoted_identifier} (id TEXT)") != _normalize_schema_sql(
+            f"CREATE TABLE {altered_identifier} (id TEXT)"
+        )
+    assert _normalize_schema_sql("CREATE TABLE t (id TEXT DEFAULT 'unterminated)") is None
+    assert _normalize_schema_sql("CREATE TABLE t (id TEXT) /* unterminated") is None
+
+
+def test_initialize_rejects_case_changed_check_literals_and_does_not_repair(tmp_path):
+    store = initialized_store(tmp_path)
+    with sqlite3.connect(store.path) as connection:
+        original = connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='audit_entries'"
+        ).fetchone()[0]
+        altered = original.replace("'source_write'", "'SOURCE_WRITE'").replace("'success'", "'SUCCESS'")
+        assert altered != original
+        connection.execute("PRAGMA writable_schema=ON")
+        connection.execute("UPDATE sqlite_master SET sql=? WHERE name='audit_entries'", (altered,))
+        schema_version = connection.execute("PRAGMA schema_version").fetchone()[0]
+        connection.execute(f"PRAGMA schema_version={schema_version + 1}")
+
+    with pytest.raises(DatabaseCorruptError) as exc_info:
+        SQLiteMemoryStore(store.path).initialize()
+    assert str(exc_info.value) == "estrutura do banco local diverge das migrações aplicadas"
+    assert str(store.path) not in str(exc_info.value)
+    with sqlite3.connect(store.path) as connection:
+        stored = connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='audit_entries'"
+        ).fetchone()[0]
+    assert stored == altered
+
+
+def test_initialize_rejects_removed_check_constraint(tmp_path):
+    store = initialized_store(tmp_path)
+    with sqlite3.connect(store.path) as connection:
+        connection.execute("DROP TABLE audit_entries")
+        connection.execute(
+            "CREATE TABLE audit_entries (id TEXT PRIMARY KEY, operation TEXT NOT NULL, "
+            "outcome TEXT NOT NULL, record_count INTEGER NOT NULL DEFAULT 0, "
+            "dataset TEXT NOT NULL DEFAULT 'real', occurred_at TEXT NOT NULL)"
+        )
+        connection.execute("CREATE INDEX idx_audit_entries_occurred_at ON audit_entries(occurred_at)")
+        connection.commit()
+    with pytest.raises(DatabaseCorruptError, match="diverge"):
+        SQLiteMemoryStore(store.path).initialize()
+
+
+def test_initialize_rejects_required_index_with_wrong_definition(tmp_path):
+    store = initialized_store(tmp_path)
+    with sqlite3.connect(store.path) as connection:
+        connection.execute("DROP INDEX idx_audit_entries_occurred_at")
+        connection.execute("CREATE INDEX idx_audit_entries_occurred_at ON audit_entries(id)")
+        connection.commit()
+    with pytest.raises(DatabaseCorruptError, match="diverge"):
+        SQLiteMemoryStore(store.path).initialize()
+
+
+def test_initialize_rejects_missing_required_column(tmp_path):
+    store = initialized_store(tmp_path)
+    with sqlite3.connect(store.path) as connection:
+        connection.execute("DROP TABLE audit_entries")
+        connection.execute(
+            "CREATE TABLE audit_entries (id TEXT PRIMARY KEY, operation TEXT NOT NULL "
+            "CHECK (operation IN ('source_write', 'event_write', 'entity_write', 'relation_write', 'memory_read')), "
+            "outcome TEXT NOT NULL CHECK (outcome = 'success'), dataset TEXT NOT NULL DEFAULT 'real' "
+            "CHECK (dataset = 'real'), occurred_at TEXT NOT NULL)"
+        )
+        connection.execute("CREATE INDEX idx_audit_entries_occurred_at ON audit_entries(occurred_at)")
+        connection.commit()
+    with pytest.raises(DatabaseCorruptError, match="diverge"):
+        SQLiteMemoryStore(store.path).initialize()
+
+
+def test_record_audit_works_after_valid_schema_initialization(tmp_path):
+    store = initialized_store(tmp_path)
+    store.record_audit("memory_read", 0)
+    with sqlite3.connect(store.path) as connection:
+        assert connection.execute(
+            "SELECT operation, outcome, record_count FROM audit_entries"
+        ).fetchall() == [("memory_read", "success", 0)]
+
+
+def test_initialize_accepts_safe_cosmetic_ddl_and_record_audit_still_works(tmp_path):
+    store = initialized_store(tmp_path)
+    with sqlite3.connect(store.path) as connection:
+        original = connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='audit_entries'"
+        ).fetchone()[0]
+        cosmetic = original.replace(
+            "CREATE TABLE audit_entries", "create  table /* cosmetic */ audit_entries", 1
+        ).replace("record_count INTEGER", "record_count    integer", 1)
+        assert cosmetic != original
+        connection.execute("PRAGMA writable_schema=ON")
+        connection.execute("UPDATE sqlite_master SET sql=? WHERE name='audit_entries'", (cosmetic,))
+        schema_version = connection.execute("PRAGMA schema_version").fetchone()[0]
+        connection.execute(f"PRAGMA schema_version={schema_version + 1}")
+
+    reopened = SQLiteMemoryStore(store.path)
+    reopened.initialize()
+    reopened.record_audit("memory_read", 0)
+    with sqlite3.connect(store.path) as connection:
+        assert connection.execute("SELECT operation, outcome FROM audit_entries").fetchall() == [
+            ("memory_read", "success")
+        ]
 
 
 def test_internal_id_collision_from_another_source_is_rejected_without_mutation(tmp_path):
