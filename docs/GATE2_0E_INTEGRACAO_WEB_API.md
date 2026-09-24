@@ -80,7 +80,7 @@ O PUT cross-origin com `Content-Type` e `X-CSRF-Token` só chega à rota se o na
 
 ## Capturas
 
-As capturas são screenshots sintéticas criadas pelos testes nos projetos Playwright de 1280×800 e 390×844 (mobile usa escala física do dispositivo):
+As capturas são sintéticas. DEMO contém a viewport dos projetos Playwright (1280×800 e 390×844 CSS pixels; mobile usa escala física do dispositivo). As capturas da integração mostram o cartão de evento autorizado com a proveniência aberta, obtido no browser desktop/mobile:
 
 - [Integração com API — desktop](screenshots/gate2-e-integrado-desktop.png)
 - [Integração com API — mobile](screenshots/gate2-e-integrado-mobile.png)
