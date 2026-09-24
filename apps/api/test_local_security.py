@@ -353,8 +353,13 @@ def test_supported_server_entrypoint_disables_proxy_headers(monkeypatch):
 
     captured = {}
     monkeypatch.delenv("JARVIS_BIND_HOST", raising=False)
-    monkeypatch.setattr(serve.uvicorn, "run", lambda *args, **kwargs: captured.update(kwargs))
+    monkeypatch.setattr(
+        serve.uvicorn,
+        "run",
+        lambda *args, **kwargs: (captured.update(kwargs), captured.update(app=args[0])),
+    )
     serve.main()
+    assert captured["app"].title == "JARVIS API — Gate 1 mock"
     assert captured["host"] == "127.0.0.1"
     assert captured["proxy_headers"] is False
     assert captured["forwarded_allow_ips"] == ""
@@ -367,6 +372,8 @@ def test_supported_entrypoint_rejects_public_bind_before_uvicorn(monkeypatch):
     monkeypatch.setattr(serve.uvicorn, "run", lambda *args, **kwargs: pytest.fail("uvicorn não deveria iniciar"))
     with pytest.raises(RuntimeError):
         serve.main()
+    with pytest.raises(RuntimeError):
+        LocalServerConfig(host="0.0.0.0")
 
 
 def test_direct_uvicorn_cli_refuses_to_start_without_guarded_runner():
