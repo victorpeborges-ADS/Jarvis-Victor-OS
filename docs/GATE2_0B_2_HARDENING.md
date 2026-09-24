@@ -79,6 +79,14 @@ O pytest informa avisos de depreciação em Starlette/httpx TestClient; não hou
 2. Um programa customizado pode construir a app com configuração loopback e depois vincular o Uvicorn a uma interface pública. Os probes confirmam que o middleware bloqueia os requests LAN testados, mas o listener existe. Evitar executar código customizado e usar as proteções de firewall descritas acima.
 3. `serve.py` é o único caminho operacional aprovado. Não usar proxy reverso, túnel ou port forwarding.
 4. A passphrase continua em variável de ambiente, sessões/grants/rate limit seguem voláteis e o modo local ainda usa HTTP. Esses itens impedem conexão com contas reais e não foram ampliados nesta etapa.
-5. SQLite, OAuth, integrações externas, dados reais e Gate 2.0-C continuam fora do escopo e dependem de auditoria e aprovação posteriores.
+5. Este incremento não implementa SQLite, OAuth, integrações externas ou dados reais. A liberação do C.1, registrada abaixo, limita-se à memória SQLite vazia e a dados sintéticos; os itens restantes seguem fora do escopo e dependem de autorização própria.
 
-**Próximo passo:** auditoria independente da branch B.2. Esta entrega não autoriza SQLite ou OAuth.
+O aceite independente e seus limites estão registrados na seção seguinte.
+
+## Aceite técnico consolidado do Gate 2.0-B
+
+Em 2026-09-24, a auditoria independente aceitou tecnicamente a fundação local e recomendou liberar o início do SQLite exclusivamente sintético.
+
+- **Suíte versionada:** os 47 testes da API, incluindo os regressivos de configuração e sockets, estão na suíte do repositório (`apps/api/test_local_security.py`, `test_main.py` e `test_contract.py`). O recorte de 14 testes direcionados relatado pela auditoria é uma seleção dessa suíte, não um conjunto adicional de testes.
+- **Evidência externa relatada:** a auditoria informou instalação isolada por `uv sync --locked` com Python 3.12.14, 47/47 testes da API e 14/14 testes direcionados. Também executou probes manuais de socket cobrindo 19 combinações de rota/método via LAN, todas com resposta 403 no servidor customizado. Esses probes manuais são evidência do relatório de auditoria e não foram incorporados como 19 novos testes versionados.
+- **Fronteira do aceite:** autoriza somente o próximo incremento de banco SQLite vazio, com dados sintéticos em bancos temporários de teste. Não autoriza dados pessoais ou institucionais, OAuth, conectores reais, backup cifrado, deploy ou acesso remoto.
