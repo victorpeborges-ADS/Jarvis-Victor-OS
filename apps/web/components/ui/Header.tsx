@@ -8,7 +8,7 @@ export function Header() {
     <header className="sticky top-0 z-40 border-b border-paper-border bg-paper-elevated/80 backdrop-blur">
       <div className="mx-auto flex h-[64px] max-w-[1280px] items-center justify-between gap-4 px-4 md:px-6">
         <div className="flex items-center gap-3">
-          <Link href="/" className="flex items-center gap-3 rounded-lg focus-visible:outline-none">
+          <Link href="/" className="flex items-center gap-3 rounded-lg ">
             <div className="flex h-8 w-8 items-center justify-center rounded-lg bg-ink text-[11px] font-semibold tracking-widest text-white">
               JVS
             </div>
@@ -27,7 +27,7 @@ export function Header() {
         <div className="flex flex-1 justify-center px-2 md:px-8">
           <button
             onClick={() => setOpen((v) => !v)}
-            className="flex w-full max-w-[560px] items-center gap-3 rounded-full border border-paper-border bg-paper-muted px-4 py-2.5 text-left text-sm text-ink-subtle shadow-sm transition hover:border-ink-faint hover:bg-white focus-visible:outline-none"
+            className="flex w-full max-w-[560px] items-center gap-3 rounded-full border border-paper-border bg-paper-muted px-4 py-2.5 text-left text-sm text-ink-subtle shadow-sm transition hover:border-ink-faint hover:bg-white "
             aria-label="Perguntar ao JARVIS — comando universal"
           >
             <svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden>
@@ -45,7 +45,7 @@ export function Header() {
         <div className="flex items-center gap-2">
           <Link
             href="/inbox"
-            className="inline-flex items-center gap-2 rounded-full bg-ink px-4 py-2 text-sm font-medium text-white transition hover:bg-action-hover focus-visible:outline-none"
+            className="inline-flex items-center gap-2 rounded-full bg-ink px-4 py-2 text-sm font-medium text-white transition hover:bg-action-hover "
           >
             <span aria-hidden>+</span> Captura rápida
           </Link>

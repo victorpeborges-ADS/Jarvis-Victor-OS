@@ -30,7 +30,7 @@ export function BottomNav() {
               href={it.href}
               aria-current={active ? "page" : undefined}
               className={[
-                "flex flex-col items-center justify-center rounded-xl px-2 py-1.5 text-xs transition focus-visible:outline-none",
+                "flex flex-col items-center justify-center rounded-xl px-2 py-1.5 text-xs transition ",
                 active ? "bg-ink text-white" : "text-ink-subtle hover:bg-paper-muted"
               ].join(" ")}
             >

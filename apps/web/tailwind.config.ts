@@ -13,7 +13,7 @@ const config: Config = {
           DEFAULT: "#0f172a",
           muted: "#475569",
           subtle: "#64748b",
-          faint: "#94a3b8"
+          faint: "#6a7380"
         },
         paper: {
           DEFAULT: "#fdfcfb",

@@ -108,7 +108,7 @@ export default function InboxPage() {
             onChange={(e) => setText(e.target.value.slice(0, 280))}
             placeholder="Ex: Ideia CRIVO — triagem por similaridade semântica com embeddings locais..."
             rows={3}
-            className="mt-1 w-full rounded-2xl border border-paper-border bg-paper-muted px-4 py-3 text-sm leading-relaxed text-ink placeholder:text-ink-faint focus:border-ink focus:bg-white focus:outline-none"
+            className="mt-1 w-full rounded-2xl border border-paper-border bg-paper-muted px-4 py-3 text-sm leading-relaxed text-ink placeholder:text-ink-faint focus:border-ink focus:bg-white "
           />
           <div className="mt-2 text-xs text-ink-faint">{text.length}/280 · revisado por humano antes de virar ação externa</div>
         </div>
@@ -122,7 +122,7 @@ export default function InboxPage() {
               id="inbox-type"
               value={type}
               onChange={(e) => setType(e.target.value as InboxType)}
-              className="mt-1 w-full rounded-full border border-paper-border bg-white px-3 py-2 text-sm text-ink focus:border-ink focus:outline-none"
+              className="mt-1 w-full rounded-full border border-paper-border bg-white px-3 py-2 text-sm text-ink focus:border-ink "
             >
               <option value="tarefa">tarefa</option>
               <option value="evento">evento</option>
@@ -141,7 +141,7 @@ export default function InboxPage() {
               data-testid="domain-select"
               value={domainId}
               onChange={(e) => setDomainId(e.target.value)}
-              className="mt-1 w-full rounded-full border border-paper-border bg-white px-3 py-2 text-sm text-ink focus:border-ink focus:outline-none"
+              className="mt-1 w-full rounded-full border border-paper-border bg-white px-3 py-2 text-sm text-ink focus:border-ink "
             >
               {fixtures.domains.map((d) => (
                 <option key={d.id} value={d.id}>

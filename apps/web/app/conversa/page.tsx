@@ -167,7 +167,7 @@ export default function ConversaPage() {
               }}
               rows={composerExpanded || input.length > 60 ? 3 : 1}
               placeholder='Ex.: "O que mudou hoje?"'
-              className="w-full resize-none rounded-2xl border border-paper-border bg-paper-muted px-4 py-2.5 text-sm text-ink placeholder:text-ink-faint focus:border-ink focus:bg-white focus:outline-none"
+              className="w-full resize-none rounded-2xl border border-paper-border bg-paper-muted px-4 py-2.5 text-sm text-ink placeholder:text-ink-faint focus:border-ink focus:bg-white "
               aria-label="Mensagem para o JARVIS"
             />
             <div className="flex flex-wrap items-center gap-2">
