@@ -1,5 +1,7 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 
 from pydantic import ValidationError
 
@@ -14,7 +16,9 @@ from contract import (
     read_raw_fixture,
 )
 from local_security import router as real_router
-from loopback import ALLOWED_ORIGINS
+from loopback import ALLOWED_ORIGINS, is_allowed_host_header, is_loopback_address, reject_direct_uvicorn_cli
+
+reject_direct_uvicorn_cli()
 
 app = FastAPI(
     title="JARVIS API — Gate 1 mock",
@@ -38,11 +42,32 @@ app.include_router(real_router)
 
 
 @app.middleware("http")
-async def mark_dataset(request, call_next):
-    response = await call_next(request)
+async def local_transport_boundary(request: Request, call_next):
+    # ASGI middleware cannot close a socket that a caller bound publicly, but it
+    # rejects every HTTP request whose Host, peer or accepted local address is
+    # not loopback. serve.py additionally refuses a non-loopback bind.
+    server = request.scope.get("server")
+    server_host = server[0] if server else None
+    client_host = request.client.host if request.client else None
+    if not is_allowed_host_header(request.headers.get("host")):
+        response = JSONResponse({"detail": "host recusado"}, status_code=400)
+    elif not is_loopback_address(server_host) or not is_loopback_address(client_host):
+        response = JSONResponse({"detail": "acesso somente local"}, status_code=403)
+    else:
+        response = await call_next(request)
     dataset = "real" if request.url.path.startswith("/real") else "demo"
     response.headers["X-JARVIS-Dataset"] = dataset
+    if request.url.path.startswith("/real"):
+        response.headers["Cache-Control"] = "no-store"
+        response.headers["Pragma"] = "no-cache"
     return response
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_error_without_input(request: Request, exc: RequestValidationError):
+    # Pydantic's default detail contains `input`; never echo a passphrase or body.
+    detail = "credencial inválida" if request.url.path == "/real/session" else "requisição inválida"
+    return JSONResponse({"detail": detail}, status_code=422)
 
 
 def fixture_or_422() -> dict:

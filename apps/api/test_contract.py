@@ -7,7 +7,7 @@ from fastapi.testclient import TestClient
 import contract
 from main import app
 
-client = TestClient(app)
+client = TestClient(app, base_url="http://127.0.0.1", client=("127.0.0.1", 51000))
 
 
 def test_fixture_matches_canonical_schema():

@@ -1,22 +1,32 @@
-"""Sessão local e concessões. Não há banco, OAuth nem dado de fixture."""
+"""Sessão, CSRF e autorização para o catálogo exclusivamente sintético."""
 
 from __future__ import annotations
 
 import hmac
 import os
 import secrets
-from dataclasses import dataclass
+from collections import defaultdict, deque
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
+from typing import Literal
 
 from fastapi import APIRouter, HTTPException, Request, Response
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-from loopback import ALLOWED_CLIENT_HOSTS, ALLOWED_ORIGINS
+from loopback import ALLOWED_ORIGINS, is_loopback_address, require_allowed_origin
 
 SESSION_COOKIE = "jarvis_session"
 CSRF_HEADER = "x-csrf-token"
 SESSION_TTL = timedelta(hours=12)
 MAX_LOGIN_FAILURES = 8
+LOGIN_WINDOW = timedelta(minutes=10)
+LOGIN_COOLDOWN = timedelta(seconds=60)
+MAX_GRANT_TTL = timedelta(days=30)
+
+CANONICAL_CONNECTORS = frozenset({"calendar_sim"})
+CANONICAL_RESOURCES = {"calendar_sim": frozenset({"calendar:synthetic-primary"})}
+# IDs sintéticos locais, sem vínculo com a fixture DEMO ou organizações reais.
+CANONICAL_DOMAIN_IDS = frozenset({"dom_synthetic_a", "dom_synthetic_b", "dom_synthetic_c"})
 
 router = APIRouter(prefix="/real", tags=["real"])
 
@@ -34,35 +44,40 @@ class Grant:
     id: str
     principal: str
     connector: str
-    permission: str
+    resource_ids: frozenset[str]
     domain_ids: frozenset[str]
+    expires_at: datetime
     revoked: bool = False
 
 
 @dataclass
 class ClassifiedRecord:
     id: str
-    domain_id: str
+    connector: str
+    resource_id: str
+    domain_id: str | None
     title: str
 
 
-# Catálogo sintético do modo real. Não é lido de fixtures/demo.json.
+# Este catálogo não é carregado de fixtures/demo.json.
 SYNTHETIC_RECORDS: tuple[ClassifiedRecord, ...] = (
-    ClassifiedRecord("synth_saude_1", "dom_saude", "ensaio local de rotina"),
-    ClassifiedRecord("synth_medsyn_1", "dom_medsyn", "ensaio cujo título cita CRIVO"),
-    ClassifiedRecord("synth_crivo_1", "dom_crivo", "ensaio CRIVO cujo título cita MedSyn"),
+    ClassifiedRecord("synth_a_1", "calendar_sim", "calendar:synthetic-primary", "dom_synthetic_a", "ensaio sintético A"),
+    ClassifiedRecord("synth_b_1", "calendar_sim", "calendar:synthetic-primary", "dom_synthetic_b", "ensaio sintético B"),
+    ClassifiedRecord("synth_unclassified_1", "calendar_sim", "calendar:synthetic-primary", None, "registro sem classificação; deve falhar fechado"),
 )
 
 _sessions: dict[str, Session] = {}
 _grants: dict[str, Grant] = {}
-_login_failures = 0
+_login_failures: dict[str, deque[datetime]] = defaultdict(deque)
+_login_blocked_until: dict[str, datetime] = {}
 
 
 def reset_state() -> None:
-    global _login_failures
+    """Limpa estado volátil; usado também para modelar reinício do processo."""
     _sessions.clear()
     _grants.clear()
-    _login_failures = 0
+    _login_failures.clear()
+    _login_blocked_until.clear()
 
 
 def _now() -> datetime:
@@ -77,17 +92,48 @@ def _expected_passphrase() -> str | None:
 
 
 class LoginIn(BaseModel):
+    model_config = ConfigDict(hide_input_in_errors=True)
     passphrase: str = Field(min_length=12, max_length=200)
 
 
 class GrantIn(BaseModel):
-    connector: str = Field(min_length=1, max_length=80)
-    permission: str = Field(pattern="^read$")
-    domain_ids: list[str] = Field(min_length=1, max_length=8)
+    connector: Literal["calendar_sim"]
+    permission: Literal["read"]
+    resource_ids: list[str] = Field(min_length=1, max_length=1)
+    domain_ids: list[str] = Field(min_length=1, max_length=3)
+    expires_at: datetime
+
+    @field_validator("resource_ids")
+    @classmethod
+    def resources_are_canonical(cls, values: list[str]) -> list[str]:
+        allowed = CANONICAL_RESOURCES["calendar_sim"]
+        if any(value not in allowed for value in values) or len(set(values)) != len(values):
+            raise ValueError("recurso inválido")
+        return values
+
+    @field_validator("domain_ids")
+    @classmethod
+    def domains_are_canonical(cls, values: list[str]) -> list[str]:
+        if any(value not in CANONICAL_DOMAIN_IDS for value in values) or len(set(values)) != len(values):
+            raise ValueError("domínio inválido")
+        return values
+
+    @field_validator("expires_at")
+    @classmethod
+    def validity_is_bounded_and_aware(cls, value: datetime) -> datetime:
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError("validade precisa de fuso horário")
+        now = _now()
+        utc_value = value.astimezone(timezone.utc)
+        if utc_value <= now or utc_value > now + MAX_GRANT_TTL:
+            raise ValueError("validade fora do intervalo permitido")
+        return utc_value
 
 
 class RealEventOut(BaseModel):
     id: str
+    connector: str
+    resource_id: str
     domain_id: str
     title: str
     dataset: str = "real"
@@ -104,12 +150,14 @@ def _client_host(request: Request) -> str:
     return request.client.host or ""
 
 
-def _session_from(request: Request) -> Session:
+def _session_from(request: Request, *, mutation: bool = False) -> Session:
     host = _client_host(request)
-    if host not in ALLOWED_CLIENT_HOSTS:
+    if not is_loopback_address(host):
         raise HTTPException(status_code=403, detail="origem de rede recusada")
     origin = request.headers.get("origin")
-    if origin is not None and origin not in ALLOWED_ORIGINS:
+    if mutation:
+        require_allowed_origin(origin)
+    elif origin is not None and origin not in ALLOWED_ORIGINS:
         raise HTTPException(status_code=403, detail="origem recusada")
     token = request.cookies.get(SESSION_COOKIE)
     session = _sessions.get(token or "")
@@ -117,28 +165,57 @@ def _session_from(request: Request) -> Session:
         if token:
             _sessions.pop(token, None)
         raise HTTPException(status_code=401, detail="sessão ausente")
-    if request.method in {"POST", "PUT", "PATCH", "DELETE"}:
+    if mutation:
         supplied = request.headers.get(CSRF_HEADER)
         if not supplied or not hmac.compare_digest(supplied, session.csrf_token):
             raise HTTPException(status_code=403, detail="csrf recusado")
     return session
 
 
-def _active_domains(principal: str) -> set[str]:
-    allowed: set[str] = set()
-    for grant in _grants.values():
-        if grant.principal == principal and grant.permission == "read" and not grant.revoked:
-            allowed.update(grant.domain_ids)
-    return allowed
+def _active_grants(principal: str, at: datetime | None = None) -> list[Grant]:
+    instant = at or _now()
+    return [grant for grant in _grants.values() if grant.principal == principal and not grant.revoked and grant.expires_at > instant]
 
 
-def _authorized_records(principal: str, requested_domain: str | None) -> list[ClassifiedRecord]:
-    allowed = _active_domains(principal)
-    if not allowed:
+def _record_is_well_classified(record: ClassifiedRecord) -> bool:
+    return (
+        record.connector in CANONICAL_CONNECTORS
+        and record.resource_id in CANONICAL_RESOURCES.get(record.connector, frozenset())
+        and record.domain_id in CANONICAL_DOMAIN_IDS
+    )
+
+
+def _record_is_authorized(record: ClassifiedRecord, grants: list[Grant]) -> bool:
+    return _record_is_well_classified(record) and any(
+        grant.connector == record.connector
+        and record.resource_id in grant.resource_ids
+        and record.domain_id in grant.domain_ids
+        for grant in grants
+    )
+
+
+def _authorized_records(
+    principal: str,
+    requested_domain: str | None,
+    record_id: str | None = None,
+) -> list[ClassifiedRecord]:
+    if requested_domain is not None and requested_domain not in CANONICAL_DOMAIN_IDS:
         raise HTTPException(status_code=403, detail="concessão ausente")
-    if requested_domain is not None and requested_domain not in allowed:
+    grants = _active_grants(principal)
+    if not grants:
         raise HTTPException(status_code=403, detail="concessão ausente")
-    return [record for record in SYNTHETIC_RECORDS if record.domain_id in allowed and (requested_domain is None or record.domain_id == requested_domain)]
+    found = [record for record in SYNTHETIC_RECORDS if record_id is None or record.id == record_id]
+    if record_id is not None and not found:
+        raise HTTPException(status_code=404, detail="registro ausente")
+    authorized = [record for record in found if _record_is_authorized(record, grants)]
+    if requested_domain is not None:
+        authorized = [record for record in authorized if record.domain_id == requested_domain]
+    if record_id is not None and not authorized:
+        # Resposta uniforme evita revelar se ID existe fora do escopo concedido.
+        raise HTTPException(status_code=404, detail="registro ausente")
+    if not authorized:
+        raise HTTPException(status_code=403, detail="concessão ausente")
+    return authorized
 
 
 def _set_cookie(response: Response, token: str, secure: bool) -> None:
@@ -153,20 +230,46 @@ def _set_cookie(response: Response, token: str, secure: bool) -> None:
     )
 
 
+def _rate_limit_key(request: Request) -> str:
+    return _client_host(request)
+
+
+def _check_login_rate_limit(key: str) -> None:
+    now = _now()
+    blocked_until = _login_blocked_until.get(key)
+    if blocked_until and blocked_until > now:
+        seconds = max(1, int((blocked_until - now).total_seconds()))
+        raise HTTPException(status_code=429, detail="muitas tentativas; aguarde e tente novamente", headers={"Retry-After": str(seconds)})
+    if blocked_until:
+        _login_blocked_until.pop(key, None)
+    failures = _login_failures[key]
+    while failures and failures[0] <= now - LOGIN_WINDOW:
+        failures.popleft()
+
+
+def _record_login_failure(key: str) -> None:
+    now = _now()
+    failures = _login_failures[key]
+    failures.append(now)
+    if len(failures) >= MAX_LOGIN_FAILURES:
+        _login_blocked_until[key] = now + LOGIN_COOLDOWN
+
+
 @router.post("/session", status_code=201)
 def open_session(body: LoginIn, request: Request, response: Response) -> dict:
-    global _login_failures
-    if _client_host(request) not in ALLOWED_CLIENT_HOSTS:
+    require_allowed_origin(request.headers.get("origin"))
+    key = _rate_limit_key(request)
+    if not is_loopback_address(key):
         raise HTTPException(status_code=403, detail="origem de rede recusada")
     expected = _expected_passphrase()
     if expected is None:
         raise HTTPException(status_code=503, detail="sessão local não configurada")
-    if _login_failures >= MAX_LOGIN_FAILURES:
-        raise HTTPException(status_code=429, detail="muitas tentativas")
+    _check_login_rate_limit(key)
     if not hmac.compare_digest(body.passphrase, expected):
-        _login_failures += 1
+        _record_login_failure(key)
         raise HTTPException(status_code=401, detail="credencial recusada")
-    _login_failures = 0
+    _login_failures.pop(key, None)
+    _login_blocked_until.pop(key, None)
     token = secrets.token_urlsafe(32)
     csrf_token = secrets.token_urlsafe(32)
     _sessions[token] = Session(
@@ -175,41 +278,57 @@ def open_session(body: LoginIn, request: Request, response: Response) -> dict:
         principal="owner",
         expires_at=_now() + SESSION_TTL,
     )
+    response.headers["Cache-Control"] = "no-store"
+    response.headers["Pragma"] = "no-cache"
     _set_cookie(response, token, request.url.scheme == "https")
     return {"csrf_token": csrf_token, "dataset": "real"}
 
 
 @router.delete("/session", status_code=204)
 def close_session(request: Request, response: Response) -> None:
-    session = _session_from(request)
+    session = _session_from(request, mutation=True)
     _sessions.pop(session.token, None)
     response.delete_cookie(SESSION_COOKIE, path="/")
 
 
 @router.post("/grants", status_code=201)
 def create_grant(body: GrantIn, request: Request) -> dict:
-    session = _session_from(request)
+    session = _session_from(request, mutation=True)
+    resources = frozenset(body.resource_ids)
+    domains = frozenset(body.domain_ids)
+    now = _now()
+    for existing in _active_grants(session.principal, now):
+        overlaps = (
+            existing.connector == body.connector
+            and bool(existing.resource_ids & resources)
+            and bool(existing.domain_ids & domains)
+        )
+        if overlaps:
+            raise HTTPException(status_code=409, detail="grant ativo sobreposto; revogue-o antes de conceder novamente")
     grant = Grant(
-        id=secrets.token_hex(8),
+        id=secrets.token_hex(16),
         principal=session.principal,
         connector=body.connector,
-        permission=body.permission,
-        domain_ids=frozenset(body.domain_ids),
+        resource_ids=resources,
+        domain_ids=domains,
+        expires_at=body.expires_at,
     )
     _grants[grant.id] = grant
     return {
         "id": grant.id,
         "principal": grant.principal,
         "connector": grant.connector,
-        "permission": grant.permission,
+        "permission": "read",
+        "resource_ids": sorted(grant.resource_ids),
         "domain_ids": sorted(grant.domain_ids),
+        "expires_at": grant.expires_at.isoformat(),
         "revoked": grant.revoked,
     }
 
 
 @router.post("/grants/{grant_id}/revoke", status_code=200)
 def revoke_grant(grant_id: str, request: Request) -> dict:
-    session = _session_from(request)
+    session = _session_from(request, mutation=True)
     grant = _grants.get(grant_id)
     if grant is None or grant.principal != session.principal:
         raise HTTPException(status_code=404, detail="concessão ausente")
@@ -221,14 +340,21 @@ def revoke_grant(grant_id: str, request: Request) -> dict:
 def read_events(request: Request, domain_id: str | None = None) -> list[RealEventOut]:
     session = _session_from(request)
     records = _authorized_records(session.principal, domain_id)
-    return [RealEventOut(id=record.id, domain_id=record.domain_id, title=record.title) for record in records]
+    return [RealEventOut(**record.__dict__) for record in records]
+
+
+@router.get("/events/{record_id}", response_model=RealEventOut)
+def read_event(record_id: str, request: Request) -> RealEventOut:
+    session = _session_from(request)
+    record = _authorized_records(session.principal, None, record_id)[0]
+    return RealEventOut(**record.__dict__)
 
 
 @router.get("/briefing", response_model=RealBriefingOut)
 def read_briefing(request: Request) -> RealBriefingOut:
     session = _session_from(request)
     records = _authorized_records(session.principal, None)
-    return RealBriefingOut(items=[RealEventOut(id=record.id, domain_id=record.domain_id, title=record.title) for record in records])
+    return RealBriefingOut(items=[RealEventOut(**record.__dict__) for record in records])
 
 
 def put_grant_for_tests(grant: Grant) -> None:
