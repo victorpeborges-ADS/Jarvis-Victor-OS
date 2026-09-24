@@ -19,7 +19,7 @@
 - **Fixtures:** `fixtures/demo.json` — dados DEMO fictícios, sinalizados explicitamente. Única fonte de dados no Gate 1.
 - **Infra Gate 1:** sem OAuth real, sem DB externo, sem n8n, sem LLM, sem túnel, sem deploy público. Tudo mock sinalizado.
 - **Node:** global v26.7.0 (não LTS) compatível com Next.js 15.5.26 (>=18.17). Preferir LTS 22.x em produção futura via `.nvmrc` sem alterar global. Validado: `node --version` + `next --version`.
-- **Python:** 3.12 LTS recomendado (compatível com FastAPI/pydantic); 3.14 apresenta falhas de build pydantic-core. Validado com `python3 --version`.
+- **Python:** 3.12 fixado por `apps/api/.python-version` e `apps/api/uv.lock`; instalar com `uv sync --locked --python 3.12`. O runner oficial da API é `python serve.py` via `uv run`; não iniciar `main:app` diretamente pelo Uvicorn.
 
 ## 3. Estrutura
 ```
@@ -51,10 +51,10 @@ npx playwright test --project=mobile
 
 # Backend
 cd apps/api
-python3 -m venv .venv && source .venv/bin/activate
-pip install -r requirements.txt
-uvicorn main:app --reload --port 8000  # http://localhost:8000/docs
-pytest
+uv python install 3.12
+uv sync --locked --python 3.12
+uv run --locked pytest
+uv run --locked python serve.py  # loopback; não executar uvicorn main:app
 ```
 
 ## 5. Política de dados e segurança (Gate 1)

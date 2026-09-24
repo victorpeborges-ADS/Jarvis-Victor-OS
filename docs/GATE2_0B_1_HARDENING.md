@@ -4,6 +4,8 @@
 **Branch:** `feat/gate2.0-b1-hardening`  
 **Escopo:** sessão, transporte local, concessões e tratamento de credenciais. Sem SQLite, OAuth, rede externa ou dados reais.
 
+> **Atualização:** o bloqueador de inicialização apontado pela auditoria independente foi tratado na etapa B.2. Consulte `docs/GATE2_0B_2_HARDENING.md` para os testes reais de socket, o lock Python e os limites da fronteira de confiança.
+
 ## Política implementada
 
 - O comando suportado é `python serve.py`. Ele aceita somente `127.0.0.1` ou `::1` e desabilita proxy headers e access log do Uvicorn.
@@ -30,7 +32,7 @@
 | Grants duplicados/overlapping sem política | Corrigido | Sobreposição ativa é negada com 409. Revogar o grant remove a permissão efetiva antes de nova concessão. |
 | Lockout permanente após oito falhas | Corrigido | Cooldown de 60s com janela de 10min; testes verificam bloqueio, recuperação temporal e reinício. |
 | Passphrase refletida em erros Pydantic | Corrigido | Handler de validação genérico; testes cobrem curta, longa, tipo errado e JSON truncado, incluindo `caplog`. |
-| Uvicorn alternativo podia bindar publicamente | Mitigado e delimitado | Runner `serve.py` recusa bind público e desliga proxies. A CLI Uvicorn direta é recusada antes de subir. Middleware nega requests recebidos por interface pública em outros runners ASGI. |
+| Uvicorn alternativo podia bindar publicamente | Corrigido para entrypoints comuns; limite do proprietário documentado | B.2 remove o objeto global `main:app`, exige configuração local na factory e prova por socket que CLI/import string não iniciam. Um programa Python arbitrário ainda pode abrir sockets; o middleware nega requests não locais. |
 | DEMO/docs potencialmente servidos por bind alternativo | Corrigido ao nível HTTP | Testes percorrem health, todas as rotas DEMO, docs, OpenAPI e sessão com scope público; todos retornam 403. |
 | Sessão antiga depois de reinício | Corrigido/esperado | Sessões e grants são voláteis; subprocesso novo retorna 401 para cookie anterior. |
 
@@ -38,7 +40,7 @@
 
 | Suite | Resultado |
 |---|---|
-| pytest API (originais + B.1) | **35/35 PASS** |
+| pytest API (originais + B.1 + B.2) | **39/39 PASS** |
 | Vitest Gate 1 | **31/31 PASS** |
 | Playwright Gate 1 desktop/mobile | **24/24 PASS** |
 | Typecheck | PASS |
@@ -51,13 +53,12 @@ O `TestClient` emite o aviso conhecido de depreciação para a integração Star
 
 ```bash
 cd apps/api
-source .venv/bin/activate
-read -s 'JARVIS_LOCAL_PASSPHRASE?Passphrase local (mínimo 12 caracteres): '
-export JARVIS_LOCAL_PASSPHRASE
-python serve.py
+uv python install 3.12
+uv sync --locked --python 3.12
+uv run --locked python serve.py
 ```
 
-O processo escuta em `127.0.0.1:8000` por padrão. Não execute com proxy reverso, túnel ou encaminhamento de porta. Não use `uvicorn main:app`; a CLI é recusada. Os endpoints DEMO continuam sem autenticação **no loopback**; o catálogo sintético `/real` exige sessão e grant. Não há suporte a mutações sem Origin.
+O processo escuta em `127.0.0.1:8000` por padrão. Configure `JARVIS_LOCAL_PASSPHRASE` no ambiente antes de iniciar. Não execute com proxy reverso, túnel ou encaminhamento de porta. Não use `uvicorn main:app`; não há mais objeto global `app`. Os endpoints DEMO continuam sem autenticação **no loopback**; o catálogo sintético `/real` exige sessão e grant. Não há suporte a mutações sem Origin.
 
 ## Riscos residuais e limites
 

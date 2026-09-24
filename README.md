@@ -30,10 +30,11 @@ npm test           # vitest run
 ### Backend (apps/api)
 ```bash
 cd apps/api
-uv venv --python 3.12 .venv && source .venv/bin/activate
-uv pip install -r requirements.txt
-uvicorn main:app --reload --port 8000  # http://localhost:8000/docs
-pytest -q
+uv python install 3.12
+uv sync --locked --python 3.12
+uv run --locked pytest -q
+JARVIS_LOCAL_PASSPHRASE='defina-uma-frase-local' uv run --locked python serve.py
+# API: http://127.0.0.1:8000/docs; não inicie com Uvicorn diretamente.
 ```
 
 ### Playwright (apps/web)

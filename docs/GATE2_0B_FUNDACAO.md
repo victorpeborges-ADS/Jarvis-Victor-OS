@@ -4,17 +4,18 @@ Incremento de sessão e concessão. Não há SQLite, OAuth, conector Google nem 
 
 ## Executar
 
-Na pasta `apps/api`, com o ambiente Python 3.12 já usado no Gate 1:
+Na pasta `apps/api`, instale o Python 3.12 e dependências exatamente pelo lockfile:
 
 ```bash
-source .venv/bin/activate
-pytest -q
+uv python install 3.12
+uv sync --locked --python 3.12
+uv run --locked pytest -q
 ```
 
 Para subir só em loopback, com uma frase local que não vai para o git:
 
 ```bash
-JARVIS_LOCAL_PASSPHRASE='uma-frase-local-longa' python serve.py
+JARVIS_LOCAL_PASSPHRASE='substitua-por-uma-frase-local-longa' uv run --locked python serve.py
 ```
 
 O padrão de escuta é `127.0.0.1:8000`. Outro host é recusado. Sem a variável de ambiente, abrir sessão responde 503.
