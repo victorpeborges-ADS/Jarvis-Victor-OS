@@ -18,7 +18,7 @@
 - **Backend:** `apps/api` — FastAPI + Uvicorn + Pydantic v2. A interface Gate 1 usa endpoints/fixtures DEMO; a API real local C.1 usa SQLite fora do repositório e filtros de leitura autorizados no servidor.
 - **Fixtures:** `fixtures/demo.json` — dados DEMO fictícios, sinalizados explicitamente. Única fonte de dados no Gate 1.
 - **Memória C.1:** banco separado das fixtures DEMO, vazio por padrão, WAL e migrações versionadas. Sessões e concessões permanecem apenas em memória; `domain_id` classifica e nunca concede acesso.
-- **Infra:** sem OAuth, conectores externos, LLM, túnel, acesso remoto ou deploy. C.1 não importa fixtures DEMO; os registros sintéticos de regressão são criados somente em bancos temporários de teste.
+- **Infra:** sem OAuth, conectores externos, LLM, túnel, acesso remoto ou deploy. C.1/C.2 não importam fixtures DEMO; testes e ensaios C.2 usam somente bancos sintéticos temporários.
 - **Node:** global v26.7.0 (não LTS) compatível com Next.js 15.5.26 (>=18.17). Preferir LTS 22.x em produção futura via `.nvmrc` sem alterar global. Validado: `node --version` + `next --version`.
 - **Python:** 3.12 fixado por `apps/api/.python-version` e `apps/api/uv.lock`; instalar com `uv sync --locked --python 3.12`. O runner oficial da API é `python serve.py` via `uv run`; não iniciar `main:app` diretamente pelo Uvicorn.
 
@@ -69,7 +69,7 @@ uv run --locked python serve.py  # loopback; não executar uvicorn main:app
 - **Gate 1 (tecnicamente aceito):** somente mocks sinalizados. Nenhuma escrita externa. Tag `gate1-accepted-v0.1`. Aprovação humana continua obrigatória para qualquer ação que toque Google ou produção.
 - **Gate 2.0-B:** tecnicamente aceito; encerramento em `docs/GATE2_0B_2_HARDENING.md`, tag local `gate2-b-accepted-v0.1`.
 - **Gate 2.0-C.1:** tecnicamente aceito em `gate2-c1-accepted-v0.1`, no commit `2609bdb`. A base SQLite permanece separada das fixtures DEMO; sessões e concessões são voláteis.
-- **Gate 2.0-C.2:** autorizado somente backup cifrado e restauração local de bancos sintéticos e descartáveis na branch dedicada. Não autoriza usar ou restaurar o banco padrão durante testes, dados pessoais/institucionais, retenção automática, persistência de chaves ou substituição de banco ativo.
+- **Gate 2.0-C.2:** implementação de backup cifrado e restauração local sintética em `feat/gate2.0-c2-backup-recovery`, aguardando auditoria independente. A autorização não cobre usar/restaurar o banco padrão em testes, dados pessoais/institucionais, retenção automática, persistência de chaves, ativação ou substituição de banco.
 - **Próximas etapas:** Calendar real, OAuth, Gmail, Drive, LLM, acesso remoto e deploy exigem autorização separada. Escrita externa permanece desativada.
 - **Gate 3+:** escrita só após testes de idempotência, concorrência, revogação e consentimento.
 

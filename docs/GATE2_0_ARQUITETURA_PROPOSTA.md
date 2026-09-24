@@ -1,6 +1,6 @@
 # Gate 2.0 — Proposta de arquitetura
 
-**Estado:** referência arquitetural aprovada. A fundação B e o C.1 foram tecnicamente aceitos; C.2 foi autorizado em branch dedicada apenas para backup cifrado e recuperação com dados sintéticos.
+**Estado:** referência arquitetural aprovada. A fundação B e o C.1 foram tecnicamente aceitos. C.2 foi implementado em branch dedicada, somente para backup cifrado e restauração sintética, e aguarda auditoria independente.
 **Base original da proposta:** `main` @ `ef5d3cd`, tag `gate1-accepted-v0.1`. A aprovação e consolidação B estão registradas em `docs/GATE2_0B_2_HARDENING.md`.
 **Data:** 23/09/2026.  
 **Restrição:** qualquer implementação depende de aceite explícito e delimitado. C.1 está aceito; o aceite separado do C.2 cobre apenas backup cifrado e restauração isolada com bancos sintéticos, não dados reais, OAuth ou conectores.
@@ -83,6 +83,10 @@ Migração das fixtures:
 ### Implementação delimitada C.1
 
 O estado implementado e os seus limites estão documentados em [`docs/GATE2_0C_1_MEMORIA.md`](GATE2_0C_1_MEMORIA.md). C.1 materializa o armazenamento local vazio, modelos e consultas protegidas por sessão e concessão voláteis; não implementa o restante esquema futuro descrito nesta proposta, sincronização, backup ou qualquer fonte externa.
+
+### Implementação delimitada C.2
+
+O backup cifrado e a restauração em diretório novo estão descritos em [`docs/GATE2_0C_2_BACKUP_RECOVERY.md`](GATE2_0C_2_BACKUP_RECOVERY.md). A implementação aguarda auditoria independente e continua restrita a bancos sintéticos descartáveis; não ativa a restauração, não substitui a base padrão e não altera as decisões pendentes de retenção ou gestão de chaves.
 
 ## 4. Primeira integração
 

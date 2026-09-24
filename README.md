@@ -1,8 +1,8 @@
 # JARVIS — Victor OS + Victor Context Hub
 
-Gate 1 tecnicamente aceito em `gate1-accepted-v0.1`. Gate 2.0-B foi aceito em `gate2-b-accepted-v0.1`. Gate 2.0-C.1 foi tecnicamente aceito em `gate2-c1-accepted-v0.1`; a branch `feat/gate2.0-c2-backup-recovery` trata somente backup cifrado e restauração local com bancos sintéticos.
+Gate 1 tecnicamente aceito em `gate1-accepted-v0.1`. Gate 2.0-B foi aceito em `gate2-b-accepted-v0.1`. Gate 2.0-C.1 foi tecnicamente aceito em `gate2-c1-accepted-v0.1`. A implementação C.2 em `feat/gate2.0-c2-backup-recovery` cobre somente backup cifrado e restauração local com bancos sintéticos e aguarda auditoria independente.
 
-> **Estado dos dados:** A interface Gate 1 continua usando exclusivamente fixtures DEMO. A API C.1 dispõe de SQLite local separado; C.2 está limitado a backup/restauração com dados sintéticos em diretórios descartáveis. Não há integração com Google Calendar/Gmail/Drive nem importação de fixtures.
+> **Estado dos dados:** A interface Gate 1 continua usando exclusivamente fixtures DEMO. A API C.1 dispõe de SQLite local separado; C.2 está limitado a backup/restauração com dados sintéticos em diretórios descartáveis. O CLI não inicializa nem substitui o banco padrão. Não há integração com Google Calendar/Gmail/Drive nem importação de fixtures.
 
 **Raiz:** `/Users/vic/Freela/Jarvis-Victor-OS`. Aceite técnico registrado a partir de `feat/gate1.3.2-a11y` @ `de1e26b`, com a correção pontual de contraste no cartão selecionado.
 
@@ -38,6 +38,16 @@ JARVIS_LOCAL_PASSPHRASE='defina-uma-frase-local' uv run --locked python serve.py
 # O runner suportado é serve.py; não inicie Uvicorn diretamente.
 ```
 
+### Backup cifrado C.2 (somente ensaio sintético)
+
+Após `uv sync --locked --python 3.12`, o CLI pede a senha diretamente no terminal; ela não deve ser passada por argumento ou variável de ambiente. Backup e restauração usam os caminhos padrão do banco, mas nunca inicializam o banco; restauração publica em diretório novo sob `restores/` e não substitui a base ativa. Consulte [docs/GATE2_0C_2_BACKUP_RECOVERY.md](docs/GATE2_0C_2_BACKUP_RECOVERY.md). A implementação aguarda auditoria independente e não está autorizada para dados reais.
+
+```bash
+cd apps/api
+uv run --locked python backup_cli.py backup
+uv run --locked python backup_cli.py restore jarvis-backup-v1-20260924T120000Z-a1b2c3d4.jvb
+```
+
 ### Playwright (apps/web)
 ```bash
 cd apps/web
@@ -60,6 +70,7 @@ ls ../docs/screenshots
 - `apps/web` — Next.js 15 + React 19 + TypeScript + Tailwind
 - `apps/api` — FastAPI local; sessão e concessões voláteis, SQLite separado das fixtures DEMO
 - `docs/GATE2_0C_1_MEMORIA.md` — arquitetura, limites e verificações da memória C.1
+- `docs/GATE2_0C_2_BACKUP_RECOVERY.md` — formato cifrado, execução e limites de backup/restauração C.2
 - `fixtures/demo.json` — dados DEMO
 - `JARVIS_Blueprint_v0.1.md` — visão e arquitetura
 - `JARVIS_PromptPack_OpenCode_Codex_Cursor.md` — prompts sequenciais
@@ -77,4 +88,4 @@ Agora · Conversa JARVIS · Inbox · Domínios · Aprovações · Fontes/Privaci
 
 ## Gates
 
-Gate 1, Gate 2.0-B e Gate 2.0-C.1 estão tecnicamente aceitos. A autorização atual cobre exclusivamente backup cifrado e restauração isolada com bancos sintéticos; não cobre importar fixtures, usar/restaurar o banco padrão, dados reais, OAuth, conectores, LLM, acesso remoto ou deploy. Consulte `docs/GATE2_0C_1_1_INTEGRIDADE.md`, `docs/GATE2_0C_2_BACKUP_RECOVERY.md` e `AGENTS.md`.
+Gate 1, Gate 2.0-B e Gate 2.0-C.1 estão tecnicamente aceitos. A implementação C.2 aguarda auditoria independente. A autorização atual cobre exclusivamente backup cifrado e restauração isolada com bancos sintéticos; não cobre importar fixtures, usar/restaurar o banco padrão em testes, ativar banco restaurado, dados reais, OAuth, conectores, LLM, acesso remoto ou deploy. Consulte `docs/GATE2_0C_1_1_INTEGRIDADE.md`, `docs/GATE2_0C_2_BACKUP_RECOVERY.md` e `AGENTS.md`.
