@@ -33,8 +33,12 @@ function domainLabel(domainId: string | null | undefined): string {
   return SYNTHETIC_DOMAINS.find((domain) => domain.id === domainId)?.label ?? "sem classificação visível";
 }
 
+function hasResourceGrant(grants: LocalGrant[], domainId: string, resourceId: string): boolean {
+  return grants.some((grant) => grant.domain_ids.includes(domainId) && grant.resource_ids.includes(resourceId) && !grant.revoked && Date.parse(grant.expires_at) > Date.now());
+}
+
 function hasDomainGrant(grants: LocalGrant[], domainId: string): boolean {
-  return grants.some((grant) => grant.domain_ids.includes(domainId) && !grant.revoked && Date.parse(grant.expires_at) > Date.now());
+  return hasResourceGrant(grants, domainId, "calendar:synthetic-primary");
 }
 
 function LoginForm() {
@@ -85,7 +89,7 @@ function LoginForm() {
 }
 
 function GrantControls() {
-  const { grants, createGrant, revokeGrant, selectedDomain } = useLocalIntegration();
+  const { grants, createGrant, createInventoryGrant, revokeGrant, selectedDomain } = useLocalIntegration();
   const [domainId, setDomainId] = useState<SyntheticDomainId>(selectedDomain);
   const [busy, setBusy] = useState(false);
   const [localError, setLocalError] = useState<string | null>(null);
@@ -95,6 +99,14 @@ function GrantControls() {
     setLocalError(null);
     try { await createGrant(domainId); }
     catch { setLocalError("A concessão não foi criada. Confira a sessão e as permissões locais."); }
+    finally { setBusy(false); }
+  }
+
+  async function grantInventory() {
+    setBusy(true);
+    setLocalError(null);
+    try { await createInventoryGrant(domainId); }
+    catch { setLocalError("O inventário limitado não foi concedido. Ele não autoriza leitura de eventos."); }
     finally { setBusy(false); }
   }
 
@@ -132,16 +144,19 @@ function GrantControls() {
         <Button data-testid="grant-create" disabled={busy || hasDomainGrant(grants, domainId)} onClick={create}>
           {hasDomainGrant(grants, domainId) ? "Concessão ativa" : "Conceder leitura"}
         </Button>
+        <Button data-testid="grant-inventory" variant="outline" disabled={busy || hasResourceGrant(grants, domainId, "calendar:synthetic-inventory")} onClick={() => void grantInventory()}>
+          {hasResourceGrant(grants, domainId, "calendar:synthetic-inventory") ? "Inventário ativo" : "Conceder inventário limitado"}
+        </Button>
       </div>
       {grants.length > 0 ? (
         <ul className="mt-4 space-y-2" aria-label="Concessões de leitura ativas">
           {grants.map((grant) => (
             <li key={grant.id} data-testid="grant-card" className="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-paper-border bg-paper-muted px-3 py-2.5">
               <div className="text-sm text-ink">
-                <span className="font-medium">{grant.resource_ids.includes("calendar:synthetic-primary") ? "Calendar fictício" : "Recurso simulado"}</span>
+                <span className="font-medium">{grant.resource_ids.includes("calendar:synthetic-primary") ? "Calendar fictício" : grant.resource_ids.includes("calendar:synthetic-inventory") ? "Inventário limitado" : "Recurso simulado"}</span>
                 <span className="text-ink-subtle"> · {grant.domain_ids.map(domainLabel).join(", ")} · até {localDate(grant.expires_at)}</span>
               </div>
-              <Button size="sm" variant="outline" disabled={busy} onClick={() => void revoke(grant)} aria-label={`Revogar ${grant.domain_ids.map(domainLabel).join(", ")}`}>
+              <Button size="sm" variant="outline" disabled={busy} onClick={() => void revoke(grant)} aria-label={`Revogar ${grant.resource_ids.includes("calendar:synthetic-primary") ? "leitura" : "inventário"} ${grant.domain_ids.map(domainLabel).join(", ")}`}>
                 Revogar
               </Button>
             </li>
@@ -161,7 +176,9 @@ function CalendarCard({ calendar }: { calendar: SimulatedCalendar }) {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const state = states.find((item) => item.calendar_id === calendar.calendar_id);
-  const canClassify = hasDomainGrant(grants, classification);
+  const canClassify = hasDomainGrant(grants, classification) && (
+    Boolean(state?.domain_id) || hasResourceGrant(grants, classification, "calendar:synthetic-inventory")
+  );
 
   async function classify() {
     setBusy(true);

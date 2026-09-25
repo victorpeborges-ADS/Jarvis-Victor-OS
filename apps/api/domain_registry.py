@@ -14,4 +14,8 @@ CANONICAL_DOMAIN_IDS = frozenset(
 )
 
 CANONICAL_CONNECTORS = frozenset({"calendar_sim"})
-CANONICAL_RESOURCES = {"calendar_sim": frozenset({"calendar:synthetic-primary"})}
+CALENDAR_READ_RESOURCE = "calendar:synthetic-primary"
+CALENDAR_INVENTORY_RESOURCE = "calendar:synthetic-inventory"
+CANONICAL_RESOURCES = {
+    "calendar_sim": frozenset({CALENDAR_READ_RESOURCE, CALENDAR_INVENTORY_RESOURCE}),
+}

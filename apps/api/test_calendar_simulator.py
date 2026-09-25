@@ -50,14 +50,14 @@ def login(client: TestClient) -> tuple[str, str]:
     return token, csrf
 
 
-def grant(client: TestClient, csrf: str, domains: list[str]) -> str:
+def grant(client: TestClient, csrf: str, domains: list[str], resource: str = "calendar:synthetic-primary") -> str:
     response = client.post(
         "/real/grants",
         headers={"origin": ORIGIN, "x-csrf-token": csrf},
         json={
             "connector": "calendar_sim",
             "permission": "read",
-            "resource_ids": ["calendar:synthetic-primary"],
+            "resource_ids": [resource],
             "domain_ids": domains,
             "expires_at": (datetime.now(timezone.utc) + timedelta(days=1)).isoformat(),
         },
@@ -67,6 +67,19 @@ def grant(client: TestClient, csrf: str, domains: list[str]) -> str:
 
 
 def classify(client: TestClient, csrf: str, calendar_letter: str, domain_letter: str) -> None:
+    domain_id = f"dom_synthetic_{domain_letter}"
+    inventory = client.post(
+        "/real/grants",
+        headers={"origin": ORIGIN, "x-csrf-token": csrf},
+        json={
+            "connector": "calendar_sim",
+            "permission": "read",
+            "resource_ids": ["calendar:synthetic-inventory"],
+            "domain_ids": [domain_id],
+            "expires_at": (datetime.now(timezone.utc) + timedelta(days=1)).isoformat(),
+        },
+    )
+    assert inventory.status_code in {201, 409}, inventory.text
     response = client.put(
         f"/real/calendar-sim/calendars/sim_calendar_{calendar_letter}/classification",
         headers={"origin": ORIGIN, "x-csrf-token": csrf},
@@ -130,6 +143,8 @@ def test_calendar_catalog_requires_grant_and_hides_other_classified_domains(clie
     session_token, csrf = login(client)
     assert client.get("/real/calendar-sim/calendars").status_code == 403
     grant_a = grant(client, csrf, ["dom_synthetic_a"])
+    assert client.get("/real/calendar-sim/calendars").json()["calendars"] == []
+    grant(client, csrf, ["dom_synthetic_a"], "calendar:synthetic-inventory")
     assert len(client.get("/real/calendar-sim/calendars").json()["calendars"]) == 8
     grant_b = grant(client, csrf, ["dom_synthetic_b"])
     classify(client, csrf, "a", "a")
@@ -864,6 +879,17 @@ def test_real_http_cors_preflight_and_classification_put(tmp_path, monkeypatch):
                 },
             )
             assert grant_response.status_code == 201
+            inventory_response = http.post(
+                "/real/grants",
+                headers={"origin": ORIGIN, "x-csrf-token": csrf},
+                json={
+                    "connector": "calendar_sim", "permission": "read",
+                    "resource_ids": ["calendar:synthetic-inventory"],
+                    "domain_ids": ["dom_synthetic_a"],
+                    "expires_at": (datetime.now(timezone.utc) + timedelta(days=1)).isoformat(),
+                },
+            )
+            assert inventory_response.status_code == 201
             classified = http.put(
                 "/real/calendar-sim/calendars/sim_calendar_a/classification",
                 headers={"origin": ORIGIN, "x-csrf-token": csrf},
@@ -892,3 +918,52 @@ def test_real_http_cors_preflight_and_classification_put(tmp_path, monkeypatch):
             assert disallowed_method.status_code == 400
             assert unexpected_header.status_code == 400
             assert denied_put.status_code == 403
+
+
+def test_calendar_state_is_401_without_session_and_403_without_grant(client):
+    assert client.get("/real/calendar-sim/state").status_code == 401
+    login(client)
+    denied = client.get("/real/calendar-sim/state", headers={"origin": ORIGIN})
+    assert denied.status_code == 403
+    assert denied.json()["detail"] == "concessão de leitura para Calendar simulado ausente"
+    _token, csrf = login(client)
+    grant(client, csrf, ["dom_synthetic_a"])
+    empty = client.get("/real/calendar-sim/state", headers={"origin": ORIGIN})
+    assert empty.status_code == 200
+    assert empty.json()["states"] == []
+
+
+def test_inventory_does_not_reveal_other_domain_or_authorize_events(client):
+    _token, csrf = login(client)
+    grant(client, csrf, ["dom_synthetic_a"], "calendar:synthetic-inventory")
+    assert client.get("/real/calendar-sim/calendars").status_code == 403
+    assert client.get("/real/events", headers={"origin": ORIGIN}).status_code == 403
+    grant_a = grant(client, csrf, ["dom_synthetic_a"])
+    grant_b = grant(client, csrf, ["dom_synthetic_b"])
+    classify(client, csrf, "a", "a")
+    classify(client, csrf, "b", "b")
+    assert client.post(
+        f"/real/grants/{grant_b}/revoke", headers={"origin": ORIGIN, "x-csrf-token": csrf}
+    ).status_code == 200
+    visible = {item["calendar_id"] for item in client.get("/real/calendar-sim/calendars").json()["calendars"]}
+    assert "sim_calendar_a" in visible
+    assert "sim_calendar_b" not in visible
+    denied = client.put(
+        "/real/calendar-sim/calendars/sim_calendar_c/classification",
+        headers={"origin": ORIGIN, "x-csrf-token": csrf},
+        json={"domain_id": "dom_synthetic_b"},
+    )
+    assert denied.status_code == 403
+    assert client.get("/real/events?domain_id=dom_synthetic_b", headers={"origin": ORIGIN}).status_code == 403
+    assert grant_a
+
+
+def test_authenticated_get_without_origin_stays_local_and_refuses_cross_site(client):
+    _token, csrf = login(client)
+    grant(client, csrf, ["dom_synthetic_a"])
+    assert client.get("/real/events", headers={"origin": ORIGIN}).status_code == 200
+    assert client.get("/real/events").status_code == 200
+    assert client.get("/real/events", headers={"origin": "https://evil.example"}).status_code == 403
+    assert client.get("/real/events", headers={"sec-fetch-site": "cross-site"}).status_code == 403
+    assert client.get("/real/events", headers={"host": "evil.example", "origin": ORIGIN}).status_code == 400
+    assert client.get("/real/calendar-sim/state").status_code == 200

@@ -40,6 +40,7 @@ type IntegrationContextValue = {
   logout(): Promise<void>;
   loadResources(): Promise<void>;
   createGrant(domainId: SyntheticDomainId): Promise<void>;
+  createInventoryGrant(domainId: SyntheticDomainId): Promise<void>;
   revokeGrant(grant: LocalGrant): Promise<void>;
   classifyCalendar(calendarId: string, domainId: SyntheticDomainId): Promise<void>;
   syncCalendar(calendarId: string): Promise<void>;
@@ -64,7 +65,8 @@ function safeArray<T>(value: unknown): T[] {
 
 function domainHasGrant(grants: LocalGrant[], domainId: string): boolean {
   return grants.some((grant) => grant.connector === "calendar_sim" &&
-    grant.permission === "read" && grant.domain_ids.includes(domainId) &&
+    grant.permission === "read" && grant.resource_ids.includes("calendar:synthetic-primary") &&
+    grant.domain_ids.includes(domainId) &&
     Date.parse(grant.expires_at) > Date.now() && !grant.revoked);
 }
 
@@ -124,7 +126,7 @@ export function LocalIntegrationProvider({ children }: { children: ReactNode }) 
 
   const requestJson = useCallback(async <T,>(
     path: string,
-    options: { method?: string; body?: unknown; csrfRequired?: boolean; allowMissingSession?: boolean } = {}
+    options: { method?: string; body?: unknown; csrfRequired?: boolean; allowMissingSession?: boolean; keepSessionOnForbidden?: boolean } = {}
   ): Promise<T | undefined> => {
     const controller = new AbortController();
     const requestGeneration = generation.current;
@@ -148,6 +150,10 @@ export function LocalIntegrationProvider({ children }: { children: ReactNode }) 
       if (controller.signal.aborted || (error instanceof DOMException && error.name === "AbortError")) return undefined;
       if (error instanceof LocalApiError) {
         if (options.allowMissingSession && error.status === 401) return undefined;
+        if (options.keepSessionOnForbidden && error.status === 403) {
+          setNotice(error.message);
+          return undefined;
+        }
         if (error.status === 401 || error.status === 403) invalidateSession(error.message, controller);
         else setNotice(error.message);
       } else {
@@ -214,23 +220,27 @@ export function LocalIntegrationProvider({ children }: { children: ReactNode }) 
   }, [pathname, clearProtectedData]);
 
   const loadResourcesFromServer = useCallback(async () => {
-    const [activeGrants, calendarStates] = await Promise.all([
-      requestJson<LocalGrant[]>("/real/grants"),
-      requestJson<{ provider_mode: "simulated"; states: CalendarSyncState[] }>("/real/calendar-sim/state")
-    ]);
-    if (!activeGrants || !calendarStates) return;
+    const activeGrants = await requestJson<LocalGrant[]>("/real/grants");
+    if (!activeGrants) return;
+    const safeGrantsValue = safeArray<LocalGrant>(activeGrants);
+    const hasCalendarRead = safeGrantsValue.some((grant) => domainHasGrant([grant], grant.domain_ids[0] ?? ""));
+    if (!hasCalendarRead) {
+      setGrants(safeGrantsValue);
+      setStates([]);
+      setCalendars([]);
+      setNotice("Sessão autenticada sem concessão de leitura do Calendar. A API recusa o estado com 403; isto não é um catálogo vazio nem o modo DEMO.");
+      return;
+    }
+    const calendarStates = await requestJson<{ provider_mode: "simulated"; states: CalendarSyncState[] }>(
+      "/real/calendar-sim/state",
+      { keepSessionOnForbidden: true }
+    );
+    if (!calendarStates) return;
     if (calendarStates.provider_mode !== "simulated") {
       invalidateSession("A resposta da API não corresponde ao modo simulado esperado.");
       return;
     }
-    const safeGrantsValue = safeArray<LocalGrant>(activeGrants);
     const safeStatesValue = safeArray<CalendarSyncState>(calendarStates.states);
-    if (activeGrants.length === 0) {
-      setGrants(safeGrantsValue);
-      setStates(safeStatesValue);
-      setCalendars([]);
-      return;
-    }
     const catalog = await requestJson<{ provider_mode: "simulated"; calendars: SimulatedCalendar[] }>("/real/calendar-sim/calendars");
     if (!catalog) return;
     if (catalog.provider_mode !== "simulated") {
@@ -239,6 +249,7 @@ export function LocalIntegrationProvider({ children }: { children: ReactNode }) 
     }
     // Do not publish states before the catalog request finishes: the page's
     // state effect starts an event refresh that cancels pending requests.
+    setNotice(null);
     setGrants(safeGrantsValue);
     setStates(safeStatesValue);
     setCalendars(safeArray<SimulatedCalendar>(catalog.calendars));
@@ -307,14 +318,14 @@ export function LocalIntegrationProvider({ children }: { children: ReactNode }) 
     catch { /* requestJson stores a safe message and clears protected data on failure. */ }
   }, [loadResourcesFromServer]);
 
-  const createGrant = useCallback(async (domainId: SyntheticDomainId) => {
+  const postGrant = useCallback(async (domainId: SyntheticDomainId, resourceId: string) => {
     const result = await requestJson<LocalGrant>("/real/grants", {
       method: "POST",
       csrfRequired: true,
       body: {
         connector: "calendar_sim",
         permission: "read",
-        resource_ids: ["calendar:synthetic-primary"],
+        resource_ids: [resourceId],
         domain_ids: [domainId],
         expires_at: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString()
       }
@@ -324,6 +335,14 @@ export function LocalIntegrationProvider({ children }: { children: ReactNode }) 
       await loadResourcesAfterMutation();
     }
   }, [loadResourcesAfterMutation, requestJson]);
+
+  const createGrant = useCallback(async (domainId: SyntheticDomainId) => {
+    await postGrant(domainId, "calendar:synthetic-primary");
+  }, [postGrant]);
+
+  const createInventoryGrant = useCallback(async (domainId: SyntheticDomainId) => {
+    await postGrant(domainId, "calendar:synthetic-inventory");
+  }, [postGrant]);
 
   const revokeGrant = useCallback(async (grant: LocalGrant) => {
     cancelPending();
@@ -364,11 +383,11 @@ export function LocalIntegrationProvider({ children }: { children: ReactNode }) 
   const value = useMemo<IntegrationContextValue>(() => ({
     authStatus, expiresAt, csrfAvailable: Boolean(csrf), notice, calendars, grants, states, events,
     selectedDomain, resourcesLoading, eventsLoading, lastReport, login, logout, loadResources,
-    createGrant, revokeGrant, classifyCalendar, syncCalendar, selectDomain, refreshEvents,
+    createGrant, createInventoryGrant, revokeGrant, classifyCalendar, syncCalendar, selectDomain, refreshEvents,
     clearNotice: () => setNotice(null)
   }), [
     authStatus, expiresAt, csrf, notice, calendars, grants, states, events, selectedDomain,
-    resourcesLoading, eventsLoading, lastReport, login, logout, loadResources, createGrant,
+    resourcesLoading, eventsLoading, lastReport, login, logout, loadResources, createGrant, createInventoryGrant,
     revokeGrant, classifyCalendar, syncCalendar, selectDomain, refreshEvents
   ]);
 

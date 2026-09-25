@@ -9,7 +9,12 @@ from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from domain_registry import CANONICAL_DOMAIN_IDS
-from local_security import _session_from, authorized_calendar_domains, calendar_grant_guard
+from local_security import (
+    _session_from,
+    authorized_calendar_domains,
+    authorized_calendar_inventory_domains,
+    calendar_grant_guard,
+)
 from calendar_simulator import (
     CalendarSyncReport,
     CalendarSyncService,
@@ -66,16 +71,20 @@ def list_simulated_calendars(request: Request) -> CalendarCatalogOut:
         raise HTTPException(status_code=403, detail="concessão de leitura para o catálogo Calendar ausente")
     service = _service(request)
     try:
-        # Unclassified entries are metadata needed to choose a classification;
-        # classified entries are visible only inside the caller's granted domains.
+        # Discovery of unclassified names requires the limited inventory grant.
+        # Classified calendars stay inside the event-read domains.
         with calendar_grant_guard(session.principal, domains):
+            inventory = authorized_calendar_inventory_domains(session.principal)
             domain_by_calendar = {state.calendar_id: state.domain_id for state in service.states()}
-            calendars = tuple(
-                calendar for calendar in service.provider.list_calendars()
-                if domain_by_calendar.get(calendar.calendar_id) is None
-                or domain_by_calendar[calendar.calendar_id] in domains
-            )
-            return CalendarCatalogOut(calendars=calendars)
+            visible = []
+            for calendar in service.provider.list_calendars():
+                domain_id = domain_by_calendar.get(calendar.calendar_id)
+                if domain_id is None:
+                    if inventory:
+                        visible.append(calendar)
+                elif domain_id in domains:
+                    visible.append(calendar)
+            return CalendarCatalogOut(calendars=tuple(visible))
     except PermissionError as exc:
         raise HTTPException(status_code=403, detail="concessão revogada durante a leitura do catálogo") from exc
 
@@ -85,9 +94,19 @@ def classify_simulated_calendar(
     calendar_id: str, body: ClassificationIn, request: Request
 ) -> CalendarMappingOut:
     session = _session_from(request, mutation=True)
+    if body.domain_id not in authorized_calendar_domains(session.principal):
+        raise HTTPException(status_code=403, detail="concessão de leitura para o domínio ausente")
+    service = _service(request)
+    if service.provider.get_calendar(calendar_id) is None:
+        raise HTTPException(status_code=404, detail="calendário sintético desconhecido")
+    current = next((state.domain_id for state in service.states() if state.calendar_id == calendar_id), None)
+    if current is None and body.domain_id not in authorized_calendar_inventory_domains(session.principal):
+        raise HTTPException(status_code=403, detail="inventário limitado ausente para calendário não classificado")
+    if current is not None and current not in authorized_calendar_domains(session.principal):
+        raise HTTPException(status_code=403, detail="concessão de leitura para o domínio ausente")
     try:
         with calendar_grant_guard(session.principal, frozenset({body.domain_id})):
-            checkpoint = _service(request).classify(calendar_id, body.domain_id)
+            checkpoint = service.classify(calendar_id, body.domain_id)
     except ValueError as exc:
         status_code = 404 if "desconhecido" in str(exc) else 409
         raise HTTPException(status_code=status_code, detail=str(exc)) from exc
@@ -132,6 +151,8 @@ def synchronize_simulated_calendars(body: SyncIn, request: Request) -> CalendarS
 def simulated_sync_state(request: Request) -> CalendarStatesOut:
     session = _session_from(request)
     domains = authorized_calendar_domains(session.principal)
+    if not domains:
+        raise HTTPException(status_code=403, detail="concessão de leitura para Calendar simulado ausente")
     visible = tuple(
         state for state in _service(request).states()
         if state.domain_id is not None and state.domain_id in domains

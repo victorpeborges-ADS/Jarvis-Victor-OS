@@ -35,6 +35,7 @@ async function grantAndClassify(page: import("@playwright/test").Page, domainId:
   const suffix = domainId.slice(-1).toUpperCase();
   await page.getByTestId("grant-domain").selectOption(domainId);
   await page.getByTestId("grant-create").click();
+  await page.getByTestId("grant-inventory").click();
   await expect(page.getByTestId("grant-card").filter({ hasText: `Escopo sintético ${suffix}` })).toBeVisible();
 
   // The card itself is selected by its explicit stable calendar identifier.
@@ -64,7 +65,8 @@ test("API local no navegador: PUT/CORS, sync, proveniência, estados, modos e re
         csrfToken = typeof body.csrf_token === "string" ? body.csrf_token : null;
       }
       if (response.url().endsWith("/real/grants") && response.request().method() === "POST" && response.status() === 201) {
-        activeGrantId = typeof body.id === "string" ? body.id : null;
+        const resources = Array.isArray(body.resource_ids) ? body.resource_ids : [];
+        if (resources.includes("calendar:synthetic-primary") && typeof body.id === "string") activeGrantId = body.id;
       }
     } catch { /* empty responses have no JSON body */ }
   });
@@ -158,7 +160,7 @@ test("API local no navegador: PUT/CORS, sync, proveniência, estados, modos e re
   });
   const pendingSync = calendarCard.getByRole("button", { name: `Sincronizar ${calendarForProject}` }).click().catch(() => undefined);
   await syncFinished;
-  const revoke = page.getByRole("button", { name: `Revogar Escopo sintético ${domainForProject.slice(-1).toUpperCase()}` });
+  const revoke = page.getByRole("button", { name: `Revogar leitura Escopo sintético ${domainForProject.slice(-1).toUpperCase()}` });
   await revoke.click();
   await expect(page.getByTestId("integrated-events").getByText(syntheticTitle)).toHaveCount(0);
   await page.getByTestId("grant-domain").selectOption(domainForProject);

@@ -15,7 +15,13 @@ from typing import Literal
 from fastapi import APIRouter, HTTPException, Request, Response
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-from domain_registry import CANONICAL_CONNECTORS, CANONICAL_DOMAIN_IDS, CANONICAL_RESOURCES
+from domain_registry import (
+    CALENDAR_INVENTORY_RESOURCE,
+    CALENDAR_READ_RESOURCE,
+    CANONICAL_CONNECTORS,
+    CANONICAL_DOMAIN_IDS,
+    CANONICAL_RESOURCES,
+)
 from memory_models import ProvenanceRecord, ReadScope
 from memory_store import SQLiteMemoryStore, StoredEvent
 from loopback import ALLOWED_ORIGINS, is_loopback_address, require_allowed_origin
@@ -228,6 +234,11 @@ def _session_from(request: Request, *, mutation: bool = False) -> Session:
         require_allowed_origin(origin)
     elif origin is not None and origin not in ALLOWED_ORIGINS:
         raise HTTPException(status_code=403, detail="origem recusada")
+    # Origin is not authentication. Loopback GET clients may omit it.
+    # An explicit cross-site fetch is refused even when Origin is absent.
+    fetch_site = request.headers.get("sec-fetch-site")
+    if fetch_site is not None and fetch_site.lower() == "cross-site":
+        raise HTTPException(status_code=403, detail="origem recusada")
     token = request.cookies.get(SESSION_COOKIE)
     session = _sessions.get(token or "")
     if session is None or session.expires_at <= _now():
@@ -247,18 +258,31 @@ def _active_grants(principal: str, at: datetime | None = None) -> list[Grant]:
         return [grant for grant in _grants.values() if grant.principal == principal and not grant.revoked and grant.expires_at > instant]
 
 
-def authorized_calendar_domains(principal: str) -> frozenset[str]:
-    """Return only domains covered by an active calendar_sim read grant."""
+def _calendar_domains_for(principal: str, resource_id: str) -> frozenset[str]:
+    """Domains of active calendar grants that carry one exact canonical resource."""
     allowed: set[str] = set()
+    canonical = CANONICAL_RESOURCES["calendar_sim"]
     with _grant_lock:
         for grant in _active_grants(principal):
             if grant.connector != "calendar_sim":
                 continue
-            valid_resources = grant.resource_ids & CANONICAL_RESOURCES["calendar_sim"]
-            if not valid_resources or valid_resources != grant.resource_ids:
+            if resource_id not in grant.resource_ids or not grant.resource_ids <= canonical:
                 continue
             allowed.update(grant.domain_ids & CANONICAL_DOMAIN_IDS)
     return frozenset(allowed)
+
+
+def authorized_calendar_domains(principal: str) -> frozenset[str]:
+    """Domains covered by an active calendar event-read grant.
+
+    The limited inventory resource does not authorize event reads or sync.
+    """
+    return _calendar_domains_for(principal, CALENDAR_READ_RESOURCE)
+
+
+def authorized_calendar_inventory_domains(principal: str) -> frozenset[str]:
+    """Domains in which unclassified calendar names may be discovered."""
+    return _calendar_domains_for(principal, CALENDAR_INVENTORY_RESOURCE)
 
 
 @contextmanager
@@ -304,7 +328,8 @@ def _authorized_records_locked(
         if grant.connector not in CANONICAL_CONNECTORS:
             continue
         valid_domains = frozenset(grant.domain_ids & CANONICAL_DOMAIN_IDS)
-        valid_resources = grant.resource_ids & CANONICAL_RESOURCES.get(grant.connector, frozenset())
+        event_resources = frozenset({CALENDAR_READ_RESOURCE}) if grant.connector == "calendar_sim" else frozenset()
+        valid_resources = grant.resource_ids & event_resources
         for resource_id in valid_resources:
             if valid_domains:
                 scopes.append(ReadScope(

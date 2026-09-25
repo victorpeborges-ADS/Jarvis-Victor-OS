@@ -4,24 +4,22 @@ Estas tarefas registram os três P2 confirmados na auditoria independente e de n
 
 ## E-P2-1 — Estado do Calendar sem concessão
 
-**Estado:** aberta.  
-**Rota:** `GET /real/calendar-sim/state`.  
-**Observado:** com sessão e sem grant, a resposta é HTTP 200 e `states: []`. No mesmo estado, `GET /real/calendar-sim/calendars` e `POST /real/calendar-sim/sync` respondem 403.  
-**Pedido:** a ausência de concessão de Calendar deve falhar fechada também nesta rota, sem ampliar o que uma concessão permite ver.  
-**Fora de escopo:** conectar Calendar real para “resolver” a rota.
+**Estado:** fechada em `feat/jarvis-g3-missoes-persistentes-p2`.
+**Rota:** `GET /real/calendar-sim/state`.
+**Contrato:** sem sessão, 401. Com sessão e sem grant de leitura `calendar:synthetic-primary`, 403. Com grant e nenhum calendário classificado no escopo, 200 e `states: []` — coleção autorizada vazia, não omissão de erro.
+**Fora de escopo:** conectar Calendar real. OAuth e cloud continuam fechados.
 
 ## E-P2-2 — Metadado de calendário ainda não classificado
 
-**Estado:** aberta.  
-**Rota:** `GET /real/calendar-sim/calendars`.  
-**Observado:** depois de classificar apenas `sim_calendar_a` em `dom_synthetic_a`, o catálogo devolve 8 calendários. Os não classificados aparecem como metadado de escolha. Classificar um domínio fora da concessão continua 403.  
-**Pedido:** antes de qualquer lista de calendários reais, definir se o nome de um calendário não mapeado pode aparecer. No simulador, manter o contrato explícito até essa decisão.  
-**Fora de escopo:** criar cliente Google ou alargar o grant para todos os domínios por padrão.
+**Estado:** fechada em `feat/jarvis-g3-missoes-persistentes-p2`.
+**Descoberta:** `GET /real/calendar-sim/calendars` lista calendário já classificado só no domínio da concessão de leitura. Nomes ainda não classificados aparecem apenas com o recurso separado `calendar:synthetic-inventory`, que não autoriza eventos nem sync.
+**Classificação:** `PUT .../classification` de calendário sem domínio exige leitura do domínio alvo e inventário desse domínio. Calendário de outro domínio continua oculto e a classificação fora da concessão responde 403.
+**Leitura de eventos:** continua no recurso `calendar:synthetic-primary`. Inventário não a substitui.
+**Fora de escopo:** cliente Google e grant amplo por padrão. OAuth e cloud continuam fechados.
 
 ## E-P2-3 — GET autenticado sem Origin
 
-**Estado:** aberta.  
-**Rotas:** leituras `/real` que hoje aceitam ausência de `Origin`, em particular `GET /real/events`.  
-**Observado:** com sessão e grant, a leitura sem `Origin` responde 200. `Origin` externo (`https://evil.example`) responde 403.  
-**Pedido:** decidir, ainda no loopback, se a leitura autenticada exige `Origin` permitido. A decisão não deve abrir a API fora de `127.0.0.1`/`::1`.  
-**Fora de escopo:** hospedagem remota, túnel ou cookie em site público.
+**Estado:** fechada em `feat/jarvis-g3-missoes-persistentes-p2`.
+**Política mínima:** `Origin` não autentica. GET loopback com sessão e grant pode omitir `Origin`, porque clientes locais e algumas navegações não o enviam. `Origin` fora da lista explícita responde 403. Mutação continua exigindo `Origin` permitido e CSRF. `Sec-Fetch-Site: cross-site` responde 403. `Host` não loopback responde 400. O bind segue só em loopback.
+**Residual antes de dados reais:** ausência de `Origin` ainda não distingue um cliente local legítimo de um pedido forjado no mesmo host. Não abrir a API fora de `127.0.0.1`/`::1` com base nesta política.
+**Fora de escopo:** hospedagem remota, túnel ou cookie em site público. OAuth e cloud continuam fechados.
