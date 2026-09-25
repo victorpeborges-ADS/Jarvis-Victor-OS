@@ -5,7 +5,7 @@ import { Dialog } from "@/components/ui/Dialog";
 import { Badge, Card } from "@/components/ui/primitives";
 import type { Mission } from "@/lib/mission-contracts";
 import { cancelMission, createMission, failMissionTask, retryMissionTask } from "@/lib/mission-core";
-import { loadMissions, MISSION_STORAGE_KEY, runAndSaveNextStep, saveMissions } from "@/lib/mission-store";
+import { clearMissionQuarantine, getMissionQuarantine, loadMissions, loadMissionsWithRecovery, MISSION_STORAGE_KEY, runAndSaveNextStep, saveMissions, type QuarantinedMissionRecord } from "@/lib/mission-store";
 
 const DOMAINS = [
   { id: "dom_synthetic_a", label: "Escopo sintético A" },
@@ -25,21 +25,55 @@ export default function MissionsPage() {
   const [ready, setReady] = useState(false);
   const [message, setMessage] = useState("Carregando missões locais sintéticas.");
   const [reviewArtifactId, setReviewArtifactId] = useState<string | null>(null);
+  const [quarantineCount, setQuarantineCount] = useState(0);
+  const [quarantineTruncated, setQuarantineTruncated] = useState(false);
+  const [recoveryError, setRecoveryError] = useState(false);
+  const [pendingQuarantine, setPendingQuarantine] = useState<QuarantinedMissionRecord[]>([]);
   const selected = useMemo(() => missions.find((mission) => mission.id === selectedId) ?? null, [missions, selectedId]);
   const reviewArtifact = selected?.artifacts.find((artifact) => artifact.id === reviewArtifactId) ?? null;
 
   useEffect(() => {
-    const loaded = loadMissions(window.localStorage);
-    setMissions(loaded);
-    setSelectedId(loaded[0]?.id ?? null);
+    const result = loadMissionsWithRecovery(window.localStorage);
+    setMissions(result.missions);
+    setSelectedId(result.missions[0]?.id ?? null);
+    setQuarantineCount(result.quarantinedCount);
+    setQuarantineTruncated(result.quarantineTruncated);
+    setRecoveryError(result.recoveryError);
+    setPendingQuarantine(result.pendingQuarantine);
     setReady(true);
-    setMessage(loaded.length ? "Missões sintéticas locais recuperadas deste navegador." : "Nenhuma missão local. Crie uma simulação para começar.");
+    setMessage(result.quarantinedCount
+      ? `${result.missions.length} missão(ões) válida(s) recuperada(s); ${result.quarantinedCount} registro(s) inválido(s) isolado(s).`
+      : result.missions.length ? "Missões sintéticas locais recuperadas deste navegador." : "Nenhuma missão local. Crie uma simulação para começar.");
   }, []);
 
   function persist(next: Mission[], notice: string) {
+    if (recoveryError) {
+      setMessage("Os registros inválidos continuam preservados. Baixe a cópia, libere espaço local e recarregue antes de editar.");
+      return;
+    }
     saveMissions(window.localStorage, next);
     setMissions(next);
     setMessage(notice);
+  }
+
+  function downloadQuarantine() {
+    const quarantine = getMissionQuarantine(window.localStorage);
+    const blob = new Blob([JSON.stringify({ ...quarantine, records: [...quarantine.records, ...pendingQuarantine] }, null, 2)], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = "jarvis-missoes-quarentena-recuperacao.json";
+    link.click();
+    URL.revokeObjectURL(url);
+  }
+
+  function discardQuarantine() {
+    clearMissionQuarantine(window.localStorage);
+    setQuarantineCount(0);
+    setQuarantineTruncated(false);
+    setRecoveryError(false);
+    setPendingQuarantine([]);
+    setMessage("Cópia isolada descartada. As missões válidas foram mantidas.");
   }
 
   function onCreate(event: React.FormEvent<HTMLFormElement>) {
@@ -91,7 +125,7 @@ export default function MissionsPage() {
     setReviewArtifactId(null);
   }
 
-  const canRun = Boolean(selected && !["done", "cancelled", "failed"].includes(selected.status));
+  const canRun = Boolean(ready && !recoveryError && selected && !["done", "cancelled", "failed"].includes(selected.status));
 
   return (
     <div className="mx-auto max-w-[960px] px-4 py-6 md:px-8 md:py-8">
@@ -108,6 +142,15 @@ export default function MissionsPage() {
         Armazenamento deste navegador · API desconectada · teto de custo 0 · nenhuma escrita externa.
       </div>
 
+      {quarantineCount > 0 && <section role="alert" className="mt-4 rounded-xl border border-orange-300 bg-orange-50 p-4 text-sm text-orange-950" data-testid="mission-quarantine-notice">
+        <p><strong>{quarantineCount} registro(s) local(is) inválido(s) {recoveryError ? "foram detectados; a origem foi preservada" : "foram isolados"}.</strong> Missões válidas foram recuperadas e continuam disponíveis.</p>
+        <p className="mt-1">Baixe a cópia para revisão e recuperação manual.{quarantineTruncated ? " Alguns registros foram limitados pelo teto local de armazenamento." : ""}{recoveryError ? " O navegador não conseguiu salvar a quarentena separada; edição local fica pausada até recuperar espaço e recarregar." : ""}</p>
+        <div className="mt-3 flex flex-wrap gap-2">
+          <button type="button" onClick={downloadQuarantine} className="rounded-lg border border-orange-400 bg-white px-3 py-2 font-medium">Baixar pacote de recuperação</button>
+          {!recoveryError && <button type="button" onClick={discardQuarantine} className="rounded-lg border border-orange-400 bg-white px-3 py-2 font-medium">Descartar cópia isolada</button>}
+        </div>
+      </section>}
+
       <div className="mt-5 grid gap-5 md:grid-cols-[300px_1fr]">
         <section aria-labelledby="missions-list-heading">
           <Card className="p-4">
@@ -119,7 +162,7 @@ export default function MissionsPage() {
               <select id="mission-domain" value={domainId} onChange={(event) => setDomainId(event.target.value)} className="w-full rounded-xl border border-paper-border bg-white px-3 py-2 text-sm text-ink outline-none focus:ring-2 focus:ring-violet-500">
                 {DOMAINS.map((domain) => <option key={domain.id} value={domain.id}>{domain.label}</option>)}
               </select>
-              <button type="submit" disabled={!ready || !title.trim()} className="w-full rounded-full bg-ink px-4 py-2.5 text-sm font-medium text-white hover:bg-action-hover focus:outline-none focus:ring-2 focus:ring-violet-500 disabled:opacity-50">Criar missão</button>
+              <button type="submit" disabled={!ready || recoveryError || !title.trim()} className="w-full rounded-full bg-ink px-4 py-2.5 text-sm font-medium text-white hover:bg-action-hover focus:outline-none focus:ring-2 focus:ring-violet-500 disabled:opacity-50">Criar missão</button>
             </form>
           </Card>
           <div className="mt-4" aria-label="Lista de missões">
@@ -151,8 +194,8 @@ export default function MissionsPage() {
                 <div className="mt-5 flex flex-wrap gap-2">
                   <button type="button" disabled={!canRun} onClick={onRun} className="rounded-full bg-ink px-4 py-2 text-sm font-medium text-white hover:bg-action-hover focus:outline-none focus:ring-2 focus:ring-violet-500 disabled:opacity-40">Executar próxima etapa · simulada</button>
                   <button type="button" disabled={!canRun} onClick={onCancel} className="rounded-full border border-paper-border bg-white px-4 py-2 text-sm font-medium text-ink hover:bg-paper-muted focus:outline-none focus:ring-2 focus:ring-violet-500 disabled:opacity-40">Cancelar</button>
-                  {selected.status === "failed" && <button type="button" onClick={onRetry} className="rounded-full border border-violet-300 bg-violet-50 px-4 py-2 text-sm font-medium text-violet-950 focus:outline-none focus:ring-2 focus:ring-violet-500">Preparar retry local</button>}
-                  {selected.status !== "failed" && selected.status !== "done" && selected.status !== "cancelled" && <button type="button" onClick={onSimulateFailure} className="rounded-full border border-paper-border bg-white px-3 py-2 text-xs text-ink-subtle hover:bg-paper-muted focus:outline-none focus:ring-2 focus:ring-violet-500">Demonstrar falha/retry</button>}
+                  {selected.status === "failed" && <button type="button" disabled={recoveryError} onClick={onRetry} className="rounded-full border border-violet-300 bg-violet-50 px-4 py-2 text-sm font-medium text-violet-950 focus:outline-none focus:ring-2 focus:ring-violet-500 disabled:opacity-40">Preparar retry local</button>}
+                  {selected.status !== "failed" && selected.status !== "done" && selected.status !== "cancelled" && <button type="button" disabled={recoveryError} onClick={onSimulateFailure} className="rounded-full border border-paper-border bg-white px-3 py-2 text-xs text-ink-subtle hover:bg-paper-muted focus:outline-none focus:ring-2 focus:ring-violet-500 disabled:opacity-40">Demonstrar falha/retry</button>}
                 </div>
                 <p className="mt-3 text-xs text-ink-faint" role="status" aria-live="polite">{message}</p>
               </Card>
@@ -219,8 +262,8 @@ export default function MissionsPage() {
           </div>
           <p className="mt-4 text-xs text-ink-faint">Estado da decisão: {reviewArtifact.review_state ?? "não requerido"}</p>
           {reviewArtifact.review_state === "awaiting_approval" && <div className="mt-5 flex flex-wrap gap-2">
-            <button type="button" onClick={() => decideReview("approved_locally")} className="rounded-full bg-ink px-4 py-2 text-sm font-medium text-white focus:outline-none focus:ring-2 focus:ring-violet-500">Aprovar para uso local</button>
-            <button type="button" onClick={() => decideReview("rejected")} className="rounded-full border border-paper-border px-4 py-2 text-sm font-medium text-ink focus:outline-none focus:ring-2 focus:ring-violet-500">Rejeitar rascunho</button>
+            <button type="button" disabled={recoveryError} onClick={() => decideReview("approved_locally")} className="rounded-full bg-ink px-4 py-2 text-sm font-medium text-white focus:outline-none focus:ring-2 focus:ring-violet-500 disabled:opacity-40">Aprovar para uso local</button>
+            <button type="button" disabled={recoveryError} onClick={() => decideReview("rejected")} className="rounded-full border border-paper-border px-4 py-2 text-sm font-medium text-ink focus:outline-none focus:ring-2 focus:ring-violet-500 disabled:opacity-40">Rejeitar rascunho</button>
           </div>}
         </div>}
       </Dialog>

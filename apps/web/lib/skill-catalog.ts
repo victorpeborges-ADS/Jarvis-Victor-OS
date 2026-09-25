@@ -3,9 +3,9 @@ import { buildTaskContext, type ContextBuildOptions, type ContextBuildResult, ty
 
 export const SYNTHETIC_SKILLS: SkillManifest[] = [
   { id: "capture-and-classify", version: "1.0.0", purpose: "Capturar conteúdo sintético e classificar apenas por regra determinística.", inputs: ["text", "domain_id"], outputs: ["knowledge_item"], tool_allowlist: ["read_synthetic", "write_local_draft"], domains: [], side_effects: ["local_draft"], approval: "none", privacy: "synthetic_only", cost_cap: 0, timeout_seconds: 5, retries: 0 },
-  { id: "build-context", version: "1.0.0", purpose: "Montar pacote de contexto após grants, escopo e validade.", inputs: ["sources", "grants", "budget"], outputs: ["context_bundle"], tool_allowlist: ["build_context"], domains: [], side_effects: ["none"], approval: "none", privacy: "synthetic_only", cost_cap: 0, timeout_seconds: 5, retries: 0 },
+  { id: "build-context", version: "1.0.0", purpose: "Minimizar fontes no cliente por escopo, validade e orçamento; não concede acesso.", inputs: ["sources", "client_minimization_policy", "budget"], outputs: ["context_bundle"], tool_allowlist: ["build_context"], domains: [], side_effects: ["none"], approval: "none", privacy: "synthetic_only", cost_cap: 0, timeout_seconds: 5, retries: 0 },
   { id: "draft-evidenced-report", version: "1.0.0", purpose: "Criar um rascunho determinístico com referências de proveniência.", inputs: ["mission", "source_refs"], outputs: ["artifact"], tool_allowlist: ["read_synthetic", "write_local_draft"], domains: [], side_effects: ["local_draft"], approval: "none", privacy: "synthetic_only", cost_cap: 0, timeout_seconds: 5, retries: 0 },
-  { id: "compare-sources", version: "1.0.0", purpose: "Comparar textos sintéticos autorizados por igualdade exata.", inputs: ["authorized_sources"], outputs: ["comparison_artifact"], tool_allowlist: ["compare_sources", "write_local_draft"], domains: [], side_effects: ["local_draft"], approval: "none", privacy: "synthetic_only", cost_cap: 0, timeout_seconds: 5, retries: 0 }
+  { id: "compare-sources", version: "1.0.0", purpose: "Comparar textos sintéticos já minimizados no cliente; não concede acesso.", inputs: ["client_filtered_sources"], outputs: ["comparison_artifact"], tool_allowlist: ["compare_sources", "write_local_draft"], domains: [], side_effects: ["local_draft"], approval: "none", privacy: "synthetic_only", cost_cap: 0, timeout_seconds: 5, retries: 0 }
 ];
 
 export function captureAndClassify(text: string, domainId: string | null, now: string, id: string): KnowledgeItem {
@@ -29,7 +29,8 @@ export function draftEvidencedReport(mission: Mission, sources: SourceRef[], now
   };
 }
 
-export function compareAuthorizedSources(sources: ContextCandidate[], now: string, id: string): Artifact {
+/** Deterministic comparison helper. Callers must supply an already minimized set; this is not authorization. */
+export function compareClientFilteredSources(sources: ContextCandidate[], now: string, id: string): Artifact {
   const same = sources.length < 2 || sources.every((source) => source.content === sources[0].content);
   const sourceRefs = sources.map(({ source_id, uri, observed_at, last_verified_at, valid_until, domain_id }) => ({ source_id, uri: uri ?? null, observed_at, last_verified_at: last_verified_at ?? null, valid_until: valid_until ?? null, domain_id: domain_id ?? null }));
   return {

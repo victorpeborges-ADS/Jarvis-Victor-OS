@@ -76,7 +76,7 @@
         "id": { "type": "string", "pattern": "^context_[a-zA-Z0-9_-]{1,80}$" },
         "task_id": { "type": "string", "pattern": "^task_[a-zA-Z0-9_-]{1,80}$" },
         "included": { "type": "array", "items": { "$ref": "#/$defs/SourceRef" } },
-        "omitted": { "type": "array", "items": { "type": "object", "additionalProperties": false, "required": ["source_id", "reason"], "properties": { "source_id": { "type": "string" }, "reason": { "enum": ["grant_denied", "wrong_domain", "wrong_project", "stale", "expired", "over_budget"] } } } },
+        "omitted": { "type": "array", "items": { "type": "object", "additionalProperties": false, "required": ["source_id", "reason"], "properties": { "source_id": { "type": "string" }, "reason": { "enum": ["not_client_visible", "wrong_domain", "wrong_project", "stale", "expired", "over_budget", "invalid_timestamp", "future_timestamp", "future_verification"] } } } },
         "size_bytes": { "type": "integer", "minimum": 0 },
         "budget_bytes": { "type": "integer", "minimum": 0 },
         "created_at": { "$ref": "#/$defs/Timestamp" }

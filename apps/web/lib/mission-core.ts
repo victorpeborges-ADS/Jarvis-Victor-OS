@@ -1,5 +1,5 @@
 import type { Artifact, Mission, MissionCheckpoint, MissionEvent, MissionTask } from "@/lib/mission-contracts";
-import { buildContextSkill, captureAndClassify, draftEvidencedReport } from "@/lib/skill-catalog";
+import { buildContextSkill, captureAndClassify, compareClientFilteredSources, draftEvidencedReport } from "@/lib/skill-catalog";
 
 export type IdFactory = (prefix: string) => string;
 
@@ -91,12 +91,19 @@ export function runNextStep(mission: Mission, options: { now?: string; idFactory
     const knowledge = captureAndClassify(`Captura fictícia para a missão ${mission.title}.`, mission.domain_id, now, `${mission.id}_capture`);
     created = { id: idFactory("artifact"), kind: "evidence", title: "Captura classificada (simulada)", content: `Tipo: ${knowledge.kind} · estado: ${knowledge.state} · escopo: ${knowledge.domain_id ?? "não classificado"}. ${knowledge.content}`, skill_version: "1.0.0", source_refs: [source], created_at: now };
   } else if (task.id === "task_context") {
-    const built = buildContextSkill([{ ...source, content: `Contexto fictício autorizado para ${mission.title}.` }], {
-      task_id: task.id, mission_id: mission.id, allowed_source_ids: new Set([sourceId]),
-      allowed_domains: new Set(mission.domain_id ? [mission.domain_id] : []), domain_id: mission.domain_id,
+    const candidates = [
+      { ...source, content: `Contexto fictício sintético para ${mission.title}.` },
+      { ...source, source_id: `${sourceId}:reference`, content: `Nota fictícia de referência para ${mission.title}.` }
+    ];
+    const built = buildContextSkill(candidates, {
+      task_id: task.id, mission_id: mission.id,
+      client_visible_source_ids: new Set(candidates.map((candidate) => candidate.source_id)),
+      client_visible_domains: new Set(mission.domain_id ? [mission.domain_id] : []), domain_id: mission.domain_id,
       now, max_bytes: 2048
     });
-    created = { id: idFactory("artifact"), kind: "context_bundle", title: "Pacote de contexto sintético", content: `${built.text || "Nenhuma fonte autorizada foi incluída."}\n\nIncluídos: ${built.bundle.included.length} · omitidos: ${built.bundle.omitted.length} · ${built.bundle.size_bytes}/${built.bundle.budget_bytes} bytes. ${built.bundle.omitted.map((item) => `${item.source_id} (${item.reason})`).join("; ")}`.trim(), skill_version: "1.0.0", source_refs: built.bundle.included, created_at: now };
+    const includedIds = new Set(built.bundle.included.map((ref) => ref.source_id));
+    const compared = compareClientFilteredSources(candidates.filter((candidate) => includedIds.has(candidate.source_id)), now, idFactory("comparison"));
+    created = { id: idFactory("artifact"), kind: "context_bundle", title: "Pacote de contexto sintético", content: `${built.text || "Nenhuma fonte foi incluída na minimização local."}\n\nIncluídos: ${built.bundle.included.length} · omitidos: ${built.bundle.omitted.length} · ${built.bundle.size_bytes}/${built.bundle.budget_bytes} bytes. ${built.bundle.omitted.map((item) => `${item.source_id} (${item.reason})`).join("; ")}\n\nComparação sintética minimizada: ${compared.content}`.trim(), skill_version: "1.0.0", source_refs: built.bundle.included, created_at: now };
   } else if (task.id === "task_report") {
     const refs = mission.artifacts.find((artifact) => artifact.kind === "context_bundle")?.source_refs ?? [source];
     const completedMission = { ...mission, tasks: updatedTasks };
