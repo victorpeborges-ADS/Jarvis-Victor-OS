@@ -28,13 +28,15 @@
 - BLOCKED para uso durável/real — a implementação usa `localStorage`, sem transação multiaba/dispositivos; a política exige autorização e migração próprias antes de usar memória SQLite ou dados reais.
 - DONE — P3/6B: `IntelligenceRouter` determinístico com `FakeProvider`, orçamento zero, fallback sem provider para qualquer classificação que não seja sintética e envelope de handoff manual. Testes verificam determinismo, privacidade e ausência de transmissão.
 - DONE — P3/6C: `FakeWorkflowAdapter` read-only filtra grant antes do domínio e respeita política sintética de interrupção/horário silencioso. Sem n8n, scheduler, webhook ou notificações reais.
-- DONE — P3/6A: ADR documental preliminar compara Cloudflare Workers+D1 e Cloud Run usando documentação oficial atual. Incompatibilidade/portabilidade, benchmark cloud, custo de conta, recuperação e região permanecem não provados; nenhuma plataforma escolhida.
+- PARTIAL/BLOCKED — P3/6A: ADR documental preliminar compara Cloudflare Workers+D1 e Cloud Run usando documentação oficial atual. PoC/benchmark nos adapters de provedores não foi executado; compatibilidade, custo de conta, recuperação e região permanecem não provados. Nenhuma plataforma escolhida.
 - BLOCKED — P2/5C: `apps/desktop/README.md` registra direção de scaffold Tauri 2 e retomada; Rust/Cargo indisponíveis; **NÃO COMPILADO**, `.app` não gerado. Nenhum toolchain foi instalado.
 - BLOCKED — P2/5D: `apps/mobile/README.md` registra direção Capacitor e retomada; Android SDK/Android Studio/Gradle/adb ausentes; **APK NÃO GERADO**. Nenhum toolchain foi instalado.
 - PASS — suíte final: API 146/146; Vitest 53/53; TypeScript, lint e build Next/E2E aprovados. Avisos existentes: depreciação Starlette/httpx e aviso de retirada futura de `next lint`; Node informou depreciação de `module.register()` na execução Playwright.
 - DONE — capturas de página longa agora removem temporariamente a navegação fixa no teste, sem alterar a interface. Após ajuste, cenário de missão/captura passou 1/1 desktop e 1/1 mobile; a suíte completa 32/32 foi executada antes dessa alteração apenas de screenshot.
-- IN PROGRESS — relatório independente da implementação e matriz de auditoria local. Gate E continua `IMPLEMENTADO/TESTADO LOCALMENTE — AUDITORIA INDEPENDENTE PENDENTE`; nenhuma aceitação foi declarada.
-- PRÓXIMA — commitar incremento P3; produzir relatórios finais, matriz, roteiro demo e instruções de retomada. Commits anteriores: runner `b9151af`, correção de passphrase `3ed519e`, capturas `a32277e`, contratos `2612832`, Missões/skills `c01ef73`.
+- DONE — entregáveis matinais: `EXECUTIVE_REPORT.md`, `TEST_MATRIX.md`, `GATE_E_AUDIT_AND_FIXES.md`, `APPROVAL_REQUESTS.md`, `RESUME.md` e `DEMO.md`. Gate E continua `IMPLEMENTADO/TESTADO LOCALMENTE — AUDITORIA INDEPENDENTE PENDENTE`; nenhuma aceitação foi declarada.
+- Não havia segundo agente revisor disponível nesta execução; nenhuma auditoria independente foi simulada pelo implementador.
+- Commits da sprint na branch isolada: runner `b9151af`; passphrase `3ed519e`; capturas E2E `a32277e`; contratos `2612832`; Missões/skills `c01ef73`; router/observadores `56432e6`; ajuste de capturas `08ab532`. A camada final de relatórios será commit documental separado.
+- Próxima ação recomendada: auditor independente read-only; depois resolver catálogo de calendários e concorrência/revogação antes de qualquer dado real. Missões seguem apenas em `localStorage` até decisão e migração autorizada.
 
 ## Evidências provisórias
 
