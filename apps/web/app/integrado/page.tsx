@@ -165,6 +165,9 @@ function GrantControls() {
       ) : (
         <p className="mt-3 text-sm text-ink-subtle">Nenhuma concessão ativa. Conceda leitura no escopo escolhido para consultar o catálogo sintético.</p>
       )}
+      {grants.length > 0 && !grants.some((grant) => grant.resource_ids.includes("calendar:synthetic-primary") && !grant.revoked && Date.parse(grant.expires_at) > Date.now()) && (
+        <p className="mt-3 text-sm text-ink-subtle">Conceda leitura no escopo escolhido para consultar o catálogo sintético. O inventário limitado não substitui essa leitura.</p>
+      )}
       {localError && <p role="alert" className="mt-3 text-sm text-red-800">{localError}</p>}
     </Card>
   );
