@@ -29,6 +29,7 @@ from local_security import router as real_router
 from mission_api import router as mission_router
 from loopback import ALLOWED_ORIGINS, is_allowed_host_header, is_loopback_address
 from memory_store import MemoryStoreError, SQLiteMemoryStore
+from mission_engine import recover_interrupted
 from server_config import LocalServerConfig, validate_local_server_config
 
 demo_router = APIRouter()
@@ -116,6 +117,7 @@ def create_app(config: LocalServerConfig, *, database_path: str | Path | None = 
         # through low-level Python APIs after app construction.
         validate_local_server_config(config)
         store.initialize()
+        recover_interrupted(store)
         yield
 
     app = FastAPI(

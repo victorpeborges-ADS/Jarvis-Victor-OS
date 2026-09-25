@@ -109,6 +109,7 @@ def test_empty_database_migrates_once_uses_wal_and_private_permissions(tmp_path)
             ("0005_calendar_full_sync_reconciliation",),
             ("0006_missions",),
             ("0007_import_idempotency_result",),
+            ("0008_mission_executions",),
         ]
         for table in ("sources", "events", "event_provenance", "entities", "relations", "relation_evidence", "audit_entries", "calendar_sync_states", "calendar_sync_seen_events", "missions", "mission_events", "mission_idempotency", "mission_knowledge"):
             assert connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] == 0
@@ -146,6 +147,7 @@ def test_database_from_previous_migration_version_upgrades_without_replaying_ddl
         ("0005_calendar_full_sync_reconciliation",),
         ("0006_missions",),
         ("0007_import_idempotency_result",),
+        ("0008_mission_executions",),
     ]
     assert "domain_id" in columns
     assert "audit_entries" in tables

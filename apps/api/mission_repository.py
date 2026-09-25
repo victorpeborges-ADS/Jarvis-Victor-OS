@@ -217,6 +217,9 @@ class MissionRepository:
         return {"dataset": "api_synthetic", "items": items, "corrupt": corrupt, "next_cursor": next_cursor}
 
     def transition(self, owner: str, mission_id: str, action: str, expected_revision: int, idempotency_key: str) -> dict:
+        if action in {"run_next", "resume"}:
+            from mission_engine import MissionEngine
+            return MissionEngine(self).run(owner, mission_id, action, expected_revision, idempotency_key)
         body_hash = _sha({"action": action, "mission_id": mission_id, "expected_revision": expected_revision})
         with self.store.transaction() as connection:
             existing = connection.execute(
@@ -270,6 +273,33 @@ class MissionRepository:
                     task["status"] = "cancelled"
                     task["updated_at"] = now
             self._append_event(connection, mission, owner, "mission_cancelled", None, "Missão cancelada no servidor.", now)
+            connection.execute(
+                "UPDATE mission_executions SET phase='interrupted', committed_at=? WHERE mission_id=? AND owner=? AND phase IN ('open', 'interrupted')",
+                (now, mission["id"], owner),
+            )
+        elif action == "fail":
+            if mission["status"] not in {"running", "interrupted", "planned"}:
+                raise MissionRejected("falha não se aplica a este estado")
+            task = next((item for item in mission["tasks"] if item["status"] in {"running", "planned", "blocked"}), None)
+            if task is None:
+                raise MissionRejected("não há etapa para falhar")
+            task["status"] = "failed"
+            task["failure_reason"] = "falha explícita do executor local"
+            task["updated_at"] = now
+            mission["status"] = "failed"
+            self._append_event(connection, mission, owner, "task_failed", task["id"], "Etapa marcada como falha pelo executor.", now)
+        elif action == "retry":
+            if mission["status"] != "failed":
+                raise MissionRejected("retry exige missão falha")
+            task = next((item for item in mission["tasks"] if item["status"] == "failed"), None)
+            if task is None or task["attempt"] >= 3:
+                raise MissionRejected("limite de tentativas")
+            task["attempt"] += 1
+            task["status"] = "planned"
+            task["failure_reason"] = None
+            task["updated_at"] = now
+            mission["status"] = "planned"
+            self._append_event(connection, mission, owner, "task_retried", task["id"], f"Tentativa {task['attempt']} preparada.", now)
         elif action == "run_next":
             if mission["status"] in {"cancelled", "failed", "done"}:
                 raise MissionRejected("execução não se aplica a este estado")
@@ -336,9 +366,11 @@ class MissionRepository:
             "created_at": now,
         }
 
-    def _append_event(self, connection, mission: dict, owner: str, event_type: str, task_id: str | None, message: str, now: str) -> None:
+    def _append_event(self, connection, mission: dict, owner: str, event_type: str, task_id: str | None, message: str, now: str, stable_key: str | None = None) -> None:
         event_id = _token("event")
-        key = f"{mission['id']}:{event_type}:{event_id}"
+        key = stable_key or f"{mission['id']}:{event_type}:{event_id}"
+        if any(item.get("idempotency_key") == key for item in mission["events"]):
+            return
         mission["events"].append({
             "id": event_id,
             "type": event_type,

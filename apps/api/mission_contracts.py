@@ -70,7 +70,7 @@ class Mission(StrictContract):
     id: str = Field(pattern=r"^mission_[A-Za-z0-9_-]{1,80}$")
     title: str = Field(min_length=1, max_length=240)
     description: str = Field(default="", max_length=2000)
-    status: Literal["draft", "planned", "awaiting_approval", "running", "blocked", "done", "cancelled", "failed"]
+    status: Literal["draft", "planned", "awaiting_approval", "running", "blocked", "done", "cancelled", "failed", "interrupted"]
     domain_id: str | None
     tasks: tuple[MissionTask, ...]
     checkpoints: tuple[dict, ...]

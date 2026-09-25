@@ -7,6 +7,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from domain_registry import CANONICAL_DOMAIN_IDS
 from local_security import _session_from, mission_domains
+from mission_engine import available_actions
 from mission_repository import MissionConflict, MissionCorrupt, MissionRejected, MissionRepository
 
 router = APIRouter(prefix="/real/missions", tags=["missions-synthetic"])
@@ -21,7 +22,7 @@ class MissionCreateIn(BaseModel):
 
 class MissionTransitionIn(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    action: str = Field(pattern=r"^(run_next|cancel)$")
+    action: str = Field(pattern=r"^(run_next|resume|fail|retry|cancel)$")
     expected_revision: int = Field(ge=1, le=100000)
     idempotency_key: str = Field(min_length=8, max_length=160)
 
@@ -31,6 +32,13 @@ class MissionImportIn(BaseModel):
     missions: list[dict] = Field(max_length=20)
     idempotency_key: str = Field(min_length=8, max_length=160)
     confirm: bool = False
+
+
+def _public(record: dict) -> dict:
+    if "mission" in record:
+        record = dict(record)
+        record["available_actions"] = available_actions(record["mission"]["status"])
+    return record
 
 
 def _repo(request: Request) -> MissionRepository:
@@ -54,7 +62,7 @@ def create_mission(body: MissionCreateIn, request: Request) -> dict:
         raise HTTPException(status_code=409, detail=exc.detail) from exc
     except MissionRejected as exc:
         raise HTTPException(status_code=422, detail=exc.detail) from exc
-    return {**record, "replayed": replayed}
+    return _public({**record, "replayed": replayed})
 
 
 @router.get("")
@@ -68,7 +76,7 @@ def list_missions(request: Request, domain_id: str | None = None, limit: int = 2
         if not allowed:
             raise HTTPException(status_code=403, detail="concessão de missão ausente")
     page = _repo(request).list_page(session.principal, domain_id, limit, cursor)
-    page["items"] = [item for item in page["items"] if item["mission"]["domain_id"] in allowed]
+    page["items"] = [_public(item) for item in page["items"] if item["mission"]["domain_id"] in allowed]
     page["corrupt"] = [item for item in page.get("corrupt", []) if item.get("domain_id") in allowed]
     return page
 
@@ -83,7 +91,7 @@ def read_mission(mission_id: str, request: Request) -> dict:
     if record is None:
         raise HTTPException(status_code=404, detail="registro ausente")
     _require(session.principal, "mission:read", record["mission"]["domain_id"])
-    return record
+    return _public(record)
 
 
 @router.post("/{mission_id}/transition")
@@ -94,9 +102,9 @@ def transition_mission(mission_id: str, body: MissionTransitionIn, request: Requ
         raise HTTPException(status_code=404, detail="registro ausente")
     _require(session.principal, "mission:write", current["mission"]["domain_id"])
     try:
-        return _repo(request).transition(
+        return _public(_repo(request).transition(
             session.principal, mission_id, body.action, body.expected_revision, body.idempotency_key
-        )
+        ))
     except MissionConflict as exc:
         raise HTTPException(status_code=409, detail=exc.detail) from exc
     except MissionRejected as exc:
