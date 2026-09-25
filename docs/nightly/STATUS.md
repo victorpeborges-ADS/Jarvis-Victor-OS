@@ -21,8 +21,10 @@
 - DONE — regressão adversarial cruza dois tokens CSRF reais e percorre criação/revogação de grant, classificação, sync e logout com token ausente, inválido, de outra sessão e Origin externa; todos recusados sem alteração do grant.
 - DONE — suíte API após correções: 140/140; recorte dos três testes novos/afetados: 3/3. Avisos conhecidos do TestClient/httpx permanecem.
 - DONE — E2E repetido depois da correção Unicode e da mudança no destino de capturas: 28/28 passou em Chromium desktop/mobile; as evidências foram gravadas em `docs/nightly/captures/`, sem alterar capturas versionadas fora desse diretório.
-- IN PROGRESS — fechar relatório/matriz do Gate E com escopo e lacunas de auditoria independentes; Gate E permanece sem aceite.
-- PRÓXIMA — concluir relatórios P0, então avançar para contratos JSON Schema e core sintético de Missões. O commit de isolamento do runner já está em `b9151af`; a correção de autenticação está em `3ed519e`.
+- DONE — P1/4A criou contratos JSON Schema v1 para Missão, tarefas, checkpoints, artefatos, contexto, conhecimento, skills, capabilities, grants de dispositivo, envelope de sync e política de notificações; tipos TS, validação compartilhada por JSON Schema em Python/Ajv, modelo Pydantic da Missão, exemplos sintéticos e ADR 001.
+- PASS — testes completos API 146/146, Vitest 36/36, TypeScript, lint e build Next. Exemplos compartilhados aprovados nos dois runtimes; rejeições adversariais cobrem status inválido, orçamento acima de zero, campo desconhecido e timestamp sem fuso.
+- IN PROGRESS — fechar relatório/matriz do Gate E com escopo e lacunas de auditoria independentes; Gate E permanece sem aceite. O segundo agente revisor não estava disponível no início da sessão.
+- PRÓXIMA — concluir relatórios P0 e iniciar core persistente isolado da Central de Missões. O commit de isolamento do runner está em `a32277e`; correção de autenticação em `3ed519e`; runner em `b9151af`.
 
 ## Evidências provisórias
 

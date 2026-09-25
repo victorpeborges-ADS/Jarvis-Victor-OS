@@ -1,0 +1,172 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://jarvis.local/contracts/jarvis.missions.v1.schema.json",
+  "title": "JARVIS Mission and Context contracts v1",
+  "$defs": {
+    "Timestamp": { "type": "string", "format": "date-time", "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(?:\\.\\d+)?(?:Z|[+-]\\d{2}:\\d{2})$" },
+    "DomainId": { "type": "string", "pattern": "^dom_[a-z0-9_]{1,64}$" },
+    "SourceRef": {
+      "type": "object", "additionalProperties": false,
+      "required": ["source_id", "observed_at"],
+      "properties": {
+        "source_id": { "type": "string", "minLength": 1, "maxLength": 160 },
+        "uri": { "type": ["string", "null"], "maxLength": 1024 },
+        "observed_at": { "$ref": "#/$defs/Timestamp" },
+        "last_verified_at": { "anyOf": [{ "$ref": "#/$defs/Timestamp" }, { "type": "null" }] },
+        "valid_until": { "anyOf": [{ "$ref": "#/$defs/Timestamp" }, { "type": "null" }] },
+        "domain_id": { "anyOf": [{ "$ref": "#/$defs/DomainId" }, { "type": "null" }] }
+      }
+    },
+    "MissionTask": {
+      "type": "object", "additionalProperties": false,
+      "required": ["id", "title", "status", "depends_on", "attempt", "idempotency_key", "updated_at"],
+      "properties": {
+        "id": { "type": "string", "pattern": "^task_[a-zA-Z0-9_-]{1,80}$" },
+        "title": { "type": "string", "minLength": 1, "maxLength": 240 },
+        "status": { "enum": ["draft", "planned", "awaiting_approval", "running", "blocked", "done", "cancelled", "failed"] },
+        "depends_on": { "type": "array", "items": { "type": "string", "pattern": "^task_[a-zA-Z0-9_-]{1,80}$" }, "uniqueItems": true },
+        "attempt": { "type": "integer", "minimum": 1 },
+        "idempotency_key": { "type": "string", "minLength": 8, "maxLength": 160 },
+        "updated_at": { "$ref": "#/$defs/Timestamp" },
+        "failure_reason": { "type": ["string", "null"], "maxLength": 500 }
+      }
+    },
+    "MissionCheckpoint": {
+      "type": "object", "additionalProperties": false,
+      "required": ["id", "task_id", "state", "created_at"],
+      "properties": {
+        "id": { "type": "string", "pattern": "^checkpoint_[a-zA-Z0-9_-]{1,80}$" },
+        "task_id": { "type": ["string", "null"], "pattern": "^task_[a-zA-Z0-9_-]{1,80}$" },
+        "state": { "type": "string", "enum": ["created", "started", "completed", "failed", "cancelled"] },
+        "note": { "type": "string", "maxLength": 1000 },
+        "created_at": { "$ref": "#/$defs/Timestamp" }
+      }
+    },
+    "Artifact": {
+      "type": "object", "additionalProperties": false,
+      "required": ["id", "kind", "title", "content", "source_refs", "created_at"],
+      "properties": {
+        "id": { "type": "string", "pattern": "^artifact_[a-zA-Z0-9_-]{1,80}$" },
+        "kind": { "enum": ["draft", "report", "context_bundle", "evidence"] },
+        "title": { "type": "string", "minLength": 1, "maxLength": 240 },
+        "content": { "type": "string", "maxLength": 50000 },
+        "source_refs": { "type": "array", "items": { "$ref": "#/$defs/SourceRef" } },
+        "created_at": { "$ref": "#/$defs/Timestamp" }
+      }
+    },
+    "ContextBundle": {
+      "type": "object", "additionalProperties": false,
+      "required": ["id", "task_id", "included", "omitted", "size_bytes", "budget_bytes", "created_at"],
+      "properties": {
+        "id": { "type": "string", "pattern": "^context_[a-zA-Z0-9_-]{1,80}$" },
+        "task_id": { "type": "string", "pattern": "^task_[a-zA-Z0-9_-]{1,80}$" },
+        "included": { "type": "array", "items": { "$ref": "#/$defs/SourceRef" } },
+        "omitted": { "type": "array", "items": { "type": "object", "additionalProperties": false, "required": ["source_id", "reason"], "properties": { "source_id": { "type": "string" }, "reason": { "enum": ["grant_denied", "wrong_domain", "stale", "expired", "over_budget"] } } } },
+        "size_bytes": { "type": "integer", "minimum": 0 },
+        "budget_bytes": { "type": "integer", "minimum": 0 },
+        "created_at": { "$ref": "#/$defs/Timestamp" }
+      }
+    },
+    "KnowledgeItem": {
+      "type": "object", "additionalProperties": false,
+      "required": ["id", "kind", "state", "content", "source_refs", "created_at", "updated_at"],
+      "properties": {
+        "id": { "type": "string", "pattern": "^knowledge_[a-zA-Z0-9_-]{1,80}$" },
+        "kind": { "enum": ["original", "imported", "human_note", "ai_derived", "approved_decision", "reference"] },
+        "state": { "enum": ["captured", "staged", "reviewed", "approved", "rejected", "stale", "expired", "archived", "deleted"] },
+        "content": { "type": "string", "maxLength": 50000 },
+        "domain_id": { "anyOf": [{ "$ref": "#/$defs/DomainId" }, { "type": "null" }] },
+        "source_refs": { "type": "array", "items": { "$ref": "#/$defs/SourceRef" } },
+        "skill_version": { "type": ["string", "null"], "maxLength": 80 },
+        "model_version": { "type": ["string", "null"], "maxLength": 80 },
+        "author": { "type": "string", "minLength": 1, "maxLength": 120 },
+        "reviewer": { "type": ["string", "null"], "maxLength": 120 },
+        "valid_until": { "anyOf": [{ "$ref": "#/$defs/Timestamp" }, { "type": "null" }] },
+        "created_at": { "$ref": "#/$defs/Timestamp" },
+        "updated_at": { "$ref": "#/$defs/Timestamp" }
+      }
+    },
+    "SkillManifest": {
+      "type": "object", "additionalProperties": false,
+      "required": ["id", "version", "purpose", "inputs", "outputs", "tool_allowlist", "domains", "side_effects", "approval", "privacy", "cost_cap", "timeout_seconds", "retries"],
+      "properties": {
+        "id": { "type": "string", "pattern": "^[a-z][a-z0-9-]{1,63}$" },
+        "version": { "type": "string", "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$" },
+        "purpose": { "type": "string", "minLength": 1, "maxLength": 500 },
+        "inputs": { "type": "array", "items": { "type": "string" }, "uniqueItems": true },
+        "outputs": { "type": "array", "items": { "type": "string" }, "uniqueItems": true },
+        "tool_allowlist": { "type": "array", "items": { "enum": ["read_synthetic", "write_local_draft", "build_context", "compare_sources"] }, "uniqueItems": true },
+        "domains": { "type": "array", "items": { "$ref": "#/$defs/DomainId" }, "uniqueItems": true },
+        "side_effects": { "type": "array", "items": { "enum": ["none", "local_draft"] }, "uniqueItems": true },
+        "approval": { "enum": ["none", "human_before_run", "human_before_publish"] },
+        "privacy": { "enum": ["synthetic_only", "local_private"] },
+        "cost_cap": { "const": 0 },
+        "timeout_seconds": { "type": "integer", "minimum": 1, "maximum": 120 },
+        "retries": { "type": "integer", "minimum": 0, "maximum": 3 }
+      }
+    },
+    "ProviderCapabilities": {
+      "type": "object", "additionalProperties": false,
+      "required": ["provider_id", "capabilities", "enabled", "privacy", "cost_cap"],
+      "properties": {
+        "provider_id": { "type": "string", "pattern": "^[a-z][a-z0-9_-]{1,63}$" },
+        "capabilities": { "type": "array", "items": { "enum": ["summarize", "classify", "draft"] }, "uniqueItems": true },
+        "enabled": { "type": "boolean" },
+        "privacy": { "enum": ["synthetic_only", "local_private", "external"] },
+        "cost_cap": { "const": 0 }
+      }
+    },
+    "DeviceGrant": {
+      "type": "object", "additionalProperties": false,
+      "required": ["id", "principal", "device_id", "domains", "permissions", "expires_at", "revoked"],
+      "properties": {
+        "id": { "type": "string", "pattern": "^devicegrant_[a-zA-Z0-9_-]{1,80}$" },
+        "principal": { "type": "string", "minLength": 1, "maxLength": 120 },
+        "device_id": { "type": "string", "minLength": 1, "maxLength": 160 },
+        "domains": { "type": "array", "items": { "$ref": "#/$defs/DomainId" }, "uniqueItems": true },
+        "permissions": { "type": "array", "items": { "enum": ["read", "write_local_draft"] }, "uniqueItems": true },
+        "expires_at": { "$ref": "#/$defs/Timestamp" },
+        "revoked": { "type": "boolean" }
+      }
+    },
+    "SyncEnvelope": {
+      "type": "object", "additionalProperties": false,
+      "required": ["version", "id", "generated_at", "cursor", "items"],
+      "properties": {
+        "version": { "const": 1 },
+        "id": { "type": "string", "pattern": "^sync_[a-zA-Z0-9_-]{1,80}$" },
+        "generated_at": { "$ref": "#/$defs/Timestamp" },
+        "cursor": { "type": ["string", "null"], "maxLength": 512 },
+        "items": { "type": "array", "items": { "type": "object", "required": ["id", "kind"], "properties": { "id": { "type": "string" }, "kind": { "enum": ["mission", "knowledge", "artifact"] }, "payload": { "type": "object" } }, "additionalProperties": false } }
+      }
+    },
+    "NotificationPolicy": {
+      "type": "object", "additionalProperties": false,
+      "required": ["enabled", "channels", "interruptions", "quiet_hours"],
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "channels": { "type": "array", "items": { "const": "in_app" }, "uniqueItems": true },
+        "interruptions": { "enum": ["never", "critical_only", "all"] },
+        "quiet_hours": { "type": ["object", "null"], "additionalProperties": false, "required": ["start", "end", "timezone"], "properties": { "start": { "type": "string", "pattern": "^([01][0-9]|2[0-3]):[0-5][0-9]$" }, "end": { "type": "string", "pattern": "^([01][0-9]|2[0-3]):[0-5][0-9]$" }, "timezone": { "type": "string", "minLength": 1, "maxLength": 64 } } }
+      }
+    },
+    "Mission": {
+      "type": "object", "additionalProperties": false,
+      "required": ["schema_version", "id", "title", "status", "domain_id", "tasks", "checkpoints", "artifacts", "budget", "created_at", "updated_at"],
+      "properties": {
+        "schema_version": { "const": 1 },
+        "id": { "type": "string", "pattern": "^mission_[a-zA-Z0-9_-]{1,80}$" },
+        "title": { "type": "string", "minLength": 1, "maxLength": 240 },
+        "description": { "type": "string", "maxLength": 2000 },
+        "status": { "enum": ["draft", "planned", "awaiting_approval", "running", "blocked", "done", "cancelled", "failed"] },
+        "domain_id": { "anyOf": [{ "$ref": "#/$defs/DomainId" }, { "type": "null" }] },
+        "tasks": { "type": "array", "items": { "$ref": "#/$defs/MissionTask" } },
+        "checkpoints": { "type": "array", "items": { "$ref": "#/$defs/MissionCheckpoint" } },
+        "artifacts": { "type": "array", "items": { "$ref": "#/$defs/Artifact" } },
+        "budget": { "type": "object", "additionalProperties": false, "required": ["cap", "spent"], "properties": { "cap": { "const": 0 }, "spent": { "const": 0 } } },
+        "created_at": { "$ref": "#/$defs/Timestamp" },
+        "updated_at": { "$ref": "#/$defs/Timestamp" }
+      }
+    }
+  }
+}
