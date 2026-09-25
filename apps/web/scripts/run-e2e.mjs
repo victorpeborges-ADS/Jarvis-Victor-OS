@@ -1,5 +1,5 @@
 import { spawn, spawnSync } from "node:child_process";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import net from "node:net";
 import { tmpdir } from "node:os";
 import { dirname, resolve } from "node:path";
@@ -9,6 +9,7 @@ const webDir = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const apiDir = resolve(webDir, "../api");
 const passphrase = "synthetic-e2e-only-passphrase-2026";
 const webOrigin = process.env.JARVIS_E2E_WEB_ORIGIN ?? "http://127.0.0.1:3000";
+const screenshotDir = resolve(webDir, "../../docs/nightly/captures");
 
 function requireLocalOrigin(value, expectedPort, label) {
   let url;
@@ -141,11 +142,13 @@ try {
   web.stdout.on("data", collectWebOutput);
   web.stderr.on("data", collectWebOutput);
   await waitForWeb(web, () => webOutput);
+  mkdirSync(screenshotDir, { recursive: true });
 
   const playwrightEnv = {
     ...apiEnv,
     JARVIS_E2E_WEB_ORIGIN: checkedWebOrigin,
     JARVIS_E2E_API_ORIGIN: apiOrigin,
+    JARVIS_E2E_SCREENSHOT_DIR: screenshotDir,
     JARVIS_E2E_DATABASE_PATH: databasePath,
     JARVIS_E2E_PASSPHRASE: passphrase
   };

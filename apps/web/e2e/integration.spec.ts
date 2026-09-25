@@ -105,7 +105,7 @@ test("API local no navegador: PUT/CORS, sync, proveniência, estados, modos e re
   expect(apiCookie?.secure).toBe(false); // loopback HTTP local
   expect(await page.evaluate(() => localStorage.length)).toBe(0);
 
-  const screenshots = resolve(process.cwd(), "../../docs/screenshots");
+  const screenshots = process.env.JARVIS_E2E_SCREENSHOT_DIR ?? resolve(process.cwd(), "../../docs/screenshots");
   mkdirSync(screenshots, { recursive: true });
   await page.getByTestId("local-event-card").first().evaluate((card) => {
     document.documentElement.style.scrollBehavior = "auto";

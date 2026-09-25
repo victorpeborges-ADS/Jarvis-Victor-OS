@@ -6,7 +6,7 @@
 - SHA-base verificado: `e648e92467396ce67b75019858fbcd0ee5557042` (`feat/gate2.0-e-integracao-web-api`).
 - Escopo: auditoria e correções Gate E sintético; avançar pelos contratos e módulos locais/sintéticos elegíveis; sem dados reais, serviços externos, custo, deploy, merge, tag ou push.
 - Estado inicial: Git limpo no worktree; HEAD corresponde ao branch compartilhado antes da criação da branch exclusiva. Tags locais observadas: B, C.1, C.2 e D.
-- Inventário de ambiente: Node v26.7.0, npm 11.19.0, Python 3.14.3, uv 0.12.13; `rustc` indisponível no PATH. Verificar versão Python/uv do projeto e ferramentas mobile antes de qualquer scaffold.
+- Inventário de ambiente: Node v26.7.0, npm 11.19.0, uv 0.12.13; `rustc`, Cargo, Gradle e adb indisponíveis no PATH. `uv sync --locked --python 3.12` instalou o runtime fixado pelo projeto; a chamada global `uv run` a partir da raiz usa Python 3.14.3 e não foi usada para executar a API.
 
 ## Andamento
 
@@ -20,8 +20,9 @@
 - DONE — a comparação de passphrase Unicode foi reproduzida (frase correta com acentos resultava em HTTP 500) e corrigida comparando bytes UTF-8 com `hmac.compare_digest`; entrada JSON com surrogate inválido falha sem erro interno nem reflexão.
 - DONE — regressão adversarial cruza dois tokens CSRF reais e percorre criação/revogação de grant, classificação, sync e logout com token ausente, inválido, de outra sessão e Origin externa; todos recusados sem alteração do grant.
 - DONE — suíte API após correções: 140/140; recorte dos três testes novos/afetados: 3/3. Avisos conhecidos do TestClient/httpx permanecem.
-- IN PROGRESS — repetir E2E após correção da sessão e fechar a matriz Gate E; depois iniciar contratos/Core de Missões.
-- Próxima ação — terminar a matriz de isolamento/rotas e executar 28 E2E em IPv6 loopback, gravando imagens apenas em `docs/nightly/captures/`.
+- DONE — E2E repetido depois da correção Unicode e da mudança no destino de capturas: 28/28 passou em Chromium desktop/mobile; as evidências foram gravadas em `docs/nightly/captures/`, sem alterar capturas versionadas fora desse diretório.
+- IN PROGRESS — fechar relatório/matriz do Gate E com escopo e lacunas de auditoria independentes; Gate E permanece sem aceite.
+- PRÓXIMA — concluir relatórios P0, então avançar para contratos JSON Schema e core sintético de Missões. O commit de isolamento do runner já está em `b9151af`; a correção de autenticação está em `3ed519e`.
 
 ## Evidências provisórias
 

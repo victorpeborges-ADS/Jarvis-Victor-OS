@@ -1,7 +1,7 @@
 import { expect, test } from "@playwright/test";
 import path from "path";
 
-const shots = path.resolve(__dirname, "../../../docs/screenshots/a11y");
+const shots = process.env.JARVIS_E2E_SCREENSHOT_DIR ?? path.resolve(__dirname, "../../../docs/screenshots/a11y");
 
 function contrast(foreground: string, background: string) {
   const parse = (value: string) => value.match(/\d+/g)?.slice(0, 3).map(Number) ?? [0, 0, 0];
