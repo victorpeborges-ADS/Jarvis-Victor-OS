@@ -5,6 +5,7 @@ import { Dialog } from "@/components/ui/Dialog";
 import { Badge, Card } from "@/components/ui/primitives";
 import type { Mission } from "@/lib/mission-contracts";
 import { cancelMission, createMission, failMissionTask, retryMissionTask } from "@/lib/mission-core";
+import { MissionApiPanel } from "@/components/missions/MissionApiPanel";
 import { clearMissionQuarantine, getMissionQuarantine, loadMissions, loadMissionsWithRecovery, MISSION_STORAGE_KEY, runAndSaveNextStep, saveMissions, type QuarantinedMissionRecord } from "@/lib/mission-store";
 
 const DOMAINS = [
@@ -129,6 +130,7 @@ export default function MissionsPage() {
 
   return (
     <div className="mx-auto max-w-[960px] px-4 py-6 md:px-8 md:py-8">
+      <MissionApiPanel />
       <div className="flex flex-wrap items-start justify-between gap-3">
         <div>
           <div className="text-xs font-semibold tracking-widest text-ink-faint">CENTRAL LOCAL</div>
