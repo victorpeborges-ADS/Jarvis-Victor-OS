@@ -1,4 +1,6 @@
-# JARVIS Desktop — scaffold Tauri 2 + React/Vite
+# JARVIS Desktop — scaffold experimental Tauri 2 + React/Vite
+
+O aceite formal do Gate 2.0-E marca este diretório como experimental. O bundle web pode ser compilado. O executável Tauri e o `.app` não foram aceitos e não devem ser tratados como funcionais.
 
 **Frontend scaffold compilado para web. Binário nativo NÃO COMPILADO; `.app` NÃO GERADO.** `rustc` e `cargo` não estavam instalados/disponíveis no PATH e não foram instalados nesta sprint.
 

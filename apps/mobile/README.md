@@ -1,4 +1,6 @@
-# JARVIS Mobile — scaffold Capacitor + React/Vite
+# JARVIS Mobile — scaffold experimental Capacitor + React/Vite
+
+O aceite formal do Gate 2.0-E marca este diretório como experimental. O shell web e os testes de browser podem ser executados. O APK Android não foi aceito e não deve ser tratado como funcional.
 
 **Shell React/Vite compilado para web e projeto Android Capacitor gerado/sincronizado. APK NÃO COMPILADO ou instalado.** Android Studio/SDK, Gradle e `adb` não estavam disponíveis; não foram instalados nesta sprint.
 
