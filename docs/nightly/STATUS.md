@@ -35,7 +35,7 @@
 - DONE — capturas de página longa agora removem temporariamente a navegação fixa no teste, sem alterar a interface. Após ajuste, cenário de missão/captura passou 1/1 desktop e 1/1 mobile; a suíte completa 32/32 foi executada antes dessa alteração apenas de screenshot.
 - DONE — entregáveis matinais: `EXECUTIVE_REPORT.md`, `TEST_MATRIX.md`, `GATE_E_AUDIT_AND_FIXES.md`, `APPROVAL_REQUESTS.md`, `RESUME.md` e `DEMO.md`. Gate E continua `IMPLEMENTADO/TESTADO LOCALMENTE — AUDITORIA INDEPENDENTE PENDENTE`; nenhuma aceitação foi declarada.
 - Não havia segundo agente revisor disponível nesta execução; nenhuma auditoria independente foi simulada pelo implementador.
-- Commits da sprint na branch isolada: runner `b9151af`; passphrase `3ed519e`; capturas E2E `a32277e`; contratos `2612832`; Missões/skills `c01ef73`; router/observadores `56432e6`; ajuste de capturas `08ab532`. A camada final de relatórios será commit documental separado.
+- Commits da sprint na branch isolada: runner `b9151af`; passphrase `3ed519e`; capturas E2E `a32277e`; contratos `2612832`; Missões/skills `c01ef73`; router/observadores `56432e6`; ajuste de capturas `08ab532`; relatórios matinais `cb4f261`.
 - Próxima ação recomendada: auditor independente read-only; depois resolver catálogo de calendários e concorrência/revogação antes de qualquer dado real. Missões seguem apenas em `localStorage` até decisão e migração autorizada.
 
 ## Evidências provisórias
