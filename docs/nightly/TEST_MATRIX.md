@@ -1,5 +1,7 @@
 # Matriz de testes — sprint JARVIS
 
+> **Histórico:** os resultados abaixo pertencem ao snapshot `fbaca454`. A matriz atualizada da branch candidata pós-auditoria está em [STABILIZATION_REPORT.md](STABILIZATION_REPORT.md); números antigos são preservados como baseline histórico.
+
 ## Ambiente
 
 - macOS Darwin, Node `v26.7.0`, npm `11.19.0`, uv `0.12.13`, Python do projeto `3.12.14`, pytest `9.0.3`, Next `15.5.26`, Vitest `5.0.1`.
@@ -43,3 +45,21 @@
 - Migração com rollback, DB/schema/índice inválido, colisão de IDs e restauração backup sem plaintext: `apps/api/test_memory_store.py:97-225,401-435,555-605`; `apps/api/test_backup_recovery.py:87-141,246-264`.
 - Revogação durante Calendar sync antes do commit, após commit/antes da resposta e durante reconciliação paginada; stale 24 h: `apps/api/test_calendar_simulator.py:317-331,430-486,489-575,679-733`.
 - Missão: zero chamadas `/real/`, persistência por reload, evidências, revisão local, retry e cancelamento: `apps/web/e2e/missions.spec.ts:7-64`.
+
+## Reteste pós-auditoria — branch candidata de estabilização
+
+Este adendo registra resultados da worktree `feat/jarvis-nightly-stabilization-2026-09-25`; as linhas acima são o histórico da sprint Nightly no commit auditado.
+
+| Comando | Resultado final | Observações |
+|---|---|---|
+| `npm ci` em `apps/web`, `apps/desktop`, `apps/mobile`; `uv sync --locked --python 3.12` em `apps/api` | **PASS** | Instalações limpas usando os lockfiles locais. |
+| `rtk uv run --locked pytest` (`apps/api`) | **PASS — 149/149** | Dois avisos de depreciação Starlette/httpx e cookies por requisição do TestClient. |
+| `rtk npm test`, `rtk npm run typecheck`, `rtk npm run lint`, `rtk npm run build` (`apps/web`) | **PASS — 63 testes** | TypeScript, ESLint e Next build passaram. `next lint` anuncia migração futura. |
+| `rtk env JARVIS_E2E_WEB_ORIGIN='http://[::1]:3000' JARVIS_E2E_API_ORIGIN='http://[::1]:8000' JARVIS_E2E_SCREENSHOT_DIR='/tmp/jarvis-nightly-stabilization-captures' npm run e2e` | **PASS — 36/36** | Chromium, 18 cenários desktop e 18 mobile; banco SQLite temporário sintético. |
+| `rtk npm test`, `rtk npm run lint`, `rtk npm run build`, `rtk npm run e2e` (`apps/mobile`) | **PASS — 2 unitários + 4 E2E** | A shell browser desktop/mobile foi coberta; APK não foi compilado. |
+| `rtk npm run build` (`apps/desktop`) | **PASS** | Frontend Vite/TypeScript; binário Tauri não compilado. |
+| `rtk git diff --check` | **PASS** | Sem erros de whitespace na árvore candidata. |
+
+As probes novas cobrem corrida de porta com servidor falso que responde `200 /health` sem prova HMAC, relógio cliente no futuro, timestamp/validade inválidos, falha e limite de gravação da quarentena, grants do catálogo e leitura/revogação concorrentes. Uma primeira execução intermediária de Vitest encontrou contagem duplicada e expectativa antiga de formato; foram corrigidas e a execução final ficou verde. Uma tentativa E2E também expôs uma corrida real de cancelamento da busca do catálogo na UI; a correção está incluída e a suíte completa final passou. Nenhum desses resultados intermediários foi classificado como falso positivo.
+
+Limites: sem listener público, DNS rebinding físico, dados/conectores reais, processos múltiplos, compilação Rust/Tauri ou APK/Gradle.

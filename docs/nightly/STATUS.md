@@ -1,5 +1,7 @@
 # Sprint autônoma JARVIS — STATUS
 
+> **Adendo pós-auditoria:** o snapshot da sprint abaixo terminou em `fbaca454`. As correções posteriores estão na branch isolada `feat/jarvis-nightly-stabilization-2026-09-25`; veja [STABILIZATION_REPORT.md](STABILIZATION_REPORT.md) para evidências, testes atualizados, bloqueios e handoff. Gate E continua sem aceite independente.
+
 - Início: 2026-09-25 04:23 UTC (2026-09-25 01:23 BRT).
 - Worktree: `/Users/vic/.codex/worktrees/jarvis-autonomous-sprint-2026-09-25/Jarvis-Victor-OS`.
 - Branch exclusiva: `feat/jarvis-nightly-2026-09-25-042315`.
@@ -45,4 +47,11 @@
 - Primeira tentativa E2E na configuração herdada: interrompida após comprovar que a porta IPv4 3000 pertencia a outro workspace; os resultados dessa tentativa não são aceitação de teste. Somente os processos iniciados por esta sessão foram encerrados.
 - Tentativa isolada nas portas 39941/49941: 24 testes DEMO/desktop/mobile passaram; 4 testes de integração falharam no login porque a política canônica rejeita corretamente origens fora das portas 3000/8000. O teste subsequente IPv6, dentro do contrato existente, passou 28/28.
 - A API não foi aberta no banco padrão. O E2E criou e removeu seu banco SQLite sintético temporário.
+
+## Atualização de estabilização — worktree candidata
+
+- A branch `feat/jarvis-nightly-stabilization-2026-09-25` deriva do commit auditado `fbaca45446f31258e7a121b3a49284516fcc8243` em worktree independente. O checkout da sprint original permaneceu intacto.
+- Corrigidos os bloqueadores reproduzidos para uma nova revisão: handshake HMAC de posse da API no runner E2E; validação de timestamp/contexto; quarentena completa de Missões inválidas com recuperação; catálogo Calendar limitado por grant; leitura e revogação linearizadas no mesmo processo; permissão Tauri incoerente removida; comparação de fontes integrada apenas após minimização local.
+- Reteste final: API 149/149; web Vitest 63/63, typecheck, lint e build; browser E2E 36/36 desktop/mobile; mobile unit 2/2, E2E 4/4, lint e build; desktop build. Detalhes no [STABILIZATION_REPORT.md](STABILIZATION_REPORT.md) e adendo da [TEST_MATRIX.md](TEST_MATRIX.md).
+- Parecer das correções locais: PASS sintético. Parecer de encerramento do Gate E: BLOCKED até auditoria independente do commit final. Dados reais e múltiplos processos continuam bloqueados; binários Tauri/APK não foram gerados.
 - Probe da passphrase Unicode antes da correção: HTTP 500 para frase configurada/fornecida com `é`; após correção, 201 para a frase correta e 422 genérico para uma sequência Unicode inválida.

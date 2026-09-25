@@ -1,6 +1,16 @@
 # Relatório executivo — sprint autônoma JARVIS
 
-**Estado:** trabalho local/sintético concluído nesta branch; Gate E continua sem aceite independente.
+**Estado deste relatório:** snapshot da sprint noturna original em `fbaca454`. A estabilização pós-auditoria está registrada em [STABILIZATION_REPORT.md](STABILIZATION_REPORT.md); os resultados abaixo preservam a fotografia histórica e não substituem a matriz da branch candidata.
+
+## ADENDO — estabilização pós-auditoria
+
+- Branch candidata isolada: `feat/jarvis-nightly-stabilization-2026-09-25`, derivada de `fbaca45446f31258e7a121b3a49284516fcc8243`; worktree separada da branch noturna e do checkout original.
+- Corrigidos o erro TypeScript no teste de Missões e o handshake de readiness do runner. O runner agora valida a posse do processo filho por prova HMAC de desafio com segredo aleatório por execução; um teste com servidor falso cobre a janela de corrida entre pré-voo e spawn.
+- O context-builder rejeita metadados inválidos/futuros e conteúdo vencido, e explicita que filtros do navegador só minimizam dados. A autorização de consultas continua no servidor.
+- Missões recuperadas do `localStorage` passam pelo schema completo e referências internas; registros inválidos ficam isolados, missões válidas são preservadas, e a UI oferece pacote local de recuperação.
+- Leituras de eventos e revogação compartilham lock de linearização; catálogo de calendários exige grant e esconde classificações fora do escopo. A semântica e o limite de processo único estão em ADR 005.
+- O acesso `opener` foi removido da capability Tauri. Skills, call sites, helpers e scaffolds foram reclassificados na matriz pós-auditoria.
+- Parecer do Gate E permanece **pendente de auditoria independente**; esta branch é candidata e não é aceite formal nem prontidão para dados reais.
 
 ## BASELINE E ISOLAMENTO
 
@@ -74,3 +84,9 @@ Todos estão apenas na branch noturna; não houve push, merge, tag ou alteraçã
 1. Solicitar auditoria independente read-only do Gate E na branch/commit preparado; corrigir achados antes de encerrar formalmente o gate.
 2. Revisar e filtrar o catálogo de calendários, decidir contrato de concorrência/revogação e só então propor teste/migração sintética das Missões para armazenamento SQLite transacional.
 3. Escolher hosting e aprovar experimentos com custo controlado; preparar PoCs nativos apenas quando toolchains estiverem disponíveis. Dados reais permanecem fora do escopo até autorização específica e novo threat review.
+
+## CANDIDATA PÓS-AUDITORIA
+
+Na worktree isolada `feat/jarvis-nightly-stabilization-2026-09-25`, os achados da auditoria independente foram corrigidos e retestados apenas com dados sintéticos. Resultado final: API 149/149, Vitest 63/63, E2E web 36/36, mobile unit 2/2 e mobile browser E2E 4/4; typecheck, lint e builds web/desktop/mobile passaram. A matriz detalhada e as limitações estão em [STABILIZATION_REPORT.md](STABILIZATION_REPORT.md) e no adendo pós-auditoria de [TEST_MATRIX.md](TEST_MATRIX.md).
+
+**Gate E continua pendente de encerramento:** o relatório é evidência do implementador e a branch precisa de auditoria independente read-only em seu commit final. Permissões/grants continuam em memória de processo único; portanto, não é autorização para dados reais nem para SQLite de memória.

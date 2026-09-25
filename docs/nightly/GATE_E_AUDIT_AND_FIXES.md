@@ -1,5 +1,7 @@
 # Auditoria local do Gate E — evidências e correções
 
+> **Adendo pós-auditoria:** o laudo independente reproduziu lacunas adicionais no runner, no catálogo Calendar e na leitura concorrente. As correções candidatas e suas provas estão em [STABILIZATION_REPORT.md](STABILIZATION_REPORT.md). Este relatório descreve os achados e a sprint anterior; não certifica a branch de estabilização.
+
 ## Parecer
 
 **IMPLEMENTADO/TESTADO LOCALMENTE — AUDITORIA INDEPENDENTE PENDENTE.** Não declaro o Gate E aceito. Na cópia isolada, os testes disponíveis não reproduziram acesso a registros fora das concessões. O único defeito de código reproduzido nesta sprint (erro 500 com passphrase Unicode) foi corrigido e recebeu regressão. O runner E2E também foi endurecido para não anexar a um servidor web preexistente.
@@ -49,3 +51,7 @@ Não havia um segundo agente de revisão independente disponível nesta execuç�
 - `rtk npm run e2e` sem variáveis parou no pré-voo por `127.0.0.1:3000` ocupado. **Não é falha do produto nem resultado de teste**; o processo PID 48315 era externo à sprint e não foi alterado.
 - Um ensaio anterior em portas não allowlisted passou casos DEMO, mas a API recusou login de forma esperada. Não conta como falha de autenticação nem como aprovação do E2E integrado.
 - Depois do ajuste exclusivo de screenshots, o caso da missão foi repetido 1/1 desktop e 1/1 mobile; a suíte inteira 32/32 havia passado imediatamente antes do ajuste do helper de captura.
+
+## Candidata pós-auditoria
+
+O inventário acima descreve o commit Nightly congelado e suas limitações históricas. A worktree de estabilização atual corrige os achados posteriores de posse do processo no readiness E2E, autorização do catálogo sintético por grants, consistência da leitura durante revogação e robustez do contexto/Missões. Evidências, regressões e resultados finais estão em [STABILIZATION_REPORT.md](STABILIZATION_REPORT.md). As suítes finais passaram localmente; isso não substitui a nova auditoria independente e não encerra formalmente o Gate E.

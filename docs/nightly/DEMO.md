@@ -16,7 +16,9 @@
 6. Recarregue a página: a missão reaparece por armazenamento local do navegador. Limpar o perfil remove essa simulação.
 7. Opcionalmente crie outra missão, pressione “Demonstrar falha/retry”, prepare o retry local e cancele. Não há execução externa.
 
-O E2E completo que demonstra a integração sintética browser/API é `rtk env JARVIS_E2E_WEB_ORIGIN='http://[::1]:3000' JARVIS_E2E_API_ORIGIN='http://[::1]:8000' npm run e2e` a partir de `apps/web`; ele cria seu banco temporário e encerra os serviços iniciados por ele.
+O E2E completo que demonstra a integração sintética browser/API é `rtk env JARVIS_E2E_WEB_ORIGIN='http://[::1]:3000' JARVIS_E2E_API_ORIGIN='http://[::1]:8000' JARVIS_E2E_SCREENSHOT_DIR='/tmp/jarvis-e2e-captures' npm run e2e` a partir de `apps/web`; ele cria seu banco temporário, comprova a identidade da API iniciada e encerra os serviços próprios. A UI só consulta o catálogo após existir grant ativo; o servidor filtra calendários classificados fora do escopo.
+
+Se a recuperação local encontrar Missões inválidas, a página mantém as entradas válidas, isola o material rejeitado e permite baixar um pacote JSON para revisão manual ou descartar a cópia isolada.
 
 ## Capturas
 
