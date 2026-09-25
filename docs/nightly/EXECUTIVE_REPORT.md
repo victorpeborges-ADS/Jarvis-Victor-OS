@@ -7,7 +7,7 @@
 - Repositório original: `/Users/vic/Freela/Jarvis-Victor-OS`, branch `feat/gate2.0-e-integracao-web-api`, HEAD base `e648e92467396ce67b75019858fbcd0ee5557042`.
 - Worktree exclusiva: `/Users/vic/.codex/worktrees/jarvis-autonomous-sprint-2026-09-25/Jarvis-Victor-OS`.
 - Branch isolada: `feat/jarvis-nightly-2026-09-25-042315`.
-- Último commit de implementação antes destes relatórios: `08ab532f563e262ee9eb51ed34b23554452c57ed`.
+- Último commit de implementação: `5925e5f` (scaffold sintético Android); `1dd3c6c` contém o scaffold desktop.
 - O original permanece no HEAD `e648e92467396ce67b75019858fbcd0ee5557042`, sem alterações rastreadas. Os arquivos locais não rastreados preexistentes (`SUPERPROMPT...`, análise da playlist e `package-lock.json`) permaneceram intocados.
 
 ## O QUE FOI IMPLEMENTADO
@@ -19,7 +19,8 @@
 | Central/P1–P2 | Página `/missoes` com missão e etapas dependentes sintéticas, idempotência, retry, falha, cancelamento, checkpoints, proveniência, rascunho e revisão/aprovação local. Quatro skills determinísticas integradas; filtro de contexto por grant/domínio/projeto/validade/frescor/orçamento; ciclo de vida do conhecimento. Storage é `localStorage` desta janela, orçamento zero, sem API/DEMO/SQLite. |
 | Router/observadores/P3 | `FakeProvider` determinístico e `FakeWorkflowAdapter` read-only, testes de privacidade/grant/domínio, janela silenciosa e resultado sem efeitos; handoff é somente um envelope para cópia manual. ADR 004. Nenhum LLM/n8n/scheduler foi chamado. |
 | Hosting/P3 | ADR 003 compara documentalmente Cloudflare Workers+D1 e Cloud Run, com incógnitas e critérios. Nenhum provider selecionado; não existe benchmark do código JARVIS rodando nesses provedores nem adapter D1. |
-| macOS/Android | READMEs de retomada em `apps/desktop` e `apps/mobile`. São scaffold documental, não PoCs nativos: Rust/Cargo ausentes; Android SDK/Studio/Gradle/adb ausentes. **`.app` não gerado e APK não gerado.** |
+| macOS | Scaffold Tauri 2 + React/Vite real em `apps/desktop`, com shell Agora/Conversa/Missões, conteúdo fictício e CSP local; build web passou. Commit `1dd3c6c`. Rust/Cargo ausentes; Tauri/Rust não compilado; **`.app` não gerado.** |
+| Android | Shell React/Vite e projeto Capacitor Android gerado/sincronizado em `apps/mobile`; outbox sintética local (20 itens × 500 caracteres), 2 Vitest e 4 E2E (desktop/mobile), lint/build e `npm audit` sem vulnerabilidades. Android SDK/Studio/Gradle/adb ausentes; **APK não gerado ou instalado.** |
 
 ## COMMITS ATÔMICOS
 
@@ -30,6 +31,9 @@
 - `c01ef73` — Central de Missões sintética e skills.
 - `56432e6` — inteligência fake e observadores.
 - `08ab532` — captura full-page sem overlays fixos.
+- `1dd3c6c` — scaffold sintético desktop Tauri 2 + React/Vite.
+- `5925e5f` — scaffold sintético Android Capacitor + React/Vite e suíte browser.
+- Um commit documental final atualiza os relatórios para registrar os dois scaffolds e o fechamento das verificações.
 
 Todos estão apenas na branch noturna; não houve push, merge, tag ou alteração no HEAD original.
 
@@ -40,6 +44,8 @@ Todos estão apenas na branch noturna; não houve push, merge, tag ou alteraçã
 - Vitest: **53 passed**.
 - TypeScript, lint e build de produção Next: **PASS**.
 - E2E completo: **32 passed** em desktop/mobile; build incluído, executado usando IPv6 loopback por colisão da porta IPv4 `127.0.0.1:3000` com outro workspace. Após uma mudança só no helper de captura, o fluxo de missão/captura foi repetido **1/1 desktop + 1/1 mobile**.
+- Frontend Tauri desktop: `npm install` e `npm run build` passaram; `npm audit` reportou 0 vulnerabilidades. Nenhum comando Rust/Tauri que compile foi executado.
+- Frontend/Capacitor mobile: `npm test` 2/2; `npm run lint`; `npm run build`; Playwright 4/4 em viewport desktop e mobile; `npx cap add android` e `npx cap sync android`; `npm audit` 0 vulnerabilidades. Nenhum Gradle/APK executado.
 - Avisos não bloqueantes observados: depreciação TestClient/httpx; retirada futura do `next lint`; Node `module.register()` deprecado no Playwright.
 - A primeira tentativa de E2E padrão terminou no pré-voo por porta ocupada e não é falha da aplicação. Um ensaio em porta não allowlisted foi corretamente recusado pela API; não é regressão do login.
 - Cobertura não realizada: teste por socket público real, logs/tracebacks inesperados em produção, benchmark de hosting, execução nativa macOS/Android, contas/provedores reais.
@@ -52,6 +58,16 @@ Todos estão apenas na branch noturna; não houve push, merge, tag ou alteraçã
 - O comparativo de hosting é preliminar: Python Workers usa Pyodide e D1 requer bindings próprios; Cloud Run executa container Python, mas requer armazenamento durável separado do disco local. Ver [ADR 003](../adr/003-hosting-evaluation.md) e as documentações oficiais de [Workers/Python](https://developers.cloudflare.com/workers/languages/python/), [D1](https://developers.cloudflare.com/d1/sql-api/sql-statements/) e [Cloud Run](https://docs.cloud.google.com/run/docs/overview/what-is-cloud-run). Compatibilidade deste backend não foi provada.
 - Nenhum serviço faturável foi ativado por esta sessão. Não verifiquei quotas, assinaturas ou custos da conta do proprietário; portanto não declaro custo total da conta nem gratuidade futura.
 - A lista precisa de aprovação futura está em [APPROVAL_REQUESTS.md](APPROVAL_REQUESTS.md).
+
+## ARQUIVOS/RELATÓRIOS DE ENTREGA
+
+- Implementação e decisões: `apps/web`, `apps/api`, `apps/desktop`, `apps/mobile`, `docs/adr/`.
+- Evidências de auditoria Gate E: [GATE_E_AUDIT_AND_FIXES.md](GATE_E_AUDIT_AND_FIXES.md).
+- Matriz de testes, falhas e cobertura: [TEST_MATRIX.md](TEST_MATRIX.md).
+- Estado detalhado da sprint: [STATUS.md](STATUS.md).
+- Roteiro demonstrável sem dados externos: [DEMO.md](DEMO.md).
+- Instruções de retomada: [RESUME.md](RESUME.md).
+- Decisões ainda dependentes do proprietário: [APPROVAL_REQUESTS.md](APPROVAL_REQUESTS.md).
 
 ## PRÓXIMOS TRÊS PASSOS
 

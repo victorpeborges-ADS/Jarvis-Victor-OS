@@ -26,3 +26,8 @@ O E2E completo que demonstra a integração sintética browser/API é `rtk env J
 - [Integração sintética mobile](captures/gate2-e-integrado-mobile.png)
 
 Todas as capturas foram feitas no Playwright com dados fictícios. O modo API sintético não é modo DEMO e a Central de Missões não lê nenhum dos dois datasets.
+
+## Scaffolds nativos, sem `.app` ou APK
+
+- Desktop web-shell: em `apps/desktop`, execute `rtk npm run dev`; Vite está preso a `127.0.0.1:1420`. Agora/Conversa/Missões alternam entre textos ilustrativos locais. A janela Tauri não é iniciada sem Rust/Cargo.
+- Android web-shell: em `apps/mobile`, execute `rtk npm run dev -- --host 127.0.0.1`; navegue para `http://127.0.0.1:5173`. Em Inbox, salve uma captura fictícia e recarregue para conferir a outbox local. O E2E desta shell cobre desktop e mobile; não é APK.

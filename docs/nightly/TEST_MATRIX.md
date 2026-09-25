@@ -22,7 +22,13 @@
 | `rtk npm run e2e` sem origem IPv6 | **BLOCKED no pré-voo** | Runner detectou `127.0.0.1:3000` ocupado e saiu antes de build/API. Não é resultado da suíte nem falha de produto; evitou usar servidor alheio. |
 | E2E em portas alternativas não allowlisted | **RECUSADO conforme contrato** | A interface web abriu, mas login recebeu recusa de Origin; 24 casos DEMO passaram, 4 integrados não puderam autenticar. Não contar como defeito nem como aprovação do fluxo integrado. |
 | `rtk git diff --check` | **PASS** | Antes de commits de código e no fechamento do pacote documental. |
-| Tauri/Cargo e Capacitor/APK | **BLOCKED / NÃO TESTADO** | `rustc`, Cargo, Android SDK/Studio, Gradle e `adb` ausentes; nada foi instalado. `.app` e APK não foram gerados. |
+| `rtk npm install && rtk npm run build` em `apps/desktop` | **PASS** | React/Vite frontend compilou; `npm audit` reportou zero vulnerabilidades. Não executa Cargo/Tauri nativo. |
+| `rtk npm test` em `apps/mobile` | **PASS — 2/2** | Outbox sintética: limite de 20, texto máximo, JSON inválido e marcador sintético obrigatório. |
+| `rtk npm run lint && rtk npm run build` em `apps/mobile` | **PASS** | Oxlint limpo; TypeScript e Vite compilados. |
+| `rtk npm run e2e` em `apps/mobile` | **PASS — 4/4** | Playwright usa Vite loopback `127.0.0.1:5173`; navegação, gravação em outbox e reload em viewports desktop/mobile, sem requisições externas. |
+| `rtk npx cap add android && rtk npx cap sync android` | **PASS** | Estrutura Android gerada e assets copiados; nenhuma compilação Gradle foi disparada. |
+| `rtk npm audit` em `apps/mobile` | **PASS — 0 vulnerabilidades** | CLI Capacitor ficou em `8.4.3` (major 8) depois do conjunto inicial indicar advisory moderado transitivo por `uuid`/`xcode`; versão inicial substituída sem `--force`. |
+| Tauri/Cargo e Capacitor/APK nativos | **BLOCKED / NÃO TESTADO** | `rustc`, Cargo, Android SDK/Studio, Gradle e `adb` ausentes; nada foi instalado. `.app` e APK não foram gerados. |
 | Hosting cloud, billing, LLM, n8n, OAuth e dados reais | **NÃO TESTADO / NÃO EXECUTADO** | Nenhuma conta, credencial, chamada externa ou recurso de cloud criado. |
 | Socket em interface pública e teste físico de DNS rebinding | **NÃO TESTADO** | Probes só via ASGI TestClient e inspeção dos guards. Um listener público seria fora do escopo permitido. |
 | Revisão exaustiva de logs/tracebacks inesperados | **NÃO TESTADO** | Access log do Uvicorn está desligado e os handlers testados são genéricos; não foi feita revisão operacional completa. |
