@@ -9,6 +9,7 @@ const items = [
   { href: "/conversa", label: "Conversa", desc: "Perguntar ao JARVIS", icon: "✦" },
   { href: "/inbox", label: "Inbox", desc: "Captura rápida", icon: "▭" },
   { href: "/dominios", label: "Domínios", desc: "Filtros de vida", icon: "⬡" },
+  { href: "/missoes", label: "Missões", desc: "Execução sintética", icon: "◎" },
   { href: "/aprovacoes", label: "Aprovações", desc: "Fila explícita", icon: "✓" },
   { href: "/fontes", label: "Fontes", desc: "Privacidade", icon: "⬢" }
 ];

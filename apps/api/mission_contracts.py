@@ -56,6 +56,15 @@ class MissionTask(StrictContract):
         return value
 
 
+class MissionEvent(StrictContract):
+    id: str = Field(pattern=r"^event_[A-Za-z0-9_-]{1,80}$")
+    type: Literal["mission_created", "task_started", "task_completed", "task_failed", "task_retried", "mission_cancelled", "artifact_created"]
+    message: str = Field(max_length=1000)
+    task_id: str | None = None
+    created_at: datetime
+    idempotency_key: str = Field(min_length=8, max_length=160)
+
+
 class Mission(StrictContract):
     schema_version: Literal[1]
     id: str = Field(pattern=r"^mission_[A-Za-z0-9_-]{1,80}$")
@@ -65,6 +74,7 @@ class Mission(StrictContract):
     domain_id: str | None
     tasks: tuple[MissionTask, ...]
     checkpoints: tuple[dict, ...]
+    events: tuple[MissionEvent, ...]
     artifacts: tuple[dict, ...]
     budget: dict
     created_at: datetime
