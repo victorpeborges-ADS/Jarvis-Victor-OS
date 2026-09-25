@@ -280,6 +280,20 @@ def _authorized_records(
     requested_domain: str | None,
     record_id: str | None = None,
 ) -> list[StoredEvent]:
+    # Authorization, SQLite selection, and the returned row snapshot share the
+    # same linearization lock as grant revocation. A request that enters this
+    # critical section first is authorized before revocation; revoke waits for
+    # it. Requests entering after revocation see no active scope.
+    with _grant_lock:
+        return _authorized_records_locked(principal, store, requested_domain, record_id)
+
+
+def _authorized_records_locked(
+    principal: str,
+    store: SQLiteMemoryStore,
+    requested_domain: str | None,
+    record_id: str | None = None,
+) -> list[StoredEvent]:
     if requested_domain is not None and requested_domain not in CANONICAL_DOMAIN_IDS:
         raise HTTPException(status_code=403, detail="concessão ausente")
     grants = _active_grants(principal)

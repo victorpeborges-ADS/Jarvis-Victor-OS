@@ -60,8 +60,24 @@ def _service(request: Request) -> CalendarSyncService:
 
 @router.get("/calendars", response_model=CalendarCatalogOut)
 def list_simulated_calendars(request: Request) -> CalendarCatalogOut:
-    _session_from(request)
-    return CalendarCatalogOut(calendars=_service(request).provider.list_calendars())
+    session = _session_from(request)
+    domains = authorized_calendar_domains(session.principal)
+    if not domains:
+        raise HTTPException(status_code=403, detail="concessão de leitura para o catálogo Calendar ausente")
+    service = _service(request)
+    try:
+        # Unclassified entries are metadata needed to choose a classification;
+        # classified entries are visible only inside the caller's granted domains.
+        with calendar_grant_guard(session.principal, domains):
+            domain_by_calendar = {state.calendar_id: state.domain_id for state in service.states()}
+            calendars = tuple(
+                calendar for calendar in service.provider.list_calendars()
+                if domain_by_calendar.get(calendar.calendar_id) is None
+                or domain_by_calendar[calendar.calendar_id] in domains
+            )
+            return CalendarCatalogOut(calendars=calendars)
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail="concessão revogada durante a leitura do catálogo") from exc
 
 
 @router.put("/calendars/{calendar_id}/classification", response_model=CalendarMappingOut)

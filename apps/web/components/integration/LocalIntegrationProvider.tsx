@@ -213,31 +213,50 @@ export function LocalIntegrationProvider({ children }: { children: ReactNode }) 
     if (pathname !== "/integrado") clearProtectedData();
   }, [pathname, clearProtectedData]);
 
+  const loadResourcesFromServer = useCallback(async () => {
+    const [activeGrants, calendarStates] = await Promise.all([
+      requestJson<LocalGrant[]>("/real/grants"),
+      requestJson<{ provider_mode: "simulated"; states: CalendarSyncState[] }>("/real/calendar-sim/state")
+    ]);
+    if (!activeGrants || !calendarStates) return;
+    if (calendarStates.provider_mode !== "simulated") {
+      invalidateSession("A resposta da API não corresponde ao modo simulado esperado.");
+      return;
+    }
+    const safeGrantsValue = safeArray<LocalGrant>(activeGrants);
+    const safeStatesValue = safeArray<CalendarSyncState>(calendarStates.states);
+    if (activeGrants.length === 0) {
+      setGrants(safeGrantsValue);
+      setStates(safeStatesValue);
+      setCalendars([]);
+      return;
+    }
+    const catalog = await requestJson<{ provider_mode: "simulated"; calendars: SimulatedCalendar[] }>("/real/calendar-sim/calendars");
+    if (!catalog) return;
+    if (catalog.provider_mode !== "simulated") {
+      invalidateSession("A resposta da API não corresponde ao modo simulado esperado.");
+      return;
+    }
+    // Do not publish states before the catalog request finishes: the page's
+    // state effect starts an event refresh that cancels pending requests.
+    setGrants(safeGrantsValue);
+    setStates(safeStatesValue);
+    setCalendars(safeArray<SimulatedCalendar>(catalog.calendars));
+  }, [invalidateSession, requestJson]);
+
   const loadResources = useCallback(async () => {
     if (authStatus !== "authenticated") return;
     setResourcesLoading(true);
     setNotice(null);
     try {
-      const [catalog, activeGrants, calendarStates] = await Promise.all([
-        requestJson<{ provider_mode: "simulated"; calendars: SimulatedCalendar[] }>("/real/calendar-sim/calendars"),
-        requestJson<LocalGrant[]>("/real/grants"),
-        requestJson<{ provider_mode: "simulated"; states: CalendarSyncState[] }>("/real/calendar-sim/state")
-      ]);
-      if (!catalog || !activeGrants || !calendarStates) return;
-      if (catalog.provider_mode !== "simulated" || calendarStates.provider_mode !== "simulated") {
-        invalidateSession("A resposta da API não corresponde ao modo simulado esperado.");
-        return;
-      }
-      setCalendars(safeArray<SimulatedCalendar>(catalog.calendars));
-      setGrants(safeArray<LocalGrant>(activeGrants));
-      setStates(safeArray<CalendarSyncState>(calendarStates.states));
+      await loadResourcesFromServer();
     } catch {
-      // requestJson stores a safe, user-facing message and clears protected
-      // data on 401/403. Raw response bodies are intentionally never rendered.
+      // requestJson stores a safe, user-facing message. Raw response bodies are
+      // intentionally never rendered.
     } finally {
       setResourcesLoading(false);
     }
-  }, [authStatus, invalidateSession, requestJson]);
+  }, [authStatus, loadResourcesFromServer]);
 
   const refreshEvents = useCallback(async (domainId: SyntheticDomainId = selectedDomain) => {
     cancelPending();
@@ -284,17 +303,9 @@ export function LocalIntegrationProvider({ children }: { children: ReactNode }) 
   }, [authStatus, invalidateSession, requestJson]);
 
   const loadResourcesAfterMutation = useCallback(async () => {
-    const [catalog, activeGrants, calendarStates] = await Promise.all([
-      requestJson<{ provider_mode: "simulated"; calendars: SimulatedCalendar[] }>("/real/calendar-sim/calendars"),
-      requestJson<LocalGrant[]>("/real/grants"),
-      requestJson<{ provider_mode: "simulated"; states: CalendarSyncState[] }>("/real/calendar-sim/state")
-    ]);
-    if (catalog && activeGrants && calendarStates) {
-      setCalendars(safeArray<SimulatedCalendar>(catalog.calendars));
-      setGrants(safeArray<LocalGrant>(activeGrants));
-      setStates(safeArray<CalendarSyncState>(calendarStates.states));
-    }
-  }, [requestJson]);
+    try { await loadResourcesFromServer(); }
+    catch { /* requestJson stores a safe message and clears protected data on failure. */ }
+  }, [loadResourcesFromServer]);
 
   const createGrant = useCallback(async (domainId: SyntheticDomainId) => {
     const result = await requestJson<LocalGrant>("/real/grants", {

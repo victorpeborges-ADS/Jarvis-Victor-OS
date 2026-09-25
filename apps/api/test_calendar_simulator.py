@@ -5,6 +5,7 @@ import hashlib
 import socket
 import threading
 import time
+from threading import Event
 from contextlib import contextmanager
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
@@ -123,6 +124,26 @@ def test_simulator_is_session_protected_and_demo_remains_separate(client):
     assert "evt_001" in {event["id"] for event in client.get("/events").json()}
     assert client.get("/events").headers["x-jarvis-dataset"] == "demo"
     assert client.get("/real/calendar-sim/calendars").headers["x-jarvis-dataset"] == "real"
+
+
+def test_calendar_catalog_requires_grant_and_hides_other_classified_domains(client):
+    session_token, csrf = login(client)
+    assert client.get("/real/calendar-sim/calendars").status_code == 403
+    grant_a = grant(client, csrf, ["dom_synthetic_a"])
+    assert len(client.get("/real/calendar-sim/calendars").json()["calendars"]) == 8
+    grant_b = grant(client, csrf, ["dom_synthetic_b"])
+    classify(client, csrf, "a", "a")
+    classify(client, csrf, "b", "b")
+    assert client.post(f"/real/grants/{grant_b}/revoke", headers={"origin": ORIGIN, "x-csrf-token": csrf}).status_code == 200
+
+    isolated = TestClient(client.app, base_url="http://127.0.0.1", client=("127.0.0.1", 50992))
+    isolated.cookies.set("jarvis_session", session_token)
+    visible_ids = {calendar["calendar_id"] for calendar in isolated.get("/real/calendar-sim/calendars").json()["calendars"]}
+    assert "sim_calendar_a" in visible_ids
+    assert "sim_calendar_b" not in visible_ids
+
+    assert client.post(f"/real/grants/{grant_a}/revoke", headers={"origin": ORIGIN, "x-csrf-token": csrf}).status_code == 200
+    assert isolated.get("/real/calendar-sim/calendars").status_code == 403
 
 
 def test_calendar_mutations_require_allowed_origin_and_csrf(client):
@@ -329,6 +350,49 @@ def test_revocation_blocks_sync_and_existing_event_reads(client):
     assert client.get("/real/events").status_code == 403
     assert client.get("/real/briefing").status_code == 403
     assert sync_one(client, csrf, "a").status_code == 403
+
+
+def test_event_read_and_revocation_linearize_on_the_same_grant_lock(client, monkeypatch):
+    session_token, csrf = login(client)
+    grant_id = grant(client, csrf, ["dom_synthetic_a"])
+    classify(client, csrf, "a", "a")
+    assert sync_one(client, csrf, "a").status_code == 200
+    store = client.app.state.memory_store
+    original_list = store.list_authorized_events
+    read_entered_sqlite = Event()
+    release_read = Event()
+
+    def pause_authorized_query(scopes, requested_domain=None):
+        read_entered_sqlite.set()
+        assert release_read.wait(timeout=5)
+        return original_list(scopes, requested_domain)
+
+    monkeypatch.setattr(store, "list_authorized_events", pause_authorized_query)
+    reader = TestClient(client.app, base_url="http://127.0.0.1", client=("127.0.0.1", 50993))
+    reader.cookies.set("jarvis_session", session_token)
+    revoke_started = Event()
+
+    def revoke():
+        revoke_started.set()
+        return client.post(
+            f"/real/grants/{grant_id}/revoke",
+            headers={"origin": ORIGIN, "x-csrf-token": csrf},
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        read_future = pool.submit(reader.get, "/real/events")
+        assert read_entered_sqlite.wait(timeout=5)
+        revoke_future = pool.submit(revoke)
+        assert revoke_started.wait(timeout=5)
+        time.sleep(0.05)
+        assert not revoke_future.done(), "revogação deve esperar a consulta já autorizada terminar"
+        release_read.set()
+        read_response = read_future.result(timeout=5)
+        revoked = revoke_future.result(timeout=5)
+
+    assert read_response.status_code == 200
+    assert revoked.status_code == 200
+    assert reader.get("/real/events").status_code == 403
 
 
 def test_eight_explicit_domain_mappings_remain_isolated(client):

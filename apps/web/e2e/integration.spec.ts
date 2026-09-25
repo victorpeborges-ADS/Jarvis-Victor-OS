@@ -81,13 +81,15 @@ test("API local no navegador: PUT/CORS, sync, proveniência, estados, modos e re
   await page.getByTestId("local-passphrase").fill(passphrase ?? "");
   await page.getByTestId("local-login-submit").click();
   await expect(page.getByRole("heading", { name: "Concessões locais" })).toBeVisible();
-  await expect(page.getByTestId("calendar-card")).toHaveCount(8);
+  await expect(page.getByTestId("calendar-card")).toHaveCount(0);
+  await expect(page.getByText(/Conceda leitura no escopo escolhido/)).toBeVisible();
   await expect(page.getByText(/^connected$/)).toHaveCount(0);
 
   if (domainForProject === "dom_synthetic_b") {
     await page.getByTestId("domain-filter").selectOption(domainForProject);
   }
   const calendarCard = await grantAndClassify(page, domainForProject, calendarForProject);
+  await expect(calendarCard).toBeVisible();
   await calendarCard.getByRole("button", { name: `Sincronizar ${calendarForProject}` }).click();
   await expect(calendarCard.getByText("Simulação atualizada")).toBeVisible();
   const syntheticTitle = `Compromisso sintético ${domainForProject.slice(-1).toUpperCase()}-1`;
@@ -141,7 +143,8 @@ test("API local no navegador: PUT/CORS, sync, proveniência, estados, modos e re
   prepareState("error", calendarForProject);
   await page.getByRole("button", { name: "Atualizar estados" }).click();
   await expect(page.getByText("Erro na sincronização").first()).toBeVisible();
-  await expect(page.getByText(/Código técnico oculto/).first()).toBeVisible();
+  await expect(page.getByRole("alert").filter({ hasText: /detalhe técnico foi ocultado/ })).toBeVisible({ timeout: 10_000 });
+  await expect(page.getByText("simulated_network", { exact: false })).toHaveCount(0);
 
   let releaseResponse!: () => void;
   let apiSyncFinished!: () => void;

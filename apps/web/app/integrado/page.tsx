@@ -148,7 +148,7 @@ function GrantControls() {
           ))}
         </ul>
       ) : (
-        <p className="mt-3 text-sm text-ink-subtle">Nenhuma concessão ativa. Calendários sem concessão continuam em quarentena.</p>
+        <p className="mt-3 text-sm text-ink-subtle">Nenhuma concessão ativa. Conceda leitura no escopo escolhido para consultar o catálogo sintético.</p>
       )}
       {localError && <p role="alert" className="mt-3 text-sm text-red-800">{localError}</p>}
     </Card>
