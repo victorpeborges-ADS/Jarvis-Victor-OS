@@ -13,7 +13,7 @@ stateDiagram-v2
     planned --> running: run_next abre execução
     running --> running: commit da etapa
     running --> done: última etapa confirmada
-    running --> interrupted: boot encontra execução aberta
+    running --> interrupted: execução aberta sem commit
     interrupted --> running: resume autorizado
     interrupted --> failed: fail
     failed --> planned: retry explícito
@@ -27,11 +27,17 @@ A etapa tem estado próprio. `done` da missão só ocorre quando todas as etapas
 
 ## HTTP
 
-`POST /real/missions/{id}/transition` aceita `run_next`, `resume`, `fail`, `retry` e `cancel`, com `expected_revision` e `idempotency_key`. A resposta inclui `available_actions` calculadas pelo servidor. Grant de Calendar não autoriza. `mission:write` é revalidado antes de confirmar a etapa.
+`POST /real/missions/{id}/transition` aceita `run_next`, `resume`, `fail`, `retry` e `cancel`, com `expected_revision` e `idempotency_key`. A resposta inclui `available_actions` calculadas pelo servidor. Grant de Calendar não autoriza. `mission:write` é revalidado de novo no commit do artefato, com o lock de concessão ainda retido até o fim da transação SQLite. Quem chega primeiro, cancelamento ou commit, fica confirmado. Uma execução que deixou de estar `open` não é concluída pelo `run_next` antigo. `resume` só confirma a fase `interrupted`.
+
+A skill determinística não tem efeito fora do SQLite. Não há exactly-once para um efeito externo que viesse a ocorrer antes desse commit.
 
 ## Concorrência
 
-Uma execução `open` por missão. A transição vencedora grava artefato, etapa, revisão e evento na mesma transação final. A outra recebe 409. Chave igual com corpo diferente também recebe 409.
+Uma execução `open` por missão. A confirmação adquire primeiro o lock em memória das concessões e, ainda com ele retido, abre `BEGIN IMMEDIATE`. Essa é a mesma ordem das leituras de Calendar: concessão, depois SQLite. O cancelamento consulta a concessão antes da transação e não pega o lock de concessão dentro do SQLite, então as duas ordens não se invertem.
+
+`run_next` só grava o artefato se a execução continua `open`, com a mesma revisão e a mesma identidade. `resume` só grava se ela continua `interrupted`. Cancelamento e `fail` fecham a execução `open` como `failed`; essa fase não pode ser concluída nem retomada. Se o cancelamento confirma primeiro, o commit seguinte responde 409, não grava artefato e não desfaz o cancelamento. Se o commit confirma primeiro, o cancelamento tardio com a revisão antiga responde 409 e o artefato já confirmado permanece. Quem usa a revisão nova cancela a missão sem reabrir a etapa.
+
+A transição vencedora grava artefato, etapa, revisão e evento na mesma transação final. A outra recebe 409. Chave igual com corpo diferente também recebe 409.
 
 ## Interrupção
 

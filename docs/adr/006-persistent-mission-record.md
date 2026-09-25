@@ -12,7 +12,7 @@ Transições válidas no servidor, na mesma transação do evento append-only:
 - `planned` ou `running` pode executar `run_next` quando as dependências estão `done`.
 - `done` só ocorre quando todas as etapas estão `done`.
 - `cancel` vale a partir de qualquer estado que não seja `done` nem `cancelled`.
-- `fail`, `retry` e a marcação humana de artefato aprovado **não** são ações desta API no G3. Elas existem apenas na página DEMO do navegador. O motor G4, se implementado, precisa de contrato próprio antes de expô-las.
+- `fail` e `retry` são ações da API desde o motor G4, descritas no ADR 007. A marcação humana que aprova um artefato continua apenas na página DEMO do navegador e não existe como transição da API.
 
 `expected_revision` divergente responde 409 e não grava. Chave de idempotência repetida com o mesmo corpo devolve o mesmo registro; corpo diferente responde 409.
 
