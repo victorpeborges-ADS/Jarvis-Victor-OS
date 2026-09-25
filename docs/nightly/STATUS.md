@@ -32,6 +32,7 @@
 - BLOCKED — P2/5C: `apps/desktop/README.md` registra direção de scaffold Tauri 2 e retomada; Rust/Cargo indisponíveis; **NÃO COMPILADO**, `.app` não gerado. Nenhum toolchain foi instalado.
 - BLOCKED — P2/5D: `apps/mobile/README.md` registra direção Capacitor e retomada; Android SDK/Android Studio/Gradle/adb ausentes; **APK NÃO GERADO**. Nenhum toolchain foi instalado.
 - PASS — suíte final: API 146/146; Vitest 53/53; TypeScript, lint e build Next/E2E aprovados. Avisos existentes: depreciação Starlette/httpx e aviso de retirada futura de `next lint`; Node informou depreciação de `module.register()` na execução Playwright.
+- DONE — capturas de página longa agora removem temporariamente a navegação fixa no teste, sem alterar a interface. Após ajuste, cenário de missão/captura passou 1/1 desktop e 1/1 mobile; a suíte completa 32/32 foi executada antes dessa alteração apenas de screenshot.
 - IN PROGRESS — relatório independente da implementação e matriz de auditoria local. Gate E continua `IMPLEMENTADO/TESTADO LOCALMENTE — AUDITORIA INDEPENDENTE PENDENTE`; nenhuma aceitação foi declarada.
 - PRÓXIMA — commitar incremento P3; produzir relatórios finais, matriz, roteiro demo e instruções de retomada. Commits anteriores: runner `b9151af`, correção de passphrase `3ed519e`, capturas `a32277e`, contratos `2612832`, Missões/skills `c01ef73`.
 

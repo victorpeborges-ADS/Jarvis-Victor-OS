@@ -36,11 +36,13 @@ test("missão sintética executa skills, mantém proveniência e sobrevive ao re
   expect(apiCalls).toHaveLength(0);
 
   mkdirSync(shots, { recursive: true });
+  await page.locator('nav[aria-label="Navegação mobile"]').evaluate((element) => element.remove());
+  const screenshotStyle = await page.addStyleTag({ content: "header { position: static !important; }" });
   await page.screenshot({
     path: resolve(shots, `missions-${info.project.name}.png`),
-    fullPage: true,
-    style: "@media (max-width: 767px) { nav[aria-label='Navegação mobile'] { display: none !important; } }"
+    fullPage: true
   });
+  await screenshotStyle.evaluate((element) => element.remove());
   await page.reload();
   await expect(page.getByRole("heading", { name: "Síntese de exemplo fictício", exact: true })).toBeVisible();
   await expect(page.getByRole("heading", { name: "Rascunho: Síntese de exemplo fictício" })).toBeVisible();
