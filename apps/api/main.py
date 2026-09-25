@@ -26,6 +26,7 @@ from contract import (
     read_raw_fixture,
 )
 from local_security import router as real_router
+from mission_api import router as mission_router
 from loopback import ALLOWED_ORIGINS, is_allowed_host_header, is_loopback_address
 from memory_store import MemoryStoreError, SQLiteMemoryStore
 from server_config import LocalServerConfig, validate_local_server_config
@@ -141,6 +142,7 @@ def create_app(config: LocalServerConfig, *, database_path: str | Path | None = 
     app.include_router(demo_router)
     app.include_router(real_router)
     app.include_router(calendar_sim_router)
+    app.include_router(mission_router)
 
     @app.middleware("http")
     async def local_transport_boundary(request: Request, call_next):

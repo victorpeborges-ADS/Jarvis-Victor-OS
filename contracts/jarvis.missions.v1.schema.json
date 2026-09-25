@@ -63,7 +63,7 @@
         "title": { "type": "string", "minLength": 1, "maxLength": 240 },
         "content": { "type": "string", "maxLength": 50000 },
         "skill_version": { "type": ["string", "null"], "maxLength": 80 },
-        "review_state": { "enum": ["not_required", "awaiting_approval", "approved_locally", "rejected"] },
+        "review_state": { "enum": ["draft", "review", "not_required", "awaiting_approval", "approved_locally", "rejected"] },
         "reviewed_at": { "anyOf": [{ "$ref": "#/$defs/Timestamp" }, { "type": "null" }] },
         "source_refs": { "type": "array", "items": { "$ref": "#/$defs/SourceRef" } },
         "created_at": { "$ref": "#/$defs/Timestamp" }

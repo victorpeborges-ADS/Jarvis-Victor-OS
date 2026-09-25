@@ -21,6 +21,8 @@ from domain_registry import (
     CANONICAL_CONNECTORS,
     CANONICAL_DOMAIN_IDS,
     CANONICAL_RESOURCES,
+    MISSION_READ_RESOURCE,
+    MISSION_WRITE_RESOURCE,
 )
 from memory_models import ProvenanceRecord, ReadScope
 from memory_store import SQLiteMemoryStore, StoredEvent
@@ -104,7 +106,7 @@ class SessionOut(BaseModel):
 class GrantOut(BaseModel):
     id: str
     principal: str
-    connector: Literal["calendar_sim"]
+    connector: Literal["calendar_sim", "mission_sim"]
     permission: Literal["read"] = "read"
     resource_ids: list[str]
     domain_ids: list[str]
@@ -125,7 +127,7 @@ def _grant_response(grant: Grant) -> GrantOut:
 
 
 class GrantIn(BaseModel):
-    connector: Literal["calendar_sim"]
+    connector: Literal["calendar_sim", "mission_sim"]
     permission: Literal["read"]
     resource_ids: list[str] = Field(min_length=1, max_length=1)
     domain_ids: list[str] = Field(min_length=1, max_length=8)
@@ -133,8 +135,9 @@ class GrantIn(BaseModel):
 
     @field_validator("resource_ids")
     @classmethod
-    def resources_are_canonical(cls, values: list[str]) -> list[str]:
-        allowed = CANONICAL_RESOURCES["calendar_sim"]
+    def resources_are_canonical(cls, values: list[str], info) -> list[str]:
+        connector = info.data.get("connector")
+        allowed = CANONICAL_RESOURCES.get(connector, frozenset())
         if any(value not in allowed for value in values) or len(set(values)) != len(values):
             raise ValueError("recurso inválido")
         return values
@@ -283,6 +286,25 @@ def authorized_calendar_domains(principal: str) -> frozenset[str]:
 def authorized_calendar_inventory_domains(principal: str) -> frozenset[str]:
     """Domains in which unclassified calendar names may be discovered."""
     return _calendar_domains_for(principal, CALENDAR_INVENTORY_RESOURCE)
+
+
+def mission_domains(principal: str, resource_id: str) -> frozenset[str]:
+    """Domains covered by an active mission_sim grant for one resource.
+
+    A calendar grant never contributes. domain_id classifies; it does not authorize.
+    """
+    if resource_id not in {MISSION_READ_RESOURCE, MISSION_WRITE_RESOURCE}:
+        return frozenset()
+    allowed: set[str] = set()
+    canonical = CANONICAL_RESOURCES["mission_sim"]
+    with _grant_lock:
+        for grant in _active_grants(principal):
+            if grant.connector != "mission_sim":
+                continue
+            if resource_id not in grant.resource_ids or not grant.resource_ids <= canonical:
+                continue
+            allowed.update(grant.domain_ids & CANONICAL_DOMAIN_IDS)
+    return frozenset(allowed)
 
 
 @contextmanager
@@ -529,3 +551,12 @@ def read_briefing(request: Request) -> RealBriefingOut:
 def put_grant_for_tests(grant: Grant) -> None:
     with _grant_lock:
         _grants[grant.id] = grant
+
+
+def put_session_for_tests(token: str, principal: str, csrf_token: str) -> None:
+    _sessions[token] = Session(
+        token=token,
+        csrf_token=csrf_token,
+        principal=principal,
+        expires_at=_now() + SESSION_TTL,
+    )
