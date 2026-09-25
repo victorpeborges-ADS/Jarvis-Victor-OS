@@ -77,6 +77,13 @@ def _expected_passphrase() -> str | None:
     return value
 
 
+def _passphrase_matches(supplied: str, expected: str) -> bool:
+    try:
+        return hmac.compare_digest(supplied.encode("utf-8"), expected.encode("utf-8"))
+    except UnicodeEncodeError:
+        return False
+
+
 class LoginIn(BaseModel):
     model_config = ConfigDict(hide_input_in_errors=True)
     passphrase: str = Field(min_length=12, max_length=200)
@@ -373,7 +380,7 @@ def open_session(body: LoginIn, request: Request, response: Response) -> Session
     if expected is None:
         raise HTTPException(status_code=503, detail="sessão local não configurada")
     _check_login_rate_limit(key)
-    if not hmac.compare_digest(body.passphrase, expected):
+    if not _passphrase_matches(body.passphrase, expected):
         _record_login_failure(key)
         raise HTTPException(status_code=401, detail="credencial recusada")
     _login_failures.pop(key, None)

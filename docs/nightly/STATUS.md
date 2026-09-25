@@ -17,11 +17,15 @@
 - DONE — E2E Gate E 28/28 passou em Chromium desktop/mobile na origem IPv6 aprovada (`http://[::1]:3000`) e API IPv6 loopback (`http://[::1]:8000`). As portas IPv4 `127.0.0.1:3000` estavam ocupadas por outro workspace e não foram usadas.
 - DONE — o E2E revelou que o runner anterior verificava apenas a porta da API, podendo testar um serviço web alheio. `run-e2e.mjs` agora valida ambas as portas, constrói antes de subir serviços, inicia/aguarda seu próprio Next, impede reutilização do servidor do Playwright e mantém subprocessos em loopback com ambiente minimizado. A rota de erro por porta ocupada foi verificada; termina antes do build ou do início da API.
 - DONE — novas capturas sintéticas copiadas para `docs/nightly/captures/`; as imagens existentes do Gate 1/E foram restauradas sem alterações.
-- IN PROGRESS — auditoria adversarial final do Gate E; correções mínimas e regressões, depois contratos/Core de Missões.
-- Próxima ação — validar regressão de passphrase Unicode, terminar inventário de rotas e fechar a matriz P0 antes de abrir novos módulos.
+- DONE — a comparação de passphrase Unicode foi reproduzida (frase correta com acentos resultava em HTTP 500) e corrigida comparando bytes UTF-8 com `hmac.compare_digest`; entrada JSON com surrogate inválido falha sem erro interno nem reflexão.
+- DONE — regressão adversarial cruza dois tokens CSRF reais e percorre criação/revogação de grant, classificação, sync e logout com token ausente, inválido, de outra sessão e Origin externa; todos recusados sem alteração do grant.
+- DONE — suíte API após correções: 140/140; recorte dos três testes novos/afetados: 3/3. Avisos conhecidos do TestClient/httpx permanecem.
+- IN PROGRESS — repetir E2E após correção da sessão e fechar a matriz Gate E; depois iniciar contratos/Core de Missões.
+- Próxima ação — terminar a matriz de isolamento/rotas e executar 28 E2E em IPv6 loopback, gravando imagens apenas em `docs/nightly/captures/`.
 
 ## Evidências provisórias
 
 - Primeira tentativa E2E na configuração herdada: interrompida após comprovar que a porta IPv4 3000 pertencia a outro workspace; os resultados dessa tentativa não são aceitação de teste. Somente os processos iniciados por esta sessão foram encerrados.
 - Tentativa isolada nas portas 39941/49941: 24 testes DEMO/desktop/mobile passaram; 4 testes de integração falharam no login porque a política canônica rejeita corretamente origens fora das portas 3000/8000. O teste subsequente IPv6, dentro do contrato existente, passou 28/28.
 - A API não foi aberta no banco padrão. O E2E criou e removeu seu banco SQLite sintético temporário.
+- Probe da passphrase Unicode antes da correção: HTTP 500 para frase configurada/fornecida com `é`; após correção, 201 para a frase correta e 422 genérico para uma sequência Unicode inválida.

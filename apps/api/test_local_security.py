@@ -293,6 +293,27 @@ def test_login_rejects_external_and_missing_origin(client):
     assert login(client, origin=None).status_code == 403
 
 
+def test_login_supports_unicode_passphrases_and_rejects_invalid_unicode(client, monkeypatch):
+    unicode_phrase = "frase-local-sintética-com-café"
+    monkeypatch.setenv("JARVIS_LOCAL_PASSPHRASE", unicode_phrase)
+    accepted = login(client, passphrase=unicode_phrase)
+    assert accepted.status_code == 201
+    client.cookies.clear()
+
+    malformed_phrase = "frase-local-" + "x" * 12 + "\ud800"
+    malformed_body = json.dumps({"passphrase": malformed_phrase}, ensure_ascii=True).encode("ascii")
+    rejected = client.post(
+        "/real/session",
+        content=malformed_body,
+        headers={"origin": ALLOWED_ORIGIN, "content-type": "application/json"},
+    )
+    assert rejected.status_code == 422
+    assert rejected.json() == {"detail": "credencial inválida"}
+    assert local_security._passphrase_matches(malformed_phrase, unicode_phrase) is False
+    assert "\ud800" not in rejected.text
+    assert "jarvis_session" not in rejected.headers.get("set-cookie", "")
+
+
 def test_mutations_require_allowed_origin_and_session_bound_csrf(client):
     assert login(client).status_code == 201
     csrf = csrf_for(client)
@@ -303,10 +324,63 @@ def test_mutations_require_allowed_origin_and_session_bound_csrf(client):
         "domain_ids": ["dom_synthetic_a"],
         "expires_at": (datetime.now(timezone.utc) + timedelta(days=2)).isoformat(),
     }
+    assert client.post("/real/grants", json=body, headers={"origin": ALLOWED_ORIGIN}).status_code == 403
     assert client.post("/real/grants", json=body, headers={"x-csrf-token": csrf}).status_code == 403
     assert client.post("/real/grants", json=body, headers={"origin": "https://evil.example", "x-csrf-token": csrf}).status_code == 403
     assert client.post("/real/grants", json=body, headers={"origin": ALLOWED_ORIGIN, "x-csrf-token": "csrf-de-outra-sessao"}).status_code == 403
     assert grant(client, csrf, ["dom_synthetic_a"]).status_code == 201
+
+
+def test_mutation_matrix_rejects_missing_invalid_cross_session_csrf_and_external_origins(client):
+    assert login(client).status_code == 201
+    token_a = client.cookies.get("jarvis_session")
+    csrf_a = csrf_for(client)
+    grant_a = grant(client, csrf_a, ["dom_synthetic_a"])
+    assert grant_a.status_code == 201
+
+    assert login(client).status_code == 201
+    token_b = client.cookies.get("jarvis_session")
+    csrf_b = csrf_for(client)
+    assert token_a != token_b
+    assert csrf_a != csrf_b
+    client.cookies.set("jarvis_session", token_a)
+
+    grant_body = {
+        "connector": "calendar_sim",
+        "permission": "read",
+        "resource_ids": [RESOURCE],
+        "domain_ids": ["dom_synthetic_b"],
+        "expires_at": (datetime.now(timezone.utc) + timedelta(days=2)).isoformat(),
+    }
+    mutations = (
+        ("POST", "/real/grants", grant_body),
+        ("POST", f"/real/grants/{grant_a.json()['id']}/revoke", {}),
+        ("PUT", "/real/calendar-sim/calendars/sim_calendar_a/classification", {"domain_id": "dom_synthetic_a"}),
+        ("POST", "/real/calendar-sim/sync", {"calendar_id": "sim_calendar_a"}),
+        ("DELETE", "/real/session", None),
+    )
+    headers_to_reject = (
+        {"origin": ALLOWED_ORIGIN},
+        {"origin": ALLOWED_ORIGIN, "x-csrf-token": "invalid-csrf-token"},
+        {"origin": ALLOWED_ORIGIN, "x-csrf-token": csrf_b},
+        {"origin": "https://evil.example", "x-csrf-token": csrf_a},
+    )
+    for method, path, body in mutations:
+        for headers in headers_to_reject:
+            response = client.request(method, path, json=body, headers=headers)
+            assert response.status_code == 403, (method, path, headers)
+
+    listed = client.get("/real/grants", headers={"origin": ALLOWED_ORIGIN})
+    assert listed.status_code == 200
+    assert [item["id"] for item in listed.json()] == [grant_a.json()["id"]]
+    assert _grants[grant_a.json()["id"]].revoked is False
+    assert [event["id"] for event in client.get("/real/events").json()] == ["real_evt_synth_a_1"]
+
+    client.cookies.set("jarvis_session", token_b)
+    assert client.post(
+        "/real/grants", json=grant_body,
+        headers={"origin": ALLOWED_ORIGIN, "x-csrf-token": csrf_a},
+    ).status_code == 403
 
 
 def test_host_external_dns_rebinding_and_public_server_scope_are_rejected(client):
