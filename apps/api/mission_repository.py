@@ -277,6 +277,18 @@ class MissionRepository:
                         (knowledge["id"], owner, mission["id"], knowledge["domain_id"], knowledge["state"], knowledge["content"], knowledge["skill_version"], now),
                     )
                     self._append_event(connection, mission, owner, "artifact_created", task["id"], "Artefato draft criado por código determinístico.", now)
+                elif task["id"] == "task_context":
+                    mission["artifacts"].append(self._draft_artifact(
+                        mission, now, "context_bundle", "Pacote de contexto sintético",
+                        "Minimização determinística no servidor. Não concede acesso e não consulta fonte não autorizada.",
+                    ))
+                    self._append_event(connection, mission, owner, "artifact_created", task["id"], "Contexto sintético registrado como rascunho.", now)
+                elif task["id"] == "task_report":
+                    mission["artifacts"].append(self._draft_artifact(
+                        mission, now, "report", f"Rascunho: {mission['title'][:80]}",
+                        "Rascunho determinístico aguardando revisão humana. Nenhuma aprovação foi marcada.",
+                    ))
+                    self._append_event(connection, mission, owner, "artifact_created", task["id"], "Rascunho criado sem aprovação automática.", now)
                 mission["status"] = "done" if all(item["status"] == "done" for item in mission["tasks"]) else "running"
         else:
             raise MissionRejected("ação desconhecida")
@@ -285,6 +297,26 @@ class MissionRepository:
         record["mission"] = mission
         record["revision"] = record["revision"] + 1
         return record
+
+    def _draft_artifact(self, mission: dict, now: str, kind: str, title: str, content: str) -> dict:
+        return {
+            "id": _token("artifact"),
+            "kind": kind,
+            "title": title,
+            "content": content,
+            "skill_version": "1.0.0",
+            "review_state": "draft",
+            "reviewed_at": None,
+            "source_refs": [{
+                "source_id": f"synthetic:mission:{mission['id']}",
+                "uri": None,
+                "observed_at": now,
+                "last_verified_at": now,
+                "valid_until": None,
+                "domain_id": mission["domain_id"],
+            }],
+            "created_at": now,
+        }
 
     def _append_event(self, connection, mission: dict, owner: str, event_type: str, task_id: str | None, message: str, now: str) -> None:
         event_id = _token("event")

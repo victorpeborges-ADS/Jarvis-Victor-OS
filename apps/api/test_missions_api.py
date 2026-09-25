@@ -135,6 +135,19 @@ def test_revision_conflict_rollback_and_deterministic_skill(client, monkeypatch)
     with sqlite3.connect(client.database_path) as connection:
         knowledge = connection.execute("SELECT state FROM mission_knowledge").fetchone()
     assert knowledge[0] == "staged"
+    revision = 2
+    for key in ("run-key-02", "run-key-03"):
+        step = client.post(
+            f"/real/missions/{mission_id}/transition",
+            headers=headers,
+            json={"action": "run_next", "expected_revision": revision, "idempotency_key": key},
+        )
+        assert step.status_code == 200, step.text
+        revision = step.json()["revision"]
+    finished = step.json()
+    assert finished["mission"]["status"] == "done"
+    assert finished["mission"]["artifacts"][-1]["review_state"] == "draft"
+    assert "aprovação" not in finished["mission"]["artifacts"][-1]["review_state"]
 
     conflict = client.post(
         f"/real/missions/{mission_id}/transition",
