@@ -36,7 +36,8 @@ async function grantAndClassify(page: import("@playwright/test").Page, domainId:
   await page.getByTestId("grant-domain").selectOption(domainId);
   await page.getByTestId("grant-create").click();
   await page.getByTestId("grant-inventory").click();
-  await expect(page.getByTestId("grant-card").filter({ hasText: `Escopo sintético ${suffix}` })).toBeVisible();
+  await expect(page.getByTestId("grant-card").filter({ hasText: "Calendar fictício" }).filter({ hasText: `Escopo sintético ${suffix}` })).toBeVisible();
+  await expect(page.getByTestId("grant-card").filter({ hasText: "Inventário limitado" }).filter({ hasText: `Escopo sintético ${suffix}` })).toBeVisible();
 
   // The card itself is selected by its explicit stable calendar identifier.
   const calendarCard = page.locator(`[data-testid="calendar-card"][data-calendar-id="${calendarId}"]`);
