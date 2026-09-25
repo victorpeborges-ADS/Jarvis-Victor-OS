@@ -8,7 +8,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from domain_registry import CANONICAL_DOMAIN_IDS
 from local_security import _session_from, mission_domains
 from mission_engine import available_actions
-from mission_repository import MissionConflict, MissionCorrupt, MissionRejected, MissionRepository
+from mission_repository import MissionConflict, MissionCorrupt, MissionDenied, MissionRejected, MissionRepository
 
 router = APIRouter(prefix="/real/missions", tags=["missions-synthetic"])
 
@@ -107,6 +107,8 @@ def transition_mission(mission_id: str, body: MissionTransitionIn, request: Requ
         ))
     except MissionConflict as exc:
         raise HTTPException(status_code=409, detail=exc.detail) from exc
+    except MissionDenied as exc:
+        raise HTTPException(status_code=403, detail=exc.detail) from exc
     except MissionRejected as exc:
         raise HTTPException(status_code=422, detail=exc.detail) from exc
 

@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import sqlite3
 import time
 from pathlib import Path
 
@@ -155,6 +156,7 @@ class MissionEngine:
                     raise MissionRejected("não há execução interrompida")
                 task = next(item for item in mission["tasks"] if item["id"] == execution["task_id"])
                 execution_id = execution["id"]
+                required_phase = "interrupted"
             else:
                 if mission["status"] in {"cancelled", "failed", "done", "interrupted"}:
                     raise MissionRejected("execução não se aplica a este estado")
@@ -168,29 +170,50 @@ class MissionEngine:
                 if task["attempt"] > MAX_ATTEMPTS:
                     raise MissionRejected("limite de tentativas")
                 execution_id = f"exec_{mission_id[-12:]}_{task['id']}_{task['attempt']}"
-                connection.execute(
-                    "INSERT INTO mission_executions(id, mission_id, owner, task_id, phase, attempt, skill_id, skill_version, input_digest, revision_at_start, created_at) VALUES (?, ?, ?, ?, 'open', ?, ?, '1.0.0', ?, ?, ?)",
-                    (execution_id, mission_id, owner, task["id"], task["attempt"], "capture-and-classify" if task["id"] == "task_capture" else "local-step", _digest(mission["title"], task["id"]), expected_revision, _now()),
-                )
+                try:
+                    connection.execute(
+                        "INSERT INTO mission_executions(id, mission_id, owner, task_id, phase, attempt, skill_id, skill_version, input_digest, revision_at_start, created_at) VALUES (?, ?, ?, ?, 'open', ?, ?, '1.0.0', ?, ?, ?)",
+                        (execution_id, mission_id, owner, task["id"], task["attempt"], "capture-and-classify" if task["id"] == "task_capture" else "local-step", _digest(mission["title"], task["id"]), expected_revision, _now()),
+                    )
+                except sqlite3.IntegrityError as exc:
+                    raise MissionConflict("execução já iniciada") from exc
                 mission["status"] = "running"
                 task["status"] = "running"
                 task["updated_at"] = _now()
                 mission["updated_at"] = task["updated_at"]
-                connection.execute(
-                    "UPDATE missions SET status=?, document_json=?, updated_at=? WHERE id=? AND owner=? AND revision=?",
+                opened = connection.execute(
+                    "UPDATE missions SET status=?, document_json=?, updated_at=? WHERE id=? AND owner=? AND revision=? AND status NOT IN ('cancelled', 'failed')",
                     ("running", json.dumps(mission, ensure_ascii=False), mission["updated_at"], mission_id, owner, expected_revision),
                 )
+                if opened.rowcount != 1:
+                    raise MissionConflict("execução já encerrada")
+                required_phase = "open"
         _pause_if_requested()
         now = _now()
         artifact, knowledge = _produce(mission, task, now)
+        domain_id = mission.get("domain_id") or ""
+        from local_security import mission_write_confirmed
+        from mission_repository import MissionDenied
+        try:
+            with mission_write_confirmed(owner, domain_id):
+                return self._confirm_locked(
+                    store, owner, mission_id, execution_id, required_phase, expected_revision,
+                    task, artifact, knowledge, now, idempotency_key, body_hash,
+                )
+        except PermissionError as exc:
+            self._park_unconfirmed(store, owner, mission_id, execution_id)
+            raise MissionDenied("concessão de missão revogada ou expirada") from exc
+
+    def _confirm_locked(self, store, owner, mission_id, execution_id, required_phase, expected_revision, task, artifact, knowledge, now, idempotency_key, body_hash):
+        from mission_repository import MissionConflict, MissionRejected, _check_mission, _record_from_row
         with store.transaction() as connection:
             current = connection.execute(
-                "SELECT phase FROM mission_executions WHERE id=?",
-                (execution_id,),
+                "SELECT phase FROM mission_executions WHERE id=? AND mission_id=? AND owner=?",
+                (execution_id, mission_id, owner),
             ).fetchone()
-            if current is None or current["phase"] not in {"open", "interrupted"}:
-                raise MissionConflict("execução já encerrada")
             fresh = connection.execute("SELECT * FROM missions WHERE id=? AND owner=?", (mission_id, owner)).fetchone()
+            if current is None or current["phase"] != required_phase or fresh is None or fresh["revision"] != expected_revision or fresh["status"] in {"cancelled", "failed"}:
+                raise MissionConflict("execução já encerrada")
             record = _record_from_row(fresh)
             mission = record["mission"]
             task = next(item for item in mission["tasks"] if item["id"] == task["id"])
@@ -207,22 +230,48 @@ class MissionEngine:
             self.repository._append_event(connection, mission, owner, "artifact_created", task["id"], "Artefato draft confirmado na mesma transação.", now, stable_key=f"{execution_id}:artifact")
             mission["status"] = "done" if all(item["status"] == "done" for item in mission["tasks"]) else "running"
             mission["updated_at"] = now
-            from mission_repository import _check_mission
             _check_mission(mission)
             if mission["status"] == "done" and any(item.get("review_state") not in {None, "draft", "not_required", "awaiting_approval"} for item in mission["artifacts"]):
                 raise MissionRejected("conclusão não pode aprovar artefato")
             revision = fresh["revision"] + 1
-            connection.execute(
-                "UPDATE missions SET status=?, revision=?, document_json=?, updated_at=? WHERE id=? AND owner=?",
-                (mission["status"], revision, json.dumps(mission, ensure_ascii=False), now, mission_id, owner),
+            updated = connection.execute(
+                "UPDATE missions SET status=?, revision=?, document_json=?, updated_at=? WHERE id=? AND owner=? AND revision=? AND status NOT IN ('cancelled', 'failed')",
+                (mission["status"], revision, json.dumps(mission, ensure_ascii=False), now, mission_id, owner, expected_revision),
             )
-            connection.execute(
-                "UPDATE mission_executions SET phase='committed', committed_at=? WHERE id=?",
-                (now, execution_id),
+            closed = connection.execute(
+                "UPDATE mission_executions SET phase='committed', committed_at=? WHERE id=? AND phase=?",
+                (now, execution_id, required_phase),
             )
+            if updated.rowcount != 1 or closed.rowcount != 1:
+                raise MissionConflict("execução já encerrada")
             connection.execute(
                 "INSERT OR IGNORE INTO mission_idempotency(owner, idempotency_key, mission_id, body_sha256) VALUES (?, ?, ?, ?)",
                 (owner, idempotency_key, mission_id, body_hash),
             )
             fresh = connection.execute("SELECT * FROM missions WHERE id=? AND owner=?", (mission_id, owner)).fetchone()
             return _record_from_row(fresh)
+
+    def _park_unconfirmed(self, store, owner: str, mission_id: str, execution_id: str) -> None:
+        from mission_repository import MissionCorrupt, _now, _record_from_row
+        now = _now()
+        with store.transaction() as connection:
+            closed = connection.execute(
+                "UPDATE mission_executions SET phase='interrupted', committed_at=? WHERE id=? AND mission_id=? AND owner=? AND phase='open'",
+                (now, execution_id, mission_id, owner),
+            )
+            if closed.rowcount != 1:
+                return
+            row = connection.execute("SELECT * FROM missions WHERE id=? AND owner=?", (mission_id, owner)).fetchone()
+            if row is None or row["status"] in {"cancelled", "done", "failed"}:
+                return
+            try:
+                record = _record_from_row(row)
+            except MissionCorrupt:
+                return
+            mission = record["mission"]
+            mission["status"] = "interrupted"
+            mission["updated_at"] = now
+            connection.execute(
+                "UPDATE missions SET status='interrupted', revision=revision+1, document_json=?, updated_at=? WHERE id=? AND owner=? AND status!=?",
+                (json.dumps(mission, ensure_ascii=False), now, mission_id, owner, "cancelled"),
+            )

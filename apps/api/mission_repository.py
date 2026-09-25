@@ -31,6 +31,11 @@ class MissionCorrupt(Exception):
         self.mission_id = mission_id
 
 
+class MissionDenied(Exception):
+    def __init__(self, detail: str) -> None:
+        self.detail = detail
+
+
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -274,7 +279,7 @@ class MissionRepository:
                     task["updated_at"] = now
             self._append_event(connection, mission, owner, "mission_cancelled", None, "Missão cancelada no servidor.", now)
             connection.execute(
-                "UPDATE mission_executions SET phase='interrupted', committed_at=? WHERE mission_id=? AND owner=? AND phase IN ('open', 'interrupted')",
+                "UPDATE mission_executions SET phase='failed', committed_at=? WHERE mission_id=? AND owner=? AND phase='open'",
                 (now, mission["id"], owner),
             )
         elif action == "fail":
@@ -288,6 +293,10 @@ class MissionRepository:
             task["updated_at"] = now
             mission["status"] = "failed"
             self._append_event(connection, mission, owner, "task_failed", task["id"], "Etapa marcada como falha pelo executor.", now)
+            connection.execute(
+                "UPDATE mission_executions SET phase='failed', committed_at=? WHERE mission_id=? AND owner=? AND phase='open'",
+                (now, mission["id"], owner),
+            )
         elif action == "retry":
             if mission["status"] != "failed":
                 raise MissionRejected("retry exige missão falha")

@@ -288,6 +288,20 @@ def authorized_calendar_inventory_domains(principal: str) -> frozenset[str]:
     return _calendar_domains_for(principal, CALENDAR_INVENTORY_RESOURCE)
 
 
+@contextmanager
+def mission_write_confirmed(principal: str, domain_id: str):
+    """Hold grant revocation stable until the caller finishes its SQLite commit.
+
+    Lock order is grant lock, then the SQLite write transaction. Callers must
+    not acquire the grant lock while already inside a SQLite transaction:
+    event reads take the grant lock first and then the database.
+    """
+    with _grant_lock:
+        if domain_id not in mission_domains(principal, MISSION_WRITE_RESOURCE):
+            raise PermissionError("concessão de missão revogada ou expirada")
+        yield
+
+
 def mission_domains(principal: str, resource_id: str) -> frozenset[str]:
     """Domains covered by an active mission_sim grant for one resource.
 
