@@ -26,3 +26,4 @@ export interface DeviceGrant { id: string; principal: string; device_id: string;
 export interface SyncEnvelope { version: 1; id: string; generated_at: Timestamp; cursor: string | null; items: Array<{ id: string; kind: "mission" | "knowledge" | "artifact"; payload?: Record<string, unknown> }>; }
 export interface NotificationPolicy { enabled: boolean; channels: Array<"in_app">; interruptions: "never" | "critical_only" | "all"; quiet_hours: null | { start: string; end: string; timezone: string }; }
 export interface Mission { schema_version: 1; id: string; title: string; description?: string; status: MissionStatus; domain_id: string | null; tasks: MissionTask[]; checkpoints: MissionCheckpoint[]; events: MissionEvent[]; artifacts: Artifact[]; budget: { cap: 0; spent: 0 }; created_at: Timestamp; updated_at: Timestamp; }
+export interface MissionRecord { dataset: "api_synthetic"; owner: string; revision: number; access_class: "synthetic_local"; mission: Mission; }

@@ -200,6 +200,17 @@
         "created_at": { "$ref": "#/$defs/Timestamp" },
         "updated_at": { "$ref": "#/$defs/Timestamp" }
       }
+    },
+    "MissionRecord": {
+      "type": "object", "additionalProperties": false,
+      "required": ["dataset", "owner", "revision", "access_class", "mission"],
+      "properties": {
+        "dataset": { "const": "api_synthetic" },
+        "owner": { "type": "string", "minLength": 1, "maxLength": 120 },
+        "revision": { "type": "integer", "minimum": 1, "maximum": 100000 },
+        "access_class": { "const": "synthetic_local" },
+        "mission": { "$ref": "#/$defs/Mission" }
+      }
     }
   }
 }
