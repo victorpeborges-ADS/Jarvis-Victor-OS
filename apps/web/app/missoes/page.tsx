@@ -15,7 +15,7 @@ const DOMAINS = [
 
 const statusLabels: Record<Mission["status"], string> = {
   draft: "Rascunho", planned: "Planejada", awaiting_approval: "Aguardando aprovação", running: "Em simulação",
-  blocked: "Bloqueada", done: "Concluída", cancelled: "Cancelada", failed: "Falhou"
+  blocked: "Bloqueada", done: "Concluída", cancelled: "Cancelada", failed: "Falhou", interrupted: "Interrompida"
 };
 
 export default function MissionsPage() {
