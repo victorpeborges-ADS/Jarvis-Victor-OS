@@ -1,6 +1,6 @@
 import { spawn, spawnSync } from "node:child_process";
+import { assertPortAvailable, createReadinessToken, waitForOwnedApi } from "./e2e-api-readiness.mjs";
 import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
-import net from "node:net";
 import { tmpdir } from "node:os";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -8,8 +8,9 @@ import { fileURLToPath } from "node:url";
 const webDir = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const apiDir = resolve(webDir, "../api");
 const passphrase = "synthetic-e2e-only-passphrase-2026";
+const readinessToken = createReadinessToken();
 const webOrigin = process.env.JARVIS_E2E_WEB_ORIGIN ?? "http://127.0.0.1:3000";
-const screenshotDir = resolve(webDir, "../../docs/nightly/captures");
+const screenshotDir = resolve(process.env.JARVIS_E2E_SCREENSHOT_DIR ?? resolve(webDir, "../../docs/nightly/captures"));
 
 function requireLocalOrigin(value, expectedPort, label) {
   let url;
@@ -45,29 +46,9 @@ const apiEnv = {
   ...Object.fromEntries(Object.entries(process.env).filter(([key]) => !/^JARVIS_/i.test(key) && !/(?:^|_)(?:token|secret|password|passphrase|credential|cookie|authorization|private_key|api_key|access_key)(?:_|$)/i.test(key))),
   JARVIS_BIND_HOST: apiBindHost,
   JARVIS_BIND_PORT: String(apiPort),
-  JARVIS_LOCAL_PASSPHRASE: passphrase
+  JARVIS_LOCAL_PASSPHRASE: passphrase,
+  JARVIS_E2E_READY_TOKEN: readinessToken
 };
-
-function ensurePortAvailable(port, host, label) {
-  return new Promise((resolvePromise, reject) => {
-    const server = net.createServer();
-    server.once("error", () => reject(new Error(`Porta ${label} ${port} já está ocupada; escolha outra porta loopback para o E2E.`)));
-    server.listen(port, host, () => server.close(resolvePromise));
-  });
-}
-
-async function waitForApi(child) {
-  const deadline = Date.now() + 60_000;
-  while (Date.now() < deadline) {
-    if (child.exitCode !== null) throw new Error(`API sintética encerrou antes de ficar pronta (exit ${child.exitCode}).`);
-    try {
-      const response = await fetch(`${apiOrigin}/health`, { signal: AbortSignal.timeout(1000) });
-      if (response.ok) return;
-    } catch { /* wait for the local runner */ }
-    await new Promise((resolvePromise) => setTimeout(resolvePromise, 250));
-  }
-  throw new Error("Tempo esgotado ao iniciar a API sintética em loopback.");
-}
 
 async function waitForWeb(child, getOutput) {
   const deadline = Date.now() + 60_000;
@@ -98,8 +79,8 @@ let playwright;
 let tempDir;
 let exitCode = 1;
 try {
-  await ensurePortAvailable(apiPort, apiBindHost, "API");
-  await ensurePortAvailable(webPort, webBindHost, "web");
+  await assertPortAvailable(apiPort, apiBindHost, "API");
+  await assertPortAvailable(webPort, webBindHost, "web");
 
   const webEnv = {
     ...Object.fromEntries(Object.entries(apiEnv).filter(([key]) => !/^JARVIS_/i.test(key))),
@@ -122,7 +103,7 @@ try {
     detached: true,
     stdio: "ignore"
   });
-  await waitForApi(api);
+  await waitForOwnedApi({ child: api, origin: apiOrigin, token: readinessToken });
 
   let webOutput = "";
   web = spawn(process.execPath, [
@@ -145,7 +126,7 @@ try {
   mkdirSync(screenshotDir, { recursive: true });
 
   const playwrightEnv = {
-    ...apiEnv,
+    ...Object.fromEntries(Object.entries(apiEnv).filter(([key]) => key !== "JARVIS_E2E_READY_TOKEN")),
     JARVIS_E2E_WEB_ORIGIN: checkedWebOrigin,
     JARVIS_E2E_API_ORIGIN: apiOrigin,
     JARVIS_E2E_SCREENSHOT_DIR: screenshotDir,

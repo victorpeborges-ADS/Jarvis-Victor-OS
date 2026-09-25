@@ -21,6 +21,7 @@ test("missão sintética executa skills, mantém proveniência e sobrevive ao re
   await expect(page.getByTestId("mission-task").nth(0)).toContainText("Concluída");
   await run.click();
   await expect(page.getByRole("heading", { name: "Pacote de contexto sintético" })).toBeVisible();
+  await expect(page.getByTestId("mission-artifact").last()).toContainText("Comparação sintética minimizada:");
   await run.click();
   await expect(page.getByRole("heading", { name: "Rascunho: Síntese de exemplo fictício" })).toBeVisible();
   await expect(page.getByText("MISSÃO SINTÉTICA · CONCLUÍDA")).toBeVisible();
@@ -42,7 +43,9 @@ test("missão sintética executa skills, mantém proveniência e sobrevive ao re
     path: resolve(shots, `missions-${info.project.name}.png`),
     fullPage: true
   });
-  await screenshotStyle.evaluate((element) => element.remove());
+  await screenshotStyle.evaluate((element) => {
+    if (element instanceof Element) element.remove();
+  });
   await page.reload();
   await expect(page.getByRole("heading", { name: "Síntese de exemplo fictício", exact: true })).toBeVisible();
   await expect(page.getByRole("heading", { name: "Rascunho: Síntese de exemplo fictício" })).toBeVisible();
@@ -64,4 +67,46 @@ test("falha sintética admite retry e cancelamento local", async ({ page }) => {
   await page.getByRole("button", { name: "Cancelar" }).click();
   await expect(page.locator("p[role='status']")).toHaveText("Missão cancelada localmente.");
   await expect(page.getByText("MISSÃO SINTÉTICA · CANCELADA")).toBeVisible();
+});
+
+test("missões inválidas são isoladas e a cópia pode ser recuperada sem perder as válidas", async ({ page }) => {
+  await page.goto("/missoes");
+  await page.getByLabel("Nome").fill("Missão válida preservada");
+  await page.getByRole("button", { name: "Criar missão" }).click();
+  await page.evaluate(() => {
+    const missions = JSON.parse(localStorage.getItem("jarvis.synthetic.missions.v1") ?? "[]");
+    missions.push({ schema_version: 1, id: "mission_tampered", title: "Inválida", tasks: [{ id: 17 }], events: [], budget: { cap: 0, spent: 0 } });
+    localStorage.setItem("jarvis.synthetic.missions.v1", JSON.stringify(missions));
+  });
+  await page.reload();
+  await expect(page.getByRole("heading", { name: "Missão válida preservada", exact: true })).toBeVisible();
+  await expect(page.getByTestId("mission-quarantine-notice")).toContainText("1 registro(s) local(is) inválido(s) foram isolados");
+  const quarantine = await page.evaluate(() => JSON.parse(localStorage.getItem("jarvis.synthetic.missions.quarantine.v1") ?? "null"));
+  expect(quarantine.records[0].raw).toContain("mission_tampered");
+
+  const downloadPromise = page.waitForEvent("download");
+  await page.getByRole("button", { name: "Baixar pacote de recuperação" }).click();
+  expect((await downloadPromise).suggestedFilename()).toBe("jarvis-missoes-quarentena-recuperacao.json");
+  await page.getByRole("button", { name: "Descartar cópia isolada" }).click();
+  await expect(page.getByTestId("mission-quarantine-notice")).toHaveCount(0);
+  await expect(page.getByRole("heading", { name: "Missão válida preservada", exact: true })).toBeVisible();
+});
+
+test("quando a quarentena não pode ser salva, preserva a origem, bloqueia edição e permite baixar a cópia", async ({ page }) => {
+  const original = '[{"invalid":true}]';
+  await page.addInitScript((raw) => {
+    localStorage.setItem("jarvis.synthetic.missions.v1", raw);
+    const nativeSetItem = Storage.prototype.setItem;
+    Storage.prototype.setItem = function (key: string, value: string) {
+      if (key === "jarvis.synthetic.missions.quarantine.v1") throw new DOMException("quota de teste", "QuotaExceededError");
+      nativeSetItem.call(this, key, value);
+    };
+  }, original);
+  await page.goto("/missoes");
+  await expect(page.getByTestId("mission-quarantine-notice")).toContainText("a origem foi preservada");
+  await expect(page.getByRole("button", { name: "Criar missão" })).toBeDisabled();
+  expect(await page.evaluate(() => localStorage.getItem("jarvis.synthetic.missions.v1"))).toBe(original);
+  const downloadPromise = page.waitForEvent("download");
+  await page.getByRole("button", { name: "Baixar pacote de recuperação" }).click();
+  expect((await downloadPromise).suggestedFilename()).toBe("jarvis-missoes-quarentena-recuperacao.json");
 });

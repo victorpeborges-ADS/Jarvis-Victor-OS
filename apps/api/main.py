@@ -1,8 +1,12 @@
 from contextlib import asynccontextmanager
+import hashlib
+import hmac
+import os
+import re
 import sqlite3
 from pathlib import Path
 
-from fastapi import APIRouter, FastAPI, HTTPException, Request
+from fastapi import APIRouter, FastAPI, HTTPException, Request, Response
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -37,7 +41,14 @@ def fixture_or_422() -> dict:
 
 
 @demo_router.get("/health", response_model=HealthOut)
-def health() -> HealthOut:
+def health(request: Request, response: Response) -> HealthOut:
+    # The E2E runner proves that its child process owns this listener with a
+    # per-run HMAC challenge. The proof is absent in normal application runs.
+    token = os.environ.get("JARVIS_E2E_READY_TOKEN")
+    nonce = request.headers.get("x-jarvis-e2e-nonce", "")
+    if token and re.fullmatch(r"[A-Za-z0-9_-]{32,128}", token) and re.fullmatch(r"[0-9a-f]{64}", nonce):
+        proof = hmac.new(token.encode("ascii"), nonce.encode("ascii"), hashlib.sha256).hexdigest()
+        response.headers["X-JARVIS-E2E-Ready-Proof"] = proof
     return HealthOut(status="ok", gate=1, mode="mock", demo=True)
 
 

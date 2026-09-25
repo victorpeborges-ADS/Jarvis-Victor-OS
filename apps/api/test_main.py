@@ -1,3 +1,6 @@
+import hashlib
+import hmac
+
 from fastapi.testclient import TestClient
 from main import create_app
 from server_config import LocalServerConfig
@@ -8,6 +11,22 @@ def test_health():
     r = client.get("/health")
     assert r.status_code == 200
     assert r.json()["demo"] is True
+    assert "x-jarvis-e2e-ready-proof" not in r.headers
+
+def test_e2e_health_proof_is_a_keyed_challenge(monkeypatch, tmp_path):
+    token = "synthetic-runner-private-random-token"
+    monkeypatch.setenv("JARVIS_E2E_READY_TOKEN", token)
+    app = create_app(LocalServerConfig(), database_path=tmp_path / "e2e-health.sqlite3")
+    test_client = TestClient(app, base_url="http://127.0.0.1", client=("127.0.0.1", 51001))
+    nonce = "ab" * 32
+    response = test_client.get("/health", headers={"x-jarvis-e2e-nonce": nonce})
+    assert response.status_code == 200
+    assert response.headers["x-jarvis-e2e-ready-proof"] == hmac.new(
+        token.encode("ascii"), nonce.encode("ascii"), hashlib.sha256
+    ).hexdigest()
+    assert "x-jarvis-e2e-ready-proof" not in test_client.get(
+        "/health", headers={"x-jarvis-e2e-nonce": "invalid"}
+    ).headers
 
 def test_briefing_has_next():
     r = client.get("/briefing")
