@@ -7,7 +7,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from domain_registry import CANONICAL_DOMAIN_IDS
 from local_security import _session_from, mission_domains
-from mission_repository import MissionConflict, MissionRejected, MissionRepository
+from mission_repository import MissionConflict, MissionCorrupt, MissionRejected, MissionRepository
 
 router = APIRouter(prefix="/real/missions", tags=["missions-synthetic"])
 
@@ -69,13 +69,17 @@ def list_missions(request: Request, domain_id: str | None = None, limit: int = 2
             raise HTTPException(status_code=403, detail="concessão de missão ausente")
     page = _repo(request).list_page(session.principal, domain_id, limit, cursor)
     page["items"] = [item for item in page["items"] if item["mission"]["domain_id"] in allowed]
+    page["corrupt"] = [item for item in page.get("corrupt", []) if item.get("domain_id") in allowed]
     return page
 
 
 @router.get("/{mission_id}")
 def read_mission(mission_id: str, request: Request) -> dict:
     session = _session_from(request)
-    record = _repo(request).get(session.principal, mission_id)
+    try:
+        record = _repo(request).get(session.principal, mission_id)
+    except MissionCorrupt as exc:
+        raise HTTPException(status_code=409, detail="integridade do registro de missão") from exc
     if record is None:
         raise HTTPException(status_code=404, detail="registro ausente")
     _require(session.principal, "mission:read", record["mission"]["domain_id"])

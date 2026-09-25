@@ -185,6 +185,11 @@ def test_repeated_import_does_not_duplicate_and_backup_restores(client, tmp_path
     again = client.post("/real/missions/import", headers={"origin": ORIGIN, "x-csrf-token": csrf}, json=payload)
     assert again.status_code == 200
     assert again.json()["replayed"] is True
+    assert again.json()["accepted"] == imported.json()["accepted"]
+    changed = dict(payload)
+    changed["missions"] = [{**document, "title": "titulo alterado na mesma chave"}, {"title": "ruim"}]
+    conflict = client.post("/real/missions/import", headers={"origin": ORIGIN, "x-csrf-token": csrf}, json=changed)
+    assert conflict.status_code == 409
     listed = client.get("/real/missions?domain_id=dom_synthetic_a", headers={"origin": ORIGIN})
     assert listed.status_code == 200
     assert len(listed.json()["items"]) == 1
@@ -195,6 +200,25 @@ def test_repeated_import_does_not_duplicate_and_backup_restores(client, tmp_path
         assert connection.execute("SELECT COUNT(*) FROM missions").fetchone()[0] == 1
         assert connection.execute("SELECT COUNT(*) FROM mission_events").fetchone()[0] >= 1
         assert connection.execute("SELECT id FROM mission_knowledge").fetchone() is None
+
+
+def test_corrupt_mission_document_is_stable_and_not_deleted(client):
+    csrf = login(client)
+    mission_grants(client, csrf)
+    created = create(client, csrf, "segredo que nao pode vazar")
+    mission_id = created["mission"]["id"]
+    with sqlite3.connect(client.database_path) as connection:
+        connection.execute("UPDATE missions SET document_json=? WHERE id=?", ("{", mission_id))
+    broken = client.get(f"/real/missions/{mission_id}", headers={"origin": ORIGIN})
+    assert broken.status_code == 409
+    assert "segredo" not in broken.text
+    assert broken.json()["detail"] == "integridade do registro de missão"
+    listed = client.get("/real/missions?domain_id=dom_synthetic_a", headers={"origin": ORIGIN})
+    assert listed.status_code == 200
+    assert listed.json()["items"] == []
+    assert listed.json()["corrupt"] == [{"id": mission_id, "domain_id": "dom_synthetic_a", "integrity": "corrupt"}]
+    with sqlite3.connect(client.database_path) as connection:
+        assert connection.execute("SELECT document_json FROM missions WHERE id=?", (mission_id,)).fetchone()[0] == "{"
 
 
 def test_revoked_mission_grant_hides_the_next_read(client):

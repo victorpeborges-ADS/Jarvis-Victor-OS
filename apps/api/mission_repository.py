@@ -26,6 +26,11 @@ class MissionRejected(Exception):
         self.detail = detail
 
 
+class MissionCorrupt(Exception):
+    def __init__(self, mission_id: str) -> None:
+        self.mission_id = mission_id
+
+
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -138,7 +143,11 @@ def new_mission(title: str, domain_id: str, owner: str) -> dict:
 
 
 def _record_from_row(row) -> dict:
-    mission = json.loads(row["document_json"])
+    try:
+        mission = json.loads(row["document_json"])
+        validate_contract("Mission", mission)
+    except (json.JSONDecodeError, ValueError, TypeError) as exc:
+        raise MissionCorrupt(row["id"]) from exc
     return {
         "dataset": "api_synthetic",
         "owner": row["owner"],
@@ -176,7 +185,9 @@ class MissionRepository:
                 "SELECT * FROM missions WHERE id=? AND owner=?",
                 (mission_id, owner),
             ).fetchone()
-        return _record_from_row(row) if row else None
+        if row is None:
+            return None
+        return _record_from_row(row)
 
     def list_page(self, owner: str, domain_id: str | None, limit: int, cursor: str | None) -> dict:
         limit = min(max(limit, 1), PAGE_LIMIT)
@@ -196,7 +207,14 @@ class MissionRepository:
             ).fetchall()
         page = rows[:limit]
         next_cursor = page[-1]["id"] if len(rows) > limit and page else None
-        return {"dataset": "api_synthetic", "items": [_record_from_row(row) for row in page], "next_cursor": next_cursor}
+        items = []
+        corrupt = []
+        for row in page:
+            try:
+                items.append(_record_from_row(row))
+            except MissionCorrupt:
+                corrupt.append({"id": row["id"], "domain_id": row["domain_id"], "integrity": "corrupt"})
+        return {"dataset": "api_synthetic", "items": items, "corrupt": corrupt, "next_cursor": next_cursor}
 
     def transition(self, owner: str, mission_id: str, action: str, expected_revision: int, idempotency_key: str) -> dict:
         body_hash = _sha({"action": action, "mission_id": mission_id, "expected_revision": expected_revision})
@@ -362,16 +380,20 @@ class MissionRepository:
                 quarantined.append({"index": index, "reason": exc.detail})
         if quarantined and len(quarantined) == len(documents):
             return {"dataset": "api_synthetic", "accepted": [], "quarantined": quarantined}
-        body_hash = _sha({"documents": [item.get("id") for item in documents]})
+        body_hash = _sha({"scope": "mission_import", "owner": owner, "documents": documents})
         with self.store.transaction() as connection:
             existing = connection.execute(
-                "SELECT mission_id, body_sha256 FROM mission_idempotency WHERE owner=? AND idempotency_key=?",
+                "SELECT mission_id, body_sha256, result_json FROM mission_idempotency WHERE owner=? AND idempotency_key=?",
                 (owner, idempotency_key),
             ).fetchone()
             if existing is not None:
                 if existing["body_sha256"] != body_hash:
                     raise MissionConflict("idempotência reutilizada com corpo diferente")
-                return {"dataset": "api_synthetic", "accepted": [], "quarantined": quarantined, "replayed": True}
+                if existing["result_json"]:
+                    stored = json.loads(existing["result_json"])
+                    stored["replayed"] = True
+                    return stored
+                return {"dataset": "api_synthetic", "accepted": [], "quarantined": quarantined, "replayed": True, "legacy": True}
             for index, document in enumerate(documents):
                 if any(item["index"] == index for item in quarantined):
                     continue
@@ -390,8 +412,9 @@ class MissionRepository:
                 }
                 self._insert_record(connection, record, owner, f"{idempotency_key}:{document['id']}", _sha(document))
                 accepted.append(document["id"])
+            result = {"dataset": "api_synthetic", "accepted": accepted, "quarantined": quarantined, "replayed": False}
             connection.execute(
-                "INSERT INTO mission_idempotency(owner, idempotency_key, mission_id, body_sha256) VALUES (?, ?, ?, ?)",
-                (owner, idempotency_key, accepted[0] if accepted else "mission_import_empty", body_hash),
+                "INSERT INTO mission_idempotency(owner, idempotency_key, mission_id, body_sha256, result_json) VALUES (?, ?, ?, ?, ?)",
+                (owner, idempotency_key, accepted[0] if accepted else "mission_import_empty", body_hash, json.dumps(result, ensure_ascii=False)),
             )
-        return {"dataset": "api_synthetic", "accepted": accepted, "quarantined": quarantined, "replayed": False}
+        return result

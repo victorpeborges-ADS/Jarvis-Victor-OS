@@ -9,11 +9,10 @@ O documento `Mission` v1 continua sendo o corpo compatível com o `localStorage`
 
 Transições válidas no servidor, na mesma transação do evento append-only:
 
-- `planned` ou `running` pode executar a próxima etapa cujas dependências estejam `done`.
+- `planned` ou `running` pode executar `run_next` quando as dependências estão `done`.
 - `done` só ocorre quando todas as etapas estão `done`.
 - `cancel` vale a partir de qualquer estado que não seja `done` nem `cancelled`.
-- `fail` e `retry` seguem a etapa indicada e não apagam eventos anteriores.
-- Revisão humana para `approved` não é automática. Artefato novo nasce em `draft`.
+- `fail`, `retry` e a marcação humana de artefato aprovado **não** são ações desta API no G3. Elas existem apenas na página DEMO do navegador. O motor G4, se implementado, precisa de contrato próprio antes de expô-las.
 
 `expected_revision` divergente responde 409 e não grava. Chave de idempotência repetida com o mesmo corpo devolve o mesmo registro; corpo diferente responde 409.
 
