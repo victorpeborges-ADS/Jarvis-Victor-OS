@@ -131,6 +131,23 @@
         "cost_cap": { "const": 0 }
       }
     },
+    "HandoffBundle": {
+      "type": "object", "additionalProperties": false,
+      "required": ["version", "id", "destination", "objective", "minimal_context", "source_refs", "restrictions", "approvals", "artifacts", "transmission", "created_at"],
+      "properties": {
+        "version": { "const": 1 },
+        "id": { "type": "string", "pattern": "^handoff_[a-zA-Z0-9_-]{1,80}$" },
+        "destination": { "const": "chatgpt_work" },
+        "objective": { "type": "string", "minLength": 1, "maxLength": 1000 },
+        "minimal_context": { "type": "string", "maxLength": 10000 },
+        "source_refs": { "type": "array", "items": { "$ref": "#/$defs/SourceRef" } },
+        "restrictions": { "type": "array", "items": { "type": "string", "maxLength": 500 }, "uniqueItems": true },
+        "approvals": { "type": "array", "items": { "type": "string", "maxLength": 500 }, "uniqueItems": true },
+        "artifacts": { "type": "array", "items": { "type": "string", "maxLength": 160 }, "uniqueItems": true },
+        "transmission": { "const": "manual_only" },
+        "created_at": { "$ref": "#/$defs/Timestamp" }
+      }
+    },
     "DeviceGrant": {
       "type": "object", "additionalProperties": false,
       "required": ["id", "principal", "device_id", "domains", "permissions", "expires_at", "revoked"],
