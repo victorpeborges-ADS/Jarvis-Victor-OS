@@ -210,10 +210,17 @@ class MissionRepository:
             return None
         return _record_from_row(row)
 
-    def list_page(self, owner: str, domain_id: str | None, limit: int, cursor: str | None) -> dict:
+    def list_page(self, owner: str, domain_id: str | None, limit: int, cursor: str | None,
+                  allowed_domains: frozenset[str] | set[str] | None = None) -> dict:
         limit = min(max(limit, 1), PAGE_LIMIT)
         clauses = ["owner=?"]
         params: list[Any] = [owner]
+        if allowed_domains is not None:
+            domains = sorted(allowed_domains)
+            if not domains:
+                return {"dataset": "api_synthetic", "items": [], "corrupt": [], "next_cursor": None}
+            clauses.append(f"domain_id IN ({','.join('?' for _ in domains)})")
+            params.extend(domains)
         if domain_id is not None:
             clauses.append("domain_id=?")
             params.append(domain_id)

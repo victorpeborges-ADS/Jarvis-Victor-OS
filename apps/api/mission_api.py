@@ -75,9 +75,8 @@ def list_missions(request: Request, domain_id: str | None = None, limit: int = 2
         allowed = mission_domains(session.principal, "mission:read")
         if not allowed:
             raise HTTPException(status_code=403, detail="concessão de missão ausente")
-    page = _repo(request).list_page(session.principal, domain_id, limit, cursor)
-    page["items"] = [_public(item) for item in page["items"] if item["mission"]["domain_id"] in allowed]
-    page["corrupt"] = [item for item in page.get("corrupt", []) if item.get("domain_id") in allowed]
+    page = _repo(request).list_page(session.principal, domain_id, limit, cursor, allowed)
+    page["items"] = [_public(item) for item in page["items"]]
     return page
 
 

@@ -64,6 +64,32 @@ def create(client: TestClient, csrf: str, title: str = "Missão sintética", key
     return response.json()
 
 
+def test_mission_queue_filters_domain_before_limit(client):
+    csrf = login(client)
+    read_a = grant(client, csrf, "mission:read", "dom_synthetic_a")
+    grant(client, csrf, "mission:write", "dom_synthetic_a")
+    read_b = grant(client, csrf, "mission:read", "dom_synthetic_b")
+    grant(client, csrf, "mission:write", "dom_synthetic_b")
+    ids = []
+    for index, domain in enumerate(("dom_synthetic_a", "dom_synthetic_b")):
+        response = client.post(
+            "/real/missions",
+            headers={"origin": ORIGIN, "x-csrf-token": csrf},
+            json={"title": f"Missão {index}", "domain_id": domain,
+                  "idempotency_key": f"pagination-create-{index}"},
+        )
+        assert response.status_code == 201
+        ids.append((response.json()["mission"]["id"], domain))
+    first, second = sorted(ids)
+    grant_to_revoke = read_a if first[1] == "dom_synthetic_a" else read_b
+    assert client.post(f"/real/grants/{grant_to_revoke}/revoke",
+                       headers={"origin": ORIGIN, "x-csrf-token": csrf}).status_code == 200
+    page = client.get("/real/missions?limit=1", headers={"origin": ORIGIN})
+    assert page.status_code == 200
+    assert [item["mission"]["id"] for item in page.json()["items"]] == [second[0]]
+    assert page.json()["next_cursor"] is None
+
+
 def test_calendar_grant_cannot_create_mission_and_missing_session_is_401(client):
     assert client.get("/real/missions").status_code == 401
     csrf = login(client)
