@@ -86,6 +86,7 @@ export function LocalIntegrationProvider({ children }: { children: ReactNode }) 
   const [eventsLoading, setEventsLoading] = useState(false);
   const [lastReport, setLastReport] = useState<CalendarSyncReport | null>(null);
   const generation = useRef(0);
+  const eventRead = useRef(0);
   const controllers = useRef(new Set<AbortController>());
 
   const cancelPending = useCallback((except?: AbortController) => {
@@ -247,8 +248,10 @@ export function LocalIntegrationProvider({ children }: { children: ReactNode }) 
       invalidateSession("A resposta da API não corresponde ao modo simulado esperado.");
       return;
     }
-    // Do not publish states before the catalog request finishes: the page's
-    // state effect starts an event refresh that cancels pending requests.
+    // Publish grants and states together so the page effect refreshes events
+    // only after this load has finished. That refresh must not abort the load:
+    // changing the domain while the grant request is in flight would discard
+    // the response and leave an authenticated session with no grants.
     setNotice(null);
     setGrants(safeGrantsValue);
     setStates(safeStatesValue);
@@ -270,23 +273,24 @@ export function LocalIntegrationProvider({ children }: { children: ReactNode }) 
   }, [authStatus, loadResourcesFromServer]);
 
   const refreshEvents = useCallback(async (domainId: SyntheticDomainId = selectedDomain) => {
-    cancelPending();
+    const readId = ++eventRead.current;
     setEvents([]);
     setNotice(null);
     if (authStatus !== "authenticated" || !domainHasGrant(grants, domainId)) {
-      setEventsLoading(false);
+      if (readId === eventRead.current) setEventsLoading(false);
       return;
     }
     setEventsLoading(true);
     try {
       const result = await requestJson<RealEvent[]>(`/real/events?domain_id=${encodeURIComponent(domainId)}`);
-      if (result) setEvents(safeArray<RealEvent>(result));
+      if (readId !== eventRead.current || !result) return;
+      setEvents(safeArray<RealEvent>(result));
     } catch {
       // Protected results remain empty on authorization or transport errors.
     } finally {
-      setEventsLoading(false);
+      if (readId === eventRead.current) setEventsLoading(false);
     }
-  }, [authStatus, cancelPending, grants, requestJson, selectedDomain]);
+  }, [authStatus, grants, requestJson, selectedDomain]);
 
   const login = useCallback(async (passphrase: string): Promise<boolean> => {
     clearProtectedData();
