@@ -1,6 +1,6 @@
 # Autoauditoria separada do G5 congelado
 
-**Objeto:** `4931c56d107f49e01d677c097ef33ceb5618015f`, branch `feat/jarvis-g5-aprovacao-persistente`. Clone destacado temporário: `/tmp/jarvis-g5-audit.a1koN0`. A worktree candidata permaneceu intocada. **Veredito do commit congelado: FAIL. Auditoria independente formal: PENDENTE. Aceite do proprietário: PENDENTE.** Este relatório é uma revisão própria em clone separado, não o laudo de outro auditor.
+**Objeto:** `4931c56d107f49e01d677c097ef33ceb5618015f`, branch `feat/jarvis-g5-aprovacao-persistente`. Clone destacado temporário: `/tmp/jarvis-g5-audit.a1koN0`. A worktree candidata permaneceu intocada. **Veredito do commit congelado: FAIL. Auditoria independente formal: PENDENTE. Aceite do proprietário: PENDENTE.** Este relatório é uma revisão própria em clone separado. Um segundo agente realizou revisão estática somente leitura depois deste relatório, registrada em `G5_SECOND_REVIEW.md`; não executou provas dinâmicas próprias.
 
 ## Baseline comprovado
 
