@@ -12,10 +12,12 @@ CREATE TABLE selected_synthetic_sources (
     domain_id TEXT NOT NULL,
     display_name TEXT NOT NULL,
     content_sha256 TEXT NOT NULL,
+    review_id TEXT NOT NULL REFERENCES mission_artifact_reviews(id),
+    knowledge_id TEXT NOT NULL REFERENCES mission_knowledge(id),
     idempotency_key TEXT NOT NULL,
     byte_count INTEGER NOT NULL CHECK (byte_count BETWEEN 1 AND 50000),
     classification TEXT NOT NULL CHECK (classification = 'synthetic_test_only'),
-    state TEXT NOT NULL CHECK (state = 'awaiting_review'),
+    state TEXT NOT NULL CHECK (state = 'selected'),
     selected_at TEXT NOT NULL,
     UNIQUE(owner, mission_id, content_sha256),
     UNIQUE(owner, idempotency_key)

@@ -244,10 +244,12 @@ class MissionRepository:
                 corrupt.append({"id": row["id"], "domain_id": row["domain_id"], "integrity": "corrupt"})
         return {"dataset": "api_synthetic", "items": items, "corrupt": corrupt, "next_cursor": next_cursor}
 
-    def transition(self, owner: str, mission_id: str, action: str, expected_revision: int, idempotency_key: str) -> dict:
+    def transition(self, owner: str, mission_id: str, action: str, expected_revision: int,
+                   idempotency_key: str, session_token: str | None = None) -> dict:
         if action in {"run_next", "resume"}:
             from mission_engine import MissionEngine
-            return MissionEngine(self).run(owner, mission_id, action, expected_revision, idempotency_key)
+            return MissionEngine(self).run(owner, mission_id, action, expected_revision,
+                                           idempotency_key, session_token)
         body_hash = _sha({"action": action, "mission_id": mission_id, "expected_revision": expected_revision})
         with self.store.transaction() as connection:
             existing = connection.execute(

@@ -43,7 +43,11 @@ def test_selected_source_needs_two_decisions_and_survives_backup(client, tmp_pat
     source = posted.json()
     assert source["replayed"] is False
     assert client.post(path, headers=_headers(csrf), json=body).json()["replayed"] is True
-    assert len(client.get(path, headers={"origin": ORIGIN}).json()["items"]) == 1
+    source_status = client.get(path, headers={"origin": ORIGIN}).json()["items"]
+    assert len(source_status) == 1
+    assert source_status[0]["selection_state"] == "selected"
+    assert source_status[0]["artifact_review_state"] == "pending"
+    assert source_status[0]["knowledge_state"] == "staged"
     knowledge = next(item for item in client.get("/real/knowledge", headers={"origin": ORIGIN}).json()["items"]
                      if item["kind"] == "selected_original")
     assert knowledge["state"] == "staged"
@@ -66,6 +70,9 @@ def test_selected_source_needs_two_decisions_and_survives_backup(client, tmp_pat
     included = client.get(context_path, headers={"origin": ORIGIN}).json()["included"]
     assert len(included) == 1 and included[0]["content"] == body["content"]
     assert included[0]["source_review_id"] == source["review_id"]
+    final_status = client.get(path, headers={"origin": ORIGIN}).json()["items"][0]
+    assert final_status["artifact_review_state"] == "approved"
+    assert final_status["knowledge_state"] == "approved"
     archive = create_backup(client.database_path, tmp_path / "backups", "senha-sintetica-arquivo-selecionado")
     restored = restore_backup(archive, tmp_path / "restore", "senha-sintetica-arquivo-selecionado")
     with sqlite3.connect(restored) as con:

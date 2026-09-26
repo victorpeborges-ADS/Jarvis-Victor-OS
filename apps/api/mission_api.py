@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+from contextlib import ExitStack
+
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, ConfigDict, Field
 
 from domain_registry import CANONICAL_DOMAIN_IDS
-from local_security import _session_from, mission_domains
+from local_security import _session_from, mission_domains, mission_write_confirmed
 from mission_engine import available_actions
 from mission_repository import MissionConflict, MissionCorrupt, MissionDenied, MissionRejected, MissionRepository
 
@@ -57,11 +59,14 @@ def create_mission(body: MissionCreateIn, request: Request) -> dict:
         raise HTTPException(status_code=422, detail="domínio desconhecido")
     _require(session.principal, "mission:write", body.domain_id)
     try:
-        record, replayed = _repo(request).create(session.principal, body.title, body.domain_id, body.idempotency_key)
+        with mission_write_confirmed(session.principal, body.domain_id, session.token):
+            record, replayed = _repo(request).create(session.principal, body.title, body.domain_id, body.idempotency_key)
     except MissionConflict as exc:
         raise HTTPException(status_code=409, detail=exc.detail) from exc
     except MissionRejected as exc:
         raise HTTPException(status_code=422, detail=exc.detail) from exc
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail="concessão ou sessão revogada ou expirada") from exc
     return _public({**record, "replayed": replayed})
 
 
@@ -111,15 +116,26 @@ def transition_mission(mission_id: str, body: MissionTransitionIn, request: Requ
         raise HTTPException(status_code=404, detail="registro ausente")
     _require(session.principal, "mission:write", current["mission"]["domain_id"])
     try:
-        return _public(_repo(request).transition(
-            session.principal, mission_id, body.action, body.expected_revision, body.idempotency_key
-        ))
+        if body.action in {"run_next", "resume"}:
+            updated = _repo(request).transition(
+                session.principal, mission_id, body.action, body.expected_revision,
+                body.idempotency_key, session.token,
+            )
+        else:
+            with mission_write_confirmed(session.principal, current["mission"]["domain_id"], session.token):
+                updated = _repo(request).transition(
+                    session.principal, mission_id, body.action, body.expected_revision,
+                    body.idempotency_key, session.token,
+                )
+        return _public(updated)
     except MissionConflict as exc:
         raise HTTPException(status_code=409, detail=exc.detail) from exc
     except MissionDenied as exc:
         raise HTTPException(status_code=403, detail=exc.detail) from exc
     except MissionRejected as exc:
         raise HTTPException(status_code=422, detail=exc.detail) from exc
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail="concessão ou sessão revogada ou expirada") from exc
 
 
 @router.post("/import")
@@ -139,8 +155,13 @@ def import_missions(body: MissionImportIn, request: Request) -> dict:
             continue
         safe.append(document)
     try:
-        result = _repo(request).import_valid(session.principal, safe, body.idempotency_key)
+        with ExitStack() as grants:
+            for domain in sorted({document["domain_id"] for document in safe}):
+                grants.enter_context(mission_write_confirmed(session.principal, domain, session.token))
+            result = _repo(request).import_valid(session.principal, safe, body.idempotency_key)
     except MissionConflict as exc:
         raise HTTPException(status_code=409, detail=exc.detail) from exc
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail="concessão ou sessão revogada ou expirada") from exc
     result["quarantined"] = quarantined + result.get("quarantined", [])
     return result

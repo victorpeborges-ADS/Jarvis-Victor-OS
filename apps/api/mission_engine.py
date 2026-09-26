@@ -123,7 +123,8 @@ class MissionEngine:
     def __init__(self, repository) -> None:
         self.repository = repository
 
-    def run(self, owner: str, mission_id: str, action: str, expected_revision: int, idempotency_key: str) -> dict:
+    def run(self, owner: str, mission_id: str, action: str, expected_revision: int,
+            idempotency_key: str, session_token: str | None = None) -> dict:
         from mission_repository import MissionConflict, MissionRejected, _now, _record_from_row, _sha
 
         body_hash = _sha({"action": action, "mission_id": mission_id, "expected_revision": expected_revision})
@@ -195,7 +196,7 @@ class MissionEngine:
         from local_security import mission_write_confirmed
         from mission_repository import MissionDenied
         try:
-            with mission_write_confirmed(owner, domain_id):
+            with mission_write_confirmed(owner, domain_id, session_token):
                 return self._confirm_locked(
                     store, owner, mission_id, execution_id, required_phase, expected_revision,
                     task, artifact, knowledge, now, idempotency_key, body_hash,

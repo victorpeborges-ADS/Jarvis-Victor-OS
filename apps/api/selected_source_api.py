@@ -47,10 +47,16 @@ def list_selected_sources(mission_id: str, request: Request) -> dict:
             with store.transaction() as connection:
                 _mission(connection, mission_id, session.principal)
                 items = connection.execute(
-                    """SELECT id, mission_id, domain_id, display_name, content_sha256,
-                              byte_count, classification, state, selected_at
-                       FROM selected_synthetic_sources WHERE mission_id=? AND owner=?
-                       ORDER BY selected_at, id LIMIT 100""",
+                    """SELECT s.id, s.mission_id, s.domain_id, s.display_name, s.content_sha256,
+                              s.byte_count, s.classification, s.state AS selection_state,
+                              s.review_id, s.knowledge_id, r.state AS artifact_review_state,
+                              COALESCE(d.decision, 'staged') AS knowledge_state, s.selected_at
+                       FROM selected_synthetic_sources s
+                       JOIN mission_artifact_reviews r ON r.id=s.review_id AND r.owner=s.owner
+                       JOIN mission_knowledge k ON k.id=s.knowledge_id AND k.owner=s.owner
+                       LEFT JOIN mission_knowledge_decisions d ON d.knowledge_id=k.id AND d.owner=s.owner
+                       WHERE s.mission_id=? AND s.owner=?
+                       ORDER BY s.selected_at, s.id LIMIT 100""",
                     (mission_id, session.principal),
                 ).fetchall()
                 return {"dataset": "api_synthetic", "items": [dict(item) for item in items]}
@@ -125,21 +131,23 @@ def add_selected_source(mission_id: str, body: SelectedSourceIn, request: Reques
                     "UPDATE missions SET document_json=?, revision=revision+1, updated_at=? WHERE id=? AND owner=?",
                     (json.dumps(mission, ensure_ascii=False), now, mission_id, session.principal),
                 )
-                connection.execute(
-                    """INSERT INTO selected_synthetic_sources
-                       (id, owner, mission_id, domain_id, display_name, content_sha256,
-                        idempotency_key, byte_count, classification, state, selected_at)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'synthetic_test_only', 'awaiting_review', ?)""",
-                    (source_id, session.principal, mission_id, domain, body.display_name, digest,
-                     body.idempotency_key, size, now),
-                )
+                knowledge_id = _token("knowledge_selected")
                 connection.execute(
                     """INSERT INTO mission_knowledge
                        (id, owner, mission_id, domain_id, state, content, skill_version,
                         created_at, kind, source_review_id)
                        VALUES (?, ?, ?, ?, 'staged', ?, '1.0.0', ?, 'selected_original', ?)""",
-                    (_token("knowledge_selected"), session.principal, mission_id, domain,
+                    (knowledge_id, session.principal, mission_id, domain,
                      body.content, now, review_id),
+                )
+                connection.execute(
+                    """INSERT INTO selected_synthetic_sources
+                       (id, owner, mission_id, domain_id, display_name, content_sha256,
+                        review_id, knowledge_id, idempotency_key, byte_count,
+                        classification, state, selected_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'synthetic_test_only', 'selected', ?)""",
+                    (source_id, session.principal, mission_id, domain, body.display_name, digest,
+                     review_id, knowledge_id, body.idempotency_key, size, now),
                 )
                 return {"dataset": "api_synthetic", "id": source_id, "mission_id": mission_id,
                         "content_sha256": digest, "review_id": review_id, "replayed": False}
