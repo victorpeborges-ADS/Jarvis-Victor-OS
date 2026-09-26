@@ -141,6 +141,38 @@ def test_owner_isolation_idempotency_conflict_and_restart(client, tmp_path, monk
         assert loaded.json()["mission"]["title"] == "<script>alert(1)</script>"
 
 
+def test_create_and_transition_use_distinct_idempotency_operations(client):
+    csrf = login(client)
+    mission_grants(client, csrf)
+    key = "create-transition-shared-key-r2"
+    created = create(client, csrf, "operações separadas", key)
+    mission_id = created["mission"]["id"]
+    headers = {"origin": ORIGIN, "x-csrf-token": csrf}
+    payload = {"action": "cancel", "expected_revision": 1, "idempotency_key": key}
+
+    cancelled = client.post(f"/real/missions/{mission_id}/transition", headers=headers, json=payload)
+    replay = client.post(f"/real/missions/{mission_id}/transition", headers=headers, json=payload)
+
+    assert cancelled.status_code == 200, cancelled.text
+    assert cancelled.json()["mission"]["status"] == "cancelled"
+    assert replay.status_code == 200, replay.text
+    assert replay.json()["revision"] == cancelled.json()["revision"]
+    with sqlite3.connect(client.database_path) as connection:
+        operations = connection.execute(
+            "SELECT operation FROM mission_idempotency WHERE owner='owner' AND idempotency_key=? "
+            "ORDER BY operation",
+            (key,),
+        ).fetchall()
+    assert [row[0] for row in operations] == ["mission.create", "mission.transition"]
+
+    changed = client.post(
+        f"/real/missions/{mission_id}/transition",
+        headers=headers,
+        json={"action": "fail", "expected_revision": 1, "idempotency_key": key},
+    )
+    assert changed.status_code == 409
+
+
 def test_revision_conflict_rollback_and_deterministic_skill(client, monkeypatch):
     csrf = login(client)
     mission_grants(client, csrf)
@@ -226,6 +258,11 @@ def test_repeated_import_does_not_duplicate_and_backup_restores(client, tmp_path
         assert connection.execute("SELECT COUNT(*) FROM missions").fetchone()[0] == 1
         assert connection.execute("SELECT COUNT(*) FROM mission_events").fetchone()[0] >= 1
         assert connection.execute("SELECT id FROM mission_knowledge").fetchone() is None
+        imported_key = connection.execute(
+            "SELECT operation FROM mission_idempotency WHERE owner='owner' AND idempotency_key='import-key-01'"
+        ).fetchone()
+        assert imported_key == ("mission.import",)
+        assert connection.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
 
 
 def test_corrupt_mission_document_is_stable_and_not_deleted(client):

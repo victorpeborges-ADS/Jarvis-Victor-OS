@@ -125,15 +125,20 @@ class MissionEngine:
 
     def run(self, owner: str, mission_id: str, action: str, expected_revision: int,
             idempotency_key: str, session_token: str | None = None) -> dict:
-        from mission_repository import MissionConflict, MissionRejected, _now, _record_from_row, _sha
+        from mission_repository import (
+            IDEMPOTENCY_TRANSITION,
+            MissionConflict,
+            MissionRejected,
+            _find_idempotency,
+            _now,
+            _record_from_row,
+            _sha,
+        )
 
         body_hash = _sha({"action": action, "mission_id": mission_id, "expected_revision": expected_revision})
         store = self.repository.store
         with store.transaction() as connection:
-            existing = connection.execute(
-                "SELECT mission_id, body_sha256 FROM mission_idempotency WHERE owner=? AND idempotency_key=?",
-                (owner, idempotency_key),
-            ).fetchone()
+            existing = _find_idempotency(connection, owner, IDEMPOTENCY_TRANSITION, idempotency_key)
             if existing is not None:
                 if existing["body_sha256"] != body_hash or existing["mission_id"] != mission_id:
                     raise MissionConflict("idempotência reutilizada com corpo diferente")
@@ -177,6 +182,13 @@ class MissionEngine:
                         (execution_id, mission_id, owner, task["id"], task["attempt"], "capture-and-classify" if task["id"] == "task_capture" else "local-step", _digest(mission["title"], task["id"]), expected_revision, _now()),
                     )
                 except sqlite3.IntegrityError as exc:
+                    conflicting_execution = connection.execute(
+                        "SELECT 1 FROM mission_executions WHERE owner=? AND "
+                        "(id=? OR (mission_id=? AND phase='open')) LIMIT 1",
+                        (owner, execution_id, mission_id),
+                    ).fetchone()
+                    if conflicting_execution is None:
+                        raise
                     raise MissionConflict("execução já iniciada") from exc
                 mission["status"] = "running"
                 task["status"] = "running"
@@ -206,7 +218,16 @@ class MissionEngine:
             raise MissionDenied("concessão de missão revogada ou expirada") from exc
 
     def _confirm_locked(self, store, owner, mission_id, execution_id, required_phase, expected_revision, task, artifact, knowledge, now, idempotency_key, body_hash):
-        from mission_repository import MissionConflict, MissionRejected, _check_mission, _record_from_row, _sha
+        from mission_repository import (
+            IDEMPOTENCY_TRANSITION,
+            MissionConflict,
+            MissionRejected,
+            _check_mission,
+            _find_idempotency,
+            _record_from_row,
+            _sha,
+            _store_idempotency,
+        )
         from local_security import mission_domains
         context_allowed = (
             task["id"] == "task_context"
@@ -279,9 +300,13 @@ class MissionEngine:
             )
             if updated.rowcount != 1 or closed.rowcount != 1:
                 raise MissionConflict("execução já encerrada")
-            connection.execute(
-                "INSERT OR IGNORE INTO mission_idempotency(owner, idempotency_key, mission_id, body_sha256) VALUES (?, ?, ?, ?)",
-                (owner, idempotency_key, mission_id, body_hash),
+            existing = _find_idempotency(connection, owner, IDEMPOTENCY_TRANSITION, idempotency_key)
+            if existing is not None:
+                if existing["body_sha256"] != body_hash or existing["mission_id"] != mission_id:
+                    raise MissionConflict("idempotência reutilizada com corpo diferente")
+                raise MissionConflict("execução já encerrada")
+            _store_idempotency(
+                connection, owner, IDEMPOTENCY_TRANSITION, idempotency_key, mission_id, body_hash,
             )
             fresh = connection.execute("SELECT * FROM missions WHERE id=? AND owner=?", (mission_id, owner)).fetchone()
             return _record_from_row(fresh)

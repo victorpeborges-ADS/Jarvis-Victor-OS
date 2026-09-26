@@ -18,6 +18,14 @@ MAX_TASKS = 20
 MAX_TITLE = 240
 PAGE_LIMIT = 20
 
+IDEMPOTENCY_LEGACY_UNRESOLVED = "legacy_unresolved"
+IDEMPOTENCY_CREATE = "mission.create"
+IDEMPOTENCY_TRANSITION = "mission.transition"
+IDEMPOTENCY_IMPORT = "mission.import"
+IDEMPOTENCY_IMPORT_ITEM = "mission.import.item"
+IDEMPOTENCY_REVIEW_DECISION = "mission.review.decide"
+IDEMPOTENCY_REVIEW_REVISION = "mission.review.revise"
+
 
 class MissionConflict(Exception):
     def __init__(self, detail: str) -> None:
@@ -37,6 +45,39 @@ class MissionCorrupt(Exception):
 class MissionDenied(Exception):
     def __init__(self, detail: str) -> None:
         self.detail = detail
+
+
+def _find_idempotency(connection, owner: str, operation: str, idempotency_key: str):
+    legacy = connection.execute(
+        "SELECT 1 FROM mission_idempotency WHERE owner=? AND operation=? AND idempotency_key=?",
+        (owner, IDEMPOTENCY_LEGACY_UNRESOLVED, idempotency_key),
+    ).fetchone()
+    if legacy is not None:
+        raise MissionConflict("chave de idempotência legada exige reconciliação")
+    return connection.execute(
+        "SELECT mission_id, body_sha256, result_json FROM mission_idempotency "
+        "WHERE owner=? AND operation=? AND idempotency_key=?",
+        (owner, operation, idempotency_key),
+    ).fetchone()
+
+
+def _store_idempotency(
+    connection,
+    owner: str,
+    operation: str,
+    idempotency_key: str,
+    mission_id: str,
+    body_sha256: str,
+    result_json: str | None = None,
+) -> None:
+    if _find_idempotency(connection, owner, operation, idempotency_key) is not None:
+        raise MissionConflict("chave de idempotência já utilizada nesta operação")
+    connection.execute(
+        "INSERT INTO mission_idempotency "
+        "(owner, operation, idempotency_key, mission_id, body_sha256, result_json) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        (owner, operation, idempotency_key, mission_id, body_sha256, result_json),
+    )
 
 
 def _now() -> str:
@@ -191,10 +232,7 @@ class MissionRepository:
     def create(self, owner: str, title: str, domain_id: str, idempotency_key: str) -> tuple[dict, bool]:
         body_hash = _sha({"title": title, "domain_id": domain_id})
         with self.store.transaction() as connection:
-            existing = connection.execute(
-                "SELECT mission_id, body_sha256 FROM mission_idempotency WHERE owner=? AND idempotency_key=?",
-                (owner, idempotency_key),
-            ).fetchone()
+            existing = _find_idempotency(connection, owner, IDEMPOTENCY_CREATE, idempotency_key)
             if existing is not None:
                 if existing["body_sha256"] != body_hash:
                     raise MissionConflict("idempotência reutilizada com corpo diferente")
@@ -203,7 +241,7 @@ class MissionRepository:
                     raise MissionRejected("registro de idempotência órfão")
                 return _record_from_row(row), True
             record = new_mission(title, domain_id, owner)
-            self._insert_record(connection, record, owner, idempotency_key, body_hash)
+            self._insert_record(connection, record, owner, idempotency_key, body_hash, IDEMPOTENCY_CREATE)
             return record, False
 
     def get(self, owner: str, mission_id: str) -> dict | None:
@@ -258,10 +296,7 @@ class MissionRepository:
                                            idempotency_key, session_token)
         body_hash = _sha({"action": action, "mission_id": mission_id, "expected_revision": expected_revision})
         with self.store.transaction() as connection:
-            existing = connection.execute(
-                "SELECT mission_id, body_sha256 FROM mission_idempotency WHERE owner=? AND idempotency_key=?",
-                (owner, idempotency_key),
-            ).fetchone()
+            existing = _find_idempotency(connection, owner, IDEMPOTENCY_TRANSITION, idempotency_key)
             if existing is not None:
                 if existing["body_sha256"] != body_hash or existing["mission_id"] != mission_id:
                     raise MissionConflict("idempotência reutilizada com corpo diferente")
@@ -291,9 +326,8 @@ class MissionRepository:
                     expected_revision,
                 ),
             )
-            connection.execute(
-                "INSERT INTO mission_idempotency(owner, idempotency_key, mission_id, body_sha256) VALUES (?, ?, ?, ?)",
-                (owner, idempotency_key, mission_id, body_hash),
+            _store_idempotency(
+                connection, owner, IDEMPOTENCY_TRANSITION, idempotency_key, mission_id, body_hash,
             )
             return updated
 
@@ -424,7 +458,15 @@ class MissionRepository:
             (event_id, mission["id"], owner, event_type, owner, key, key, now),
         )
 
-    def _insert_record(self, connection, record: dict, owner: str, idempotency_key: str, body_hash: str) -> None:
+    def _insert_record(
+        self,
+        connection,
+        record: dict,
+        owner: str,
+        idempotency_key: str,
+        body_hash: str,
+        idempotency_operation: str,
+    ) -> None:
         mission = record["mission"]
         connection.execute(
             "INSERT INTO missions(id, owner, domain_id, status, revision, document_json, dataset, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, 'api_synthetic', ?, ?)",
@@ -435,9 +477,8 @@ class MissionRepository:
                 "INSERT INTO mission_events(id, mission_id, owner, event_type, actor, correlation_id, idempotency_key, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                 (event["id"], mission["id"], owner, event["type"], owner, event["idempotency_key"], event["idempotency_key"], event["created_at"]),
             )
-        connection.execute(
-            "INSERT INTO mission_idempotency(owner, idempotency_key, mission_id, body_sha256) VALUES (?, ?, ?, ?)",
-            (owner, idempotency_key, mission["id"], body_hash),
+        _store_idempotency(
+            connection, owner, idempotency_operation, idempotency_key, mission["id"], body_hash,
         )
         for artifact in mission.get("artifacts", []):
             self._sync_artifact_review(connection, mission, owner, artifact, mission["created_at"])
@@ -481,10 +522,7 @@ class MissionRepository:
             return {"dataset": "api_synthetic", "accepted": [], "quarantined": quarantined}
         body_hash = _sha({"scope": "mission_import", "owner": owner, "documents": documents})
         with self.store.transaction() as connection:
-            existing = connection.execute(
-                "SELECT mission_id, body_sha256, result_json FROM mission_idempotency WHERE owner=? AND idempotency_key=?",
-                (owner, idempotency_key),
-            ).fetchone()
+            existing = _find_idempotency(connection, owner, IDEMPOTENCY_IMPORT, idempotency_key)
             if existing is not None:
                 if existing["body_sha256"] != body_hash:
                     raise MissionConflict("idempotência reutilizada com corpo diferente")
@@ -528,12 +566,24 @@ class MissionRepository:
                     "access_class": "synthetic_local",
                     "mission": document,
                 }
-                self._insert_record(connection, record, owner, f"{idempotency_key}:{document['id']}", _sha(document))
+                self._insert_record(
+                    connection,
+                    record,
+                    owner,
+                    f"{idempotency_key}:{document['id']}",
+                    _sha(document),
+                    IDEMPOTENCY_IMPORT_ITEM,
+                )
                 accepted.append(document["id"])
             result = {"dataset": "api_synthetic", "accepted": accepted, "quarantined": quarantined, "replayed": False}
-            connection.execute(
-                "INSERT INTO mission_idempotency(owner, idempotency_key, mission_id, body_sha256, result_json) VALUES (?, ?, ?, ?, ?)",
-                (owner, idempotency_key, accepted[0] if accepted else "mission_import_empty", body_hash, json.dumps(result, ensure_ascii=False)),
+            _store_idempotency(
+                connection,
+                owner,
+                IDEMPOTENCY_IMPORT,
+                idempotency_key,
+                accepted[0] if accepted else "mission_import_empty",
+                body_hash,
+                json.dumps(result, ensure_ascii=False),
             )
         return result
 
@@ -683,10 +733,9 @@ class MissionRepository:
         })
 
         with self.store.transaction() as connection:
-            existing = connection.execute(
-                "SELECT mission_id, body_sha256, result_json FROM mission_idempotency WHERE owner=? AND idempotency_key=?",
-                (owner, idempotency_key),
-            ).fetchone()
+            existing = _find_idempotency(
+                connection, owner, IDEMPOTENCY_REVIEW_DECISION, idempotency_key,
+            )
             if existing is not None:
                 if existing["body_sha256"] != body_hash:
                     raise MissionConflict("idempotência reutilizada com corpo diferente")
@@ -733,10 +782,9 @@ class MissionRepository:
     ) -> tuple[dict, bool]:
         now = _now()
         with self.store.transaction() as connection:
-            existing = connection.execute(
-                "SELECT body_sha256, result_json FROM mission_idempotency WHERE owner=? AND idempotency_key=?",
-                (owner, idempotency_key),
-            ).fetchone()
+            existing = _find_idempotency(
+                connection, owner, IDEMPOTENCY_REVIEW_DECISION, idempotency_key,
+            )
             if existing is not None:
                 if existing["body_sha256"] != body_hash:
                     raise MissionConflict("idempotência reutilizada com corpo diferente")
@@ -850,9 +898,14 @@ class MissionRepository:
                 "replayed": False,
             }
 
-            connection.execute(
-                "INSERT OR IGNORE INTO mission_idempotency (owner, idempotency_key, mission_id, body_sha256, result_json) VALUES (?, ?, ?, ?, ?)",
-                (owner, idempotency_key, rev_row["mission_id"], body_hash, json.dumps(result, ensure_ascii=False)),
+            _store_idempotency(
+                connection,
+                owner,
+                IDEMPOTENCY_REVIEW_DECISION,
+                idempotency_key,
+                rev_row["mission_id"],
+                body_hash,
+                json.dumps(result, ensure_ascii=False),
             )
 
             return result, False
@@ -888,10 +941,9 @@ class MissionRepository:
         })
         now = _now()
         with self.store.transaction() as connection:
-            existing = connection.execute(
-                "SELECT mission_id, body_sha256, result_json FROM mission_idempotency WHERE owner=? AND idempotency_key=?",
-                (owner, idempotency_key),
-            ).fetchone()
+            existing = _find_idempotency(
+                connection, owner, IDEMPOTENCY_REVIEW_REVISION, idempotency_key,
+            )
             if existing is not None:
                 if existing["body_sha256"] != body_hash:
                     raise MissionConflict("idempotência reutilizada com corpo diferente")
@@ -979,9 +1031,14 @@ class MissionRepository:
                 "replayed": False,
             }
 
-            connection.execute(
-                "INSERT INTO mission_idempotency (owner, idempotency_key, mission_id, body_sha256, result_json) VALUES (?, ?, ?, ?, ?)",
-                (owner, idempotency_key, rev_row["mission_id"], body_hash, json.dumps(result, ensure_ascii=False)),
+            _store_idempotency(
+                connection,
+                owner,
+                IDEMPOTENCY_REVIEW_REVISION,
+                idempotency_key,
+                rev_row["mission_id"],
+                body_hash,
+                json.dumps(result, ensure_ascii=False),
             )
 
             return result, False

@@ -114,6 +114,7 @@ def test_empty_database_migrates_once_uses_wal_and_private_permissions(tmp_path)
             ("0010_review_snapshots",),
             ("0011_knowledge_decisions",),
             ("0012_selected_synthetic_sources",),
+            ("0013_mission_idempotency_scopes",),
         ]
         for table in ("sources", "events", "event_provenance", "entities", "relations", "relation_evidence", "audit_entries", "calendar_sync_states", "calendar_sync_seen_events", "missions", "mission_events", "mission_idempotency", "mission_knowledge", "mission_artifact_reviews", "mission_review_decisions"):
             assert connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] == 0
@@ -156,9 +157,46 @@ def test_database_from_previous_migration_version_upgrades_without_replaying_ddl
             ("0010_review_snapshots",),
             ("0011_knowledge_decisions",),
             ("0012_selected_synthetic_sources",),
+            ("0013_mission_idempotency_scopes",),
     ]
     assert "domain_id" in columns
     assert "audit_entries" in tables
+
+
+def test_unscoped_mission_idempotency_rows_are_preserved_as_unresolved_legacy(tmp_path):
+    previous_migrations = tmp_path / "pre-scoped-migrations"
+    previous_migrations.mkdir()
+    for migration in sorted(MIGRATIONS_DIR.glob("[0-9][0-9][0-9][0-9]_*.sql")):
+        if migration.stem == "0013_mission_idempotency_scopes":
+            continue
+        copyfile(migration, previous_migrations / migration.name)
+
+    database_path = tmp_path / "legacy" / "memory.sqlite3"
+    SQLiteMemoryStore(database_path, migrations_dir=previous_migrations).initialize()
+    legacy_row = (
+        "owner",
+        "legacy-shared-key-r2",
+        "mission_legacy_record_001",
+        "a" * 64,
+        '{"dataset":"api_synthetic","legacy":true}',
+    )
+    with sqlite3.connect(database_path) as connection:
+        connection.execute(
+            "INSERT INTO mission_idempotency(owner, idempotency_key, mission_id, body_sha256, result_json) "
+            "VALUES (?, ?, ?, ?, ?)",
+            legacy_row,
+        )
+
+    SQLiteMemoryStore(database_path).initialize()
+    with sqlite3.connect(database_path) as connection:
+        migrated = connection.execute(
+            "SELECT operation, owner, idempotency_key, mission_id, body_sha256, result_json "
+            "FROM mission_idempotency WHERE owner=? AND idempotency_key=?",
+            (legacy_row[0], legacy_row[1]),
+        ).fetchone()
+        assert migrated == ("legacy_unresolved", *legacy_row)
+        assert connection.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+        assert connection.execute("PRAGMA foreign_key_check").fetchone() is None
 
 
 @pytest.mark.parametrize("applied_count", [1, 2, 3, 4])

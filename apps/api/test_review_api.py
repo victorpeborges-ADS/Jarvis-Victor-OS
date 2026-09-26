@@ -427,6 +427,82 @@ def test_changes_requested_and_revised_version_requires_new_review(client):
     assert v2_approved.json()["state"] == "approved"
 
 
+def test_mission_review_operations_can_reuse_create_key_and_replay_history(client):
+    csrf = login(client)
+    mission_all_grants(client, csrf)
+    shared_key = "create-review-shared-key-r2"
+    created = client.post(
+        "/real/missions",
+        headers={"origin": ORIGIN, "x-csrf-token": csrf},
+        json={"title": "chave compartilhada entre operações", "domain_id": "dom_synthetic_a",
+              "idempotency_key": shared_key},
+    )
+    assert created.status_code == 201, created.text
+    mission_id = created.json()["mission"]["id"]
+    step = client.post(
+        f"/real/missions/{mission_id}/transition",
+        headers={"origin": ORIGIN, "x-csrf-token": csrf},
+        json={"action": "run_next", "expected_revision": 1, "idempotency_key": "review-scope-step-r2"},
+    )
+    assert step.status_code == 200, step.text
+    review = next(
+        item for item in client.get("/real/reviews", headers={"origin": ORIGIN}).json()["items"]
+        if item["mission_id"] == mission_id
+    )
+    detail = client.get(f"/real/reviews/{review['id']}", headers={"origin": ORIGIN}).json()
+    decision_body = {
+        "decision": "changes_requested",
+        "expected_revision": 1,
+        "expected_artifact_sha256": detail["artifact_sha256"],
+        "reason": "Revisar o sumário para esta demonstração sintética.",
+        "idempotency_key": shared_key,
+    }
+
+    decision = client.post(
+        f"/real/reviews/{review['id']}/decide",
+        headers={"origin": ORIGIN, "x-csrf-token": csrf},
+        json=decision_body,
+    )
+    replayed_decision = client.post(
+        f"/real/reviews/{review['id']}/decide",
+        headers={"origin": ORIGIN, "x-csrf-token": csrf},
+        json=decision_body,
+    )
+    assert decision.status_code == 200, decision.text
+    assert replayed_decision.status_code == 200
+    assert replayed_decision.json()["replayed"] is True
+
+    revision_body = {"new_content": "Conteúdo revisado com sumário.", "idempotency_key": shared_key}
+    revision = client.post(
+        f"/real/reviews/{review['id']}/revise",
+        headers={"origin": ORIGIN, "x-csrf-token": csrf},
+        json=revision_body,
+    )
+    replayed_revision = client.post(
+        f"/real/reviews/{review['id']}/revise",
+        headers={"origin": ORIGIN, "x-csrf-token": csrf},
+        json=revision_body,
+    )
+    assert revision.status_code == 200, revision.text
+    assert replayed_revision.status_code == 200
+    assert replayed_revision.json()["replayed"] is True
+
+    with sqlite3.connect(client.database_path) as connection:
+        operations = connection.execute(
+            "SELECT operation FROM mission_idempotency WHERE owner='owner' AND idempotency_key=? "
+            "ORDER BY operation",
+            (shared_key,),
+        ).fetchall()
+        review_history = connection.execute(
+            "SELECT COUNT(*) FROM mission_review_decisions WHERE owner='owner' AND idempotency_key=?",
+            (shared_key,),
+        ).fetchone()[0]
+    assert [row[0] for row in operations] == [
+        "mission.create", "mission.review.decide", "mission.review.revise",
+    ]
+    assert review_history == 1
+
+
 def test_ledger_snapshot_hash_and_immutability(client):
     csrf = login(client)
     mission_all_grants(client, csrf)
