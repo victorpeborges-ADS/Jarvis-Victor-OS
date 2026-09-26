@@ -4,8 +4,11 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import secrets
+import time
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 
 from mission_contracts import validate_contract
@@ -38,6 +41,19 @@ class MissionDenied(Exception):
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _pause_review_if_requested() -> None:
+    raw = os.environ.get("JARVIS_TEST_PAUSE_REVIEW_FILE")
+    if not raw:
+        return
+    path = Path(raw)
+    path.write_text("open", encoding="utf-8")
+    deadline = time.time() + 30
+    while time.time() < deadline:
+        if path.read_text(encoding="utf-8") == "go":
+            return
+        time.sleep(0.05)
 
 
 def _token(prefix: str) -> str:
@@ -408,6 +424,22 @@ class MissionRepository:
             "INSERT INTO mission_idempotency(owner, idempotency_key, mission_id, body_sha256) VALUES (?, ?, ?, ?)",
             (owner, idempotency_key, mission["id"], body_hash),
         )
+        for artifact in mission.get("artifacts", []):
+            self._sync_artifact_review(connection, mission, owner, artifact, mission["created_at"])
+
+    def _sync_artifact_review(self, connection, mission: dict, owner: str, artifact: dict, now: str) -> str:
+        review_id = f"rev_{artifact['id']}_1"
+        artifact_sha = _sha(artifact)
+        domain_id = mission.get("domain_id") or "dom_synthetic_a"
+        connection.execute(
+            """INSERT OR IGNORE INTO mission_artifact_reviews (
+                id, mission_id, owner, artifact_id, artifact_version,
+                artifact_sha256, domain_id, state, decision_reason,
+                decision_actor, decided_at, revision, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, 1, ?, ?, 'pending', NULL, NULL, NULL, 1, ?, ?)""",
+            (review_id, mission["id"], owner, artifact["id"], artifact_sha, domain_id, now, now),
+        )
+        return review_id
 
     def import_valid(self, owner: str, documents: list[dict], idempotency_key: str) -> dict:
         accepted = []
@@ -459,3 +491,415 @@ class MissionRepository:
                 (owner, idempotency_key, accepted[0] if accepted else "mission_import_empty", body_hash, json.dumps(result, ensure_ascii=False)),
             )
         return result
+
+    def list_reviews(
+        self,
+        owner: str,
+        domain_id: str | None = None,
+        state: str | None = None,
+        limit: int = 20,
+        cursor: str | None = None,
+    ) -> dict:
+        clauses = ["r.owner = ?"]
+        params: list[Any] = [owner]
+        if domain_id is not None:
+            clauses.append("r.domain_id = ?")
+            params.append(domain_id)
+        if state is not None:
+            clauses.append("r.state = ?")
+            params.append(state)
+        if cursor:
+            clauses.append("r.id > ?")
+            params.append(cursor)
+        limit = max(1, min(limit, 100))
+        params.append(limit + 1)
+        query = f"""
+            SELECT r.*, m.status as mission_status, m.document_json
+            FROM mission_artifact_reviews r
+            JOIN missions m ON m.id = r.mission_id AND m.owner = r.owner
+            WHERE {' AND '.join(clauses)}
+            ORDER BY r.id ASC
+            LIMIT ?
+        """
+        with self.store.transaction() as connection:
+            rows = connection.execute(query, params).fetchall()
+        page = rows[:limit]
+        next_cursor = page[-1]["id"] if len(rows) > limit and page else None
+        items = []
+        corrupt = []
+        for row in page:
+            try:
+                mission_doc = json.loads(row["document_json"])
+                artifact = next((a for a in mission_doc.get("artifacts", []) if a["id"] == row["artifact_id"]), None)
+                if artifact is None:
+                    raise ValueError("artefato não encontrado no documento da missão")
+                items.append({
+                    "id": row["id"],
+                    "mission_id": row["mission_id"],
+                    "mission_title": mission_doc.get("title", ""),
+                    "mission_status": row["mission_status"],
+                    "artifact_id": row["artifact_id"],
+                    "artifact_version": row["artifact_version"],
+                    "artifact_sha256": row["artifact_sha256"],
+                    "artifact_title": artifact.get("title", ""),
+                    "artifact_kind": artifact.get("kind", "draft"),
+                    "domain_id": row["domain_id"],
+                    "state": row["state"],
+                    "decision_reason": row["decision_reason"],
+                    "decision_actor": row["decision_actor"],
+                    "decided_at": row["decided_at"],
+                    "revision": row["revision"],
+                    "created_at": row["created_at"],
+                    "updated_at": row["updated_at"],
+                })
+            except Exception:
+                corrupt.append({"id": row["id"], "domain_id": row["domain_id"], "integrity": "corrupt"})
+        return {"dataset": "api_synthetic", "items": items, "corrupt": corrupt, "next_cursor": next_cursor}
+
+    def get_review(self, owner: str, review_id: str) -> dict | None:
+        query = """
+            SELECT r.*, m.status as mission_status, m.document_json
+            FROM mission_artifact_reviews r
+            JOIN missions m ON m.id = r.mission_id AND m.owner = r.owner
+            WHERE r.owner = ? AND r.id = ?
+        """
+        with self.store.transaction() as connection:
+            row = connection.execute(query, (owner, review_id)).fetchone()
+            if row is None:
+                return None
+            try:
+                mission_doc = json.loads(row["document_json"])
+                artifact = next((a for a in mission_doc.get("artifacts", []) if a["id"] == row["artifact_id"]), None)
+                if artifact is None:
+                    raise ValueError("artefato ausente")
+            except Exception as exc:
+                raise MissionCorrupt(review_id) from exc
+            decisions = connection.execute(
+                """SELECT id, decision, decision_reason, actor, idempotency_key, created_at
+                   FROM mission_review_decisions
+                   WHERE review_id = ? AND owner = ?
+                   ORDER BY created_at ASC""",
+                (review_id, owner),
+            ).fetchall()
+        return {
+            "dataset": "api_synthetic",
+            "id": row["id"],
+            "mission_id": row["mission_id"],
+            "mission_title": mission_doc.get("title", ""),
+            "mission_status": row["mission_status"],
+            "artifact_id": row["artifact_id"],
+            "artifact_version": row["artifact_version"],
+            "artifact_sha256": row["artifact_sha256"],
+            "artifact": artifact,
+            "domain_id": row["domain_id"],
+            "state": row["state"],
+            "decision_reason": row["decision_reason"],
+            "decision_actor": row["decision_actor"],
+            "decided_at": row["decided_at"],
+            "revision": row["revision"],
+            "created_at": row["created_at"],
+            "updated_at": row["updated_at"],
+            "history": [dict(d) for d in decisions],
+        }
+
+    def decide_review(
+        self,
+        owner: str,
+        review_id: str,
+        decision: str,
+        expected_revision: int,
+        expected_artifact_sha256: str,
+        reason: str | None,
+        idempotency_key: str,
+    ) -> tuple[dict, bool]:
+        if decision not in ("approved", "rejected", "changes_requested"):
+            raise MissionRejected("decisão inválida")
+        clean_reason = reason.strip() if reason else None
+        if decision in ("rejected", "changes_requested") and not clean_reason:
+            raise MissionRejected("motivo obrigatório para rejeição ou solicitação de ajustes")
+        if clean_reason and len(clean_reason) > 500:
+            raise MissionRejected("motivo excede limite de 500 caracteres")
+
+        body_hash = _sha({
+            "action": "decide_review",
+            "review_id": review_id,
+            "decision": decision,
+            "expected_revision": expected_revision,
+            "expected_artifact_sha256": expected_artifact_sha256,
+            "reason": clean_reason,
+        })
+
+        with self.store.transaction() as connection:
+            existing = connection.execute(
+                "SELECT mission_id, body_sha256, result_json FROM mission_idempotency WHERE owner=? AND idempotency_key=?",
+                (owner, idempotency_key),
+            ).fetchone()
+            if existing is not None:
+                if existing["body_sha256"] != body_hash:
+                    raise MissionConflict("idempotência reutilizada com corpo diferente")
+                if existing["result_json"]:
+                    stored = json.loads(existing["result_json"])
+                    stored["replayed"] = True
+                    return stored, True
+                rev = self.get_review(owner, review_id)
+                if rev is not None:
+                    rev["replayed"] = True
+                    return rev, True
+                raise MissionConflict("idempotência reutilizada com corpo diferente")
+
+            rev_row = connection.execute(
+                "SELECT domain_id FROM mission_artifact_reviews WHERE id=? AND owner=?",
+                (review_id, owner),
+            ).fetchone()
+            if rev_row is None:
+                raise MissionRejected("revisão ausente")
+            domain_id = rev_row["domain_id"]
+
+        _pause_review_if_requested()
+        from local_security import mission_review_confirmed
+        try:
+            with mission_review_confirmed(owner, domain_id):
+                return self._decide_locked(
+                    owner, review_id, domain_id, decision, expected_revision,
+                    expected_artifact_sha256, clean_reason, idempotency_key, body_hash,
+                )
+        except PermissionError as exc:
+            raise MissionDenied("concessão de revisão revogada ou expirada") from exc
+
+    def _decide_locked(
+        self,
+        owner: str,
+        review_id: str,
+        domain_id: str,
+        decision: str,
+        expected_revision: int,
+        expected_artifact_sha256: str,
+        reason: str | None,
+        idempotency_key: str,
+        body_hash: str,
+    ) -> tuple[dict, bool]:
+        now = _now()
+        with self.store.transaction() as connection:
+            existing = connection.execute(
+                "SELECT body_sha256, result_json FROM mission_idempotency WHERE owner=? AND idempotency_key=?",
+                (owner, idempotency_key),
+            ).fetchone()
+            if existing is not None:
+                if existing["body_sha256"] != body_hash:
+                    raise MissionConflict("idempotência reutilizada com corpo diferente")
+                if existing["result_json"]:
+                    stored = json.loads(existing["result_json"])
+                    stored["replayed"] = True
+                    return stored, True
+                rev = self.get_review(owner, review_id)
+                if rev is not None:
+                    rev["replayed"] = True
+                    return rev, True
+                raise MissionConflict("idempotência reutilizada com corpo diferente")
+
+            rev_row = connection.execute(
+                "SELECT * FROM mission_artifact_reviews WHERE id=? AND owner=?",
+                (review_id, owner),
+            ).fetchone()
+            if rev_row is None:
+                raise MissionRejected("revisão ausente")
+            if rev_row["revision"] != expected_revision:
+                raise MissionConflict("revisão divergente")
+            if rev_row["artifact_sha256"] != expected_artifact_sha256:
+                raise MissionConflict("versão do artefato divergente")
+            if rev_row["state"] in ("approved", "rejected"):
+                raise MissionConflict("revisão já encerrada")
+
+            mission_row = connection.execute(
+                "SELECT * FROM missions WHERE id=? AND owner=?",
+                (rev_row["mission_id"], owner),
+            ).fetchone()
+            if mission_row is None:
+                raise MissionRejected("missão ausente")
+            if mission_row["status"] == "cancelled":
+                raise MissionRejected("missão cancelada não aceita decisões de revisão")
+
+            mission = json.loads(mission_row["document_json"])
+            artifact = next((a for a in mission.get("artifacts", []) if a["id"] == rev_row["artifact_id"]), None)
+            if artifact is None:
+                raise MissionRejected("artefato ausente na missão")
+            if _sha(artifact) != expected_artifact_sha256:
+                raise MissionConflict("conteúdo do artefato diverge do esperado")
+
+            artifact["review_state"] = decision
+            artifact["reviewed_at"] = now
+
+            event_key = f"{review_id}:{decision}:{expected_revision}"
+            self._append_event(
+                connection, mission, owner, "artifact_reviewed", None,
+                f"Decisão de revisão: {decision}. Motivo: {reason or 'aprovado sem ressalvas'}.",
+                now, stable_key=event_key,
+            )
+            _check_mission(mission)
+            new_mission_revision = mission_row["revision"] + 1
+            updated_mission = connection.execute(
+                "UPDATE missions SET document_json=?, revision=?, updated_at=? WHERE id=? AND owner=? AND revision=?",
+                (json.dumps(mission, ensure_ascii=False), new_mission_revision, now, mission_row["id"], owner, mission_row["revision"]),
+            )
+            if updated_mission.rowcount != 1:
+                raise MissionConflict("missão modificada concorrentemente")
+
+            new_review_revision = rev_row["revision"] + 1
+            updated_review = connection.execute(
+                """UPDATE mission_artifact_reviews
+                   SET state=?, decision_reason=?, decision_actor=?, decided_at=?, revision=?, updated_at=?
+                   WHERE id=? AND owner=? AND revision=?""",
+                (decision, reason, owner, now, new_review_revision, now, review_id, owner, expected_revision),
+            )
+            if updated_review.rowcount != 1:
+                raise MissionConflict("revisão modificada concorrentemente")
+
+            dec_id = _token("rdec")
+            connection.execute(
+                """INSERT INTO mission_review_decisions (
+                    id, review_id, mission_id, owner, artifact_id, artifact_version,
+                    artifact_sha256, decision, decision_reason, actor, idempotency_key,
+                    snapshot_json, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    dec_id, review_id, rev_row["mission_id"], owner, rev_row["artifact_id"],
+                    rev_row["artifact_version"], rev_row["artifact_sha256"], decision,
+                    reason, owner, idempotency_key, json.dumps(artifact, ensure_ascii=False), now,
+                ),
+            )
+
+            result = {
+                "dataset": "api_synthetic",
+                "id": review_id,
+                "mission_id": rev_row["mission_id"],
+                "mission_title": mission["title"],
+                "mission_status": mission["status"],
+                "artifact_id": rev_row["artifact_id"],
+                "artifact_version": rev_row["artifact_version"],
+                "artifact_sha256": rev_row["artifact_sha256"],
+                "artifact": artifact,
+                "domain_id": domain_id,
+                "state": decision,
+                "decision_reason": reason,
+                "decision_actor": owner,
+                "decided_at": now,
+                "revision": new_review_revision,
+                "created_at": rev_row["created_at"],
+                "updated_at": now,
+                "replayed": False,
+            }
+
+            connection.execute(
+                "INSERT OR IGNORE INTO mission_idempotency (owner, idempotency_key, mission_id, body_sha256, result_json) VALUES (?, ?, ?, ?, ?)",
+                (owner, idempotency_key, rev_row["mission_id"], body_hash, json.dumps(result, ensure_ascii=False)),
+            )
+
+            return result, False
+
+    def revise_review(self, owner: str, review_id: str, new_content: str, idempotency_key: str) -> tuple[dict, bool]:
+        if not new_content or not new_content.strip():
+            raise MissionRejected("conteúdo revisado obrigatório")
+        clean_content = new_content.strip()[:50000]
+
+        body_hash = _sha({
+            "action": "revise_review",
+            "review_id": review_id,
+            "new_content": clean_content,
+        })
+        now = _now()
+        with self.store.transaction() as connection:
+            existing = connection.execute(
+                "SELECT mission_id, body_sha256, result_json FROM mission_idempotency WHERE owner=? AND idempotency_key=?",
+                (owner, idempotency_key),
+            ).fetchone()
+            if existing is not None:
+                if existing["body_sha256"] != body_hash:
+                    raise MissionConflict("idempotência reutilizada com corpo diferente")
+                if existing["result_json"]:
+                    stored = json.loads(existing["result_json"])
+                    stored["replayed"] = True
+                    return stored, True
+                raise MissionConflict("idempotência reutilizada com corpo diferente")
+
+            rev_row = connection.execute(
+                "SELECT * FROM mission_artifact_reviews WHERE id=? AND owner=?",
+                (review_id, owner),
+            ).fetchone()
+            if rev_row is None:
+                raise MissionRejected("revisão ausente")
+            if rev_row["state"] != "changes_requested":
+                raise MissionRejected("somente revisões com ajustes solicitados podem ser revisadas")
+
+            mission_row = connection.execute(
+                "SELECT * FROM missions WHERE id=? AND owner=?",
+                (rev_row["mission_id"], owner),
+            ).fetchone()
+            if mission_row is None:
+                raise MissionRejected("missão ausente")
+            if mission_row["status"] == "cancelled":
+                raise MissionRejected("missão cancelada")
+
+            mission = json.loads(mission_row["document_json"])
+            artifact = next((a for a in mission.get("artifacts", []) if a["id"] == rev_row["artifact_id"]), None)
+            if artifact is None:
+                raise MissionRejected("artefato ausente na missão")
+
+            artifact["content"] = clean_content
+            artifact["review_state"] = "pending"
+            artifact["reviewed_at"] = None
+            artifact["created_at"] = now
+            new_sha = _sha(artifact)
+            new_version = rev_row["artifact_version"] + 1
+            new_review_id = f"rev_{artifact['id']}_{new_version}"
+
+            connection.execute(
+                """INSERT INTO mission_artifact_reviews (
+                    id, mission_id, owner, artifact_id, artifact_version,
+                    artifact_sha256, domain_id, state, decision_reason,
+                    decision_actor, decided_at, revision, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', NULL, NULL, NULL, 1, ?, ?)""",
+                (
+                    new_review_id, rev_row["mission_id"], owner, artifact["id"],
+                    new_version, new_sha, rev_row["domain_id"], now, now,
+                ),
+            )
+
+            self._append_event(
+                connection, mission, owner, "artifact_created", None,
+                f"Versão {new_version} do artefato atualizada após ajustes.",
+                now, stable_key=f"{new_review_id}:revised",
+            )
+            _check_mission(mission)
+            new_mission_revision = mission_row["revision"] + 1
+            connection.execute(
+                "UPDATE missions SET document_json=?, revision=?, updated_at=? WHERE id=? AND owner=? AND revision=?",
+                (json.dumps(mission, ensure_ascii=False), new_mission_revision, now, mission_row["id"], owner, mission_row["revision"]),
+            )
+
+            result = {
+                "dataset": "api_synthetic",
+                "id": new_review_id,
+                "mission_id": rev_row["mission_id"],
+                "mission_title": mission["title"],
+                "mission_status": mission["status"],
+                "artifact_id": artifact["id"],
+                "artifact_version": new_version,
+                "artifact_sha256": new_sha,
+                "artifact": artifact,
+                "domain_id": rev_row["domain_id"],
+                "state": "pending",
+                "decision_reason": None,
+                "decision_actor": None,
+                "decided_at": None,
+                "revision": 1,
+                "created_at": now,
+                "updated_at": now,
+                "replayed": False,
+            }
+
+            connection.execute(
+                "INSERT INTO mission_idempotency (owner, idempotency_key, mission_id, body_sha256, result_json) VALUES (?, ?, ?, ?, ?)",
+                (owner, idempotency_key, rev_row["mission_id"], body_hash, json.dumps(result, ensure_ascii=False)),
+            )
+
+            return result, False

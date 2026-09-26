@@ -94,6 +94,16 @@ def read_mission(mission_id: str, request: Request) -> dict:
     return _public(record)
 
 
+@router.get("/{mission_id}/reviews")
+def list_mission_reviews(mission_id: str, request: Request) -> dict:
+    session = _session_from(request)
+    current = _repo(request).get(session.principal, mission_id)
+    if current is None:
+        raise HTTPException(status_code=404, detail="registro ausente")
+    _require(session.principal, "mission:read", current["mission"]["domain_id"])
+    return _repo(request).list_reviews(session.principal, domain_id=current["mission"]["domain_id"])
+
+
 @router.post("/{mission_id}/transition")
 def transition_mission(mission_id: str, body: MissionTransitionIn, request: Request) -> dict:
     session = _session_from(request, mutation=True)

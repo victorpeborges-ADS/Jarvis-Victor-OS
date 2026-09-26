@@ -219,6 +219,7 @@ class MissionEngine:
             task = next(item for item in mission["tasks"] if item["id"] == task["id"])
             if not any(item["id"] == artifact["id"] for item in mission["artifacts"]):
                 mission["artifacts"].append(artifact)
+            self.repository._sync_artifact_review(connection, mission, owner, artifact, now)
             if knowledge is not None:
                 connection.execute(
                     "INSERT OR IGNORE INTO mission_knowledge(id, owner, mission_id, domain_id, state, content, skill_version, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
