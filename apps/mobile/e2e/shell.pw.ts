@@ -8,7 +8,9 @@ test("shell navega e mantém outbox sintética local após reload", async ({ pag
   await page.goto("/");
   await expect(page.getByText("SOMENTE SINTÉTICO")).toBeVisible();
   await page.getByRole("button", { name: "Inbox" }).click();
-  await page.getByLabel("Texto").fill("Ideia fictícia para revisão local");
+  await page.getByLabel("Texto de teste").fill("Ideia fictícia para revisão local");
+  await expect(page.getByRole("button", { name: "Salvar localmente" })).toBeDisabled();
+  await page.getByLabel("Confirmo que o texto é fictício").check();
   await page.getByRole("button", { name: "Salvar localmente" }).click();
   await expect(page.getByRole("status")).toContainText("nada foi enviado");
   await expect(page.getByText("Ideia fictícia para revisão local")).toBeVisible();
@@ -21,11 +23,14 @@ test("shell navega e mantém outbox sintética local após reload", async ({ pag
   expect(stored[0].synthetic).toBe(true);
 });
 
-test("Conversa e Missões continuam explicitamente sintéticas", async ({ page }) => {
+test("Missões, aprovações e integrações expõem capacidades reais", async ({ page }) => {
   await page.goto("/");
-  await page.getByRole("button", { name: "Conversa" }).click();
-  await expect(page.getByText("SEM LLM")).toBeVisible();
   await page.getByRole("button", { name: "Missões" }).click();
   await expect(page.getByText("SIMULAÇÃO · CUSTO 0")).toBeVisible();
   await expect(page.getByText("Esta tela é ilustrativa e não executa tarefas.")).toBeVisible();
+  await page.getByRole("button", { name: "Aprovações" }).click();
+  await expect(page.getByText("API NÃO CONECTADA")).toBeVisible();
+  await page.getByRole("button", { name: "Mais" }).click();
+  await page.getByRole("button", { name: "Integrações" }).click();
+  await expect(page.getByText("NÃO CONFIGURADO")).toBeVisible();
 });
