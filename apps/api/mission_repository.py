@@ -99,6 +99,12 @@ def _check_mission(document: dict) -> None:
         validate_contract("Mission", document)
     except ValueError as exc:
         raise MissionRejected("missão malformada") from exc
+    event_ids = [event["id"] for event in document["events"]]
+    event_keys = [event["idempotency_key"] for event in document["events"]]
+    if len(event_ids) != len(set(event_ids)):
+        raise MissionRejected("ID de evento repetido no documento")
+    if len(event_keys) != len(set(event_keys)):
+        raise MissionRejected("chave de evento repetida no documento")
     _acyclic(list(document["tasks"]))
     if document["status"] == "done" and any(task["status"] != "done" for task in document["tasks"]):
         raise MissionRejected("missão concluída sem etapas concluídas")
@@ -455,6 +461,7 @@ class MissionRepository:
     def import_valid(self, owner: str, documents: list[dict], idempotency_key: str) -> dict:
         accepted = []
         quarantined = []
+        valid_documents = []
         for index, document in enumerate(documents):
             try:
                 _check_mission(document)
@@ -462,6 +469,14 @@ class MissionRepository:
                     raise MissionRejected("domínio ausente")
             except MissionRejected as exc:
                 quarantined.append({"index": index, "reason": exc.detail})
+                continue
+            valid_documents.append(document)
+
+        mission_ids = [document["id"] for document in valid_documents]
+        event_ids = [event["id"] for document in valid_documents for event in document["events"]]
+        if len(mission_ids) != len(set(mission_ids)) or len(event_ids) != len(set(event_ids)):
+            raise MissionRejected("lote de importação contém identificadores repetidos")
+
         if quarantined and len(quarantined) == len(documents):
             return {"dataset": "api_synthetic", "accepted": [], "quarantined": quarantined}
         body_hash = _sha({"scope": "mission_import", "owner": owner, "documents": documents})
@@ -478,15 +493,34 @@ class MissionRepository:
                     stored["replayed"] = True
                     return stored
                 return {"dataset": "api_synthetic", "accepted": [], "quarantined": quarantined, "replayed": True, "legacy": True}
-            for index, document in enumerate(documents):
-                if any(item["index"] == index for item in quarantined):
-                    continue
+
+            new_documents = []
+            for document in valid_documents:
                 found = connection.execute(
-                    "SELECT id FROM missions WHERE id=? AND owner=?",
-                    (document["id"], owner),
+                    "SELECT owner, document_json FROM missions WHERE id=?",
+                    (document["id"],),
                 ).fetchone()
                 if found is not None:
+                    if found["owner"] != owner:
+                        raise MissionConflict("conflito de identidade na importação")
+                    try:
+                        stored_document = json.loads(found["document_json"])
+                    except (json.JSONDecodeError, TypeError):
+                        raise MissionConflict("conflito de identidade na importação") from None
+                    if _sha(stored_document) != _sha(document):
+                        raise MissionConflict("conflito de identidade na importação")
                     continue
+
+                for event in document["events"]:
+                    used = connection.execute(
+                        "SELECT 1 FROM mission_events WHERE id=? LIMIT 1",
+                        (event["id"],),
+                    ).fetchone()
+                    if used is not None:
+                        raise MissionConflict("conflito de identidade na importação")
+                new_documents.append(document)
+
+            for document in new_documents:
                 record = {
                     "dataset": "api_synthetic",
                     "owner": owner,

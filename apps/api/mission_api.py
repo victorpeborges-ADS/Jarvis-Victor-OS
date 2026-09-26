@@ -161,6 +161,8 @@ def import_missions(body: MissionImportIn, request: Request) -> dict:
             result = _repo(request).import_valid(session.principal, safe, body.idempotency_key)
     except MissionConflict as exc:
         raise HTTPException(status_code=409, detail=exc.detail) from exc
+    except MissionRejected as exc:
+        raise HTTPException(status_code=422, detail=exc.detail) from exc
     except PermissionError as exc:
         raise HTTPException(status_code=403, detail="concessão ou sessão revogada ou expirada") from exc
     result["quarantined"] = quarantined + result.get("quarantined", [])
