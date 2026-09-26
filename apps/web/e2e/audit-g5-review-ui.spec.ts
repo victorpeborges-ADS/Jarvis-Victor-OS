@@ -15,7 +15,15 @@ async function setupReview(page: Page, title: string) {
     const session = await sessionResponse.json() as { csrf_token: string };
     const csrf = session.csrf_token;
     let reviewGrantId = "";
+    const activeResponse = await fetch(`${api}/real/grants`, { credentials: "include" });
+    if (!activeResponse.ok) throw new Error(`grant inventory: ${activeResponse.status}`);
+    const active = await activeResponse.json() as Array<{ id: string; resource_ids: string[]; domain_ids: string[] }>;
     for (const resource of ["mission:read", "mission:write", "mission:review"]) {
+      const current = active.find((item) => item.resource_ids.includes(resource) && item.domain_ids.includes("dom_synthetic_a"));
+      if (current) {
+        if (resource === "mission:review") reviewGrantId = current.id;
+        continue;
+      }
       const response = await fetch(`${api}/real/grants`, {
         method: "POST", credentials: "include",
         headers: { "Content-Type": "application/json", "X-CSRF-Token": csrf },
