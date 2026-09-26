@@ -68,8 +68,8 @@ _login_blocked_until: dict[str, datetime] = {}
 
 def reset_state() -> None:
     """Limpa estado volátil; usado também para modelar reinício do processo."""
-    _sessions.clear()
     with _grant_lock:
+        _sessions.clear()
         _grants.clear()
     _login_failures.clear()
     _login_blocked_until.clear()
@@ -290,7 +290,7 @@ def authorized_calendar_inventory_domains(principal: str) -> frozenset[str]:
 
 
 @contextmanager
-def mission_write_confirmed(principal: str, domain_id: str):
+def mission_write_confirmed(principal: str, domain_id: str, session_token: str | None = None):
     """Hold grant revocation stable until the caller finishes its SQLite commit.
 
     Lock order is grant lock, then the SQLite write transaction. Callers must
@@ -298,18 +298,26 @@ def mission_write_confirmed(principal: str, domain_id: str):
     event reads take the grant lock first and then the database.
     """
     with _grant_lock:
+        if session_token is not None:
+            session = _sessions.get(session_token)
+            if session is None or session.principal != principal or session.expires_at <= _now():
+                raise PermissionError("sessão encerrada ou expirada")
         if domain_id not in mission_domains(principal, MISSION_WRITE_RESOURCE):
             raise PermissionError("concessão de missão revogada ou expirada")
         yield
 
 
 @contextmanager
-def mission_review_confirmed(principal: str, domain_id: str):
+def mission_review_confirmed(principal: str, domain_id: str, session_token: str | None = None):
     """Hold review grant revocation stable until the review decision SQLite commit.
 
     Lock order is grant lock, then the SQLite write transaction.
     """
     with _grant_lock:
+        if session_token is not None:
+            session = _sessions.get(session_token)
+            if session is None or session.principal != principal or session.expires_at <= _now():
+                raise PermissionError("sessão encerrada ou expirada")
         if domain_id not in mission_domains(principal, MISSION_REVIEW_RESOURCE):
             raise PermissionError("concessão de revisão revogada ou expirada")
         yield
@@ -501,7 +509,8 @@ def current_session(request: Request, response: Response) -> SessionOut:
 @router.delete("/session", status_code=204)
 def close_session(request: Request, response: Response) -> None:
     session = _session_from(request, mutation=True)
-    _sessions.pop(session.token, None)
+    with _grant_lock:
+        _sessions.pop(session.token, None)
     response.delete_cookie(SESSION_COOKIE, path="/")
 
 

@@ -55,10 +55,7 @@ def list_reviews(
     else:
         allowed = readable
 
-    page = _repo(request).list_reviews(session.principal, domain_id, state, limit, cursor)
-    page["items"] = [item for item in page["items"] if item["domain_id"] in allowed]
-    page["corrupt"] = [item for item in page.get("corrupt", []) if item.get("domain_id") in allowed]
-    return page
+    return _repo(request).list_reviews(session.principal, domain_id, state, limit, cursor, allowed)
 
 
 @router.get("/{review_id}")
@@ -82,7 +79,10 @@ def read_review(review_id: str, request: Request) -> dict:
 @router.post("/{review_id}/decide")
 def decide_review(review_id: str, body: ReviewDecisionIn, request: Request) -> dict:
     session = _session_from(request, mutation=True)
-    current = _repo(request).get_review(session.principal, review_id)
+    try:
+        current = _repo(request).get_review(session.principal, review_id)
+    except MissionCorrupt as exc:
+        raise HTTPException(status_code=409, detail="integridade do registro de revisão") from exc
     if current is None:
         raise HTTPException(status_code=404, detail="registro ausente")
     reviewable = mission_domains(session.principal, "mission:review")
@@ -98,6 +98,7 @@ def decide_review(review_id: str, body: ReviewDecisionIn, request: Request) -> d
             body.expected_artifact_sha256,
             body.reason,
             body.idempotency_key,
+            session.token,
         )
         return {**record, "replayed": replayed}
     except MissionConflict as exc:
@@ -106,12 +107,17 @@ def decide_review(review_id: str, body: ReviewDecisionIn, request: Request) -> d
         raise HTTPException(status_code=403, detail=exc.detail) from exc
     except MissionRejected as exc:
         raise HTTPException(status_code=422, detail=exc.detail) from exc
+    except MissionCorrupt as exc:
+        raise HTTPException(status_code=409, detail="integridade do registro de revisão") from exc
 
 
 @router.post("/{review_id}/revise")
 def revise_review(review_id: str, body: ReviewReviseIn, request: Request) -> dict:
     session = _session_from(request, mutation=True)
-    current = _repo(request).get_review(session.principal, review_id)
+    try:
+        current = _repo(request).get_review(session.principal, review_id)
+    except MissionCorrupt as exc:
+        raise HTTPException(status_code=409, detail="integridade do registro de revisão") from exc
     if current is None:
         raise HTTPException(status_code=404, detail="registro ausente")
     writable = mission_domains(session.principal, "mission:write")
@@ -127,9 +133,14 @@ def revise_review(review_id: str, body: ReviewReviseIn, request: Request) -> dic
             review_id,
             body.new_content,
             body.idempotency_key,
+            session.token,
         )
         return {**record, "replayed": replayed}
     except MissionConflict as exc:
         raise HTTPException(status_code=409, detail=exc.detail) from exc
     except MissionRejected as exc:
         raise HTTPException(status_code=422, detail=exc.detail) from exc
+    except MissionDenied as exc:
+        raise HTTPException(status_code=403, detail=exc.detail) from exc
+    except MissionCorrupt as exc:
+        raise HTTPException(status_code=409, detail="integridade do registro de revisão") from exc

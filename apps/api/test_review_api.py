@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import signal
 import sqlite3
@@ -408,6 +409,8 @@ def test_changes_requested_and_revised_version_requires_new_review(client):
     # Version 1 remains changes_requested and terminal
     v1 = client.get(f"/real/reviews/{review_id}", headers={"origin": ORIGIN}).json()
     assert v1["state"] == "changes_requested"
+    assert v1["artifact"]["content"] == detail["artifact"]["content"]
+    assert v1["artifact"]["content"] != v2["artifact"]["content"]
 
     # Version 2 can be approved independently
     v2_approved = client.post(
@@ -422,6 +425,143 @@ def test_changes_requested_and_revised_version_requires_new_review(client):
     )
     assert v2_approved.status_code == 200
     assert v2_approved.json()["state"] == "approved"
+
+
+def test_ledger_snapshot_hash_and_immutability(client):
+    csrf = login(client)
+    mission_all_grants(client, csrf)
+    _, review_id = create_and_run_step(client, csrf, "Snapshot verificável")
+    detail = client.get(f"/real/reviews/{review_id}", headers={"origin": ORIGIN}).json()
+    response = client.post(
+        f"/real/reviews/{review_id}/decide",
+        headers={"origin": ORIGIN, "x-csrf-token": csrf},
+        json={"decision": "approved", "expected_revision": 1,
+              "expected_artifact_sha256": detail["artifact_sha256"],
+              "idempotency_key": "snapshot-hash-key"},
+    )
+    assert response.status_code == 200
+    with sqlite3.connect(client.database_path) as con:
+        row = con.execute(
+            "SELECT id, artifact_sha256, snapshot_json FROM mission_review_decisions WHERE review_id=?",
+            (review_id,),
+        ).fetchone()
+        snapshot = json.loads(row[2])
+        canonical = json.dumps(snapshot, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+        assert hashlib.sha256(canonical.encode()).hexdigest() == row[1]
+        with pytest.raises(sqlite3.IntegrityError):
+            con.execute("UPDATE mission_review_decisions SET decision='rejected' WHERE id=?", (row[0],))
+        with pytest.raises(sqlite3.IntegrityError):
+            con.execute("DELETE FROM mission_review_decisions WHERE id=?", (row[0],))
+
+
+def test_session_closed_before_decision_commit_fails_closed(client, monkeypatch):
+    csrf = login(client)
+    mission_all_grants(client, csrf)
+    _, review_id = create_and_run_step(client, csrf, "Sessão encerrada")
+    detail = client.get(f"/real/reviews/{review_id}", headers={"origin": ORIGIN}).json()
+    entered, release = threading.Event(), threading.Event()
+    import mission_repository
+    def pause():
+        entered.set()
+        assert release.wait(5)
+    monkeypatch.setattr(mission_repository, "_pause_review_if_requested", pause)
+    sink = []
+    def decide():
+        sink.append(client.post(
+            f"/real/reviews/{review_id}/decide",
+            headers={"origin": ORIGIN, "x-csrf-token": csrf},
+            json={"decision": "approved", "expected_revision": 1,
+                  "expected_artifact_sha256": detail["artifact_sha256"],
+                  "idempotency_key": "session-close-race-key"},
+        ).status_code)
+    worker = threading.Thread(target=decide)
+    worker.start()
+    assert entered.wait(5)
+    try:
+        assert client.delete("/real/session", headers={"origin": ORIGIN, "x-csrf-token": csrf}).status_code == 204
+    finally:
+        release.set()
+        worker.join(timeout=5)
+    assert sink == [403]
+    with sqlite3.connect(client.database_path) as con:
+        assert con.execute("SELECT state FROM mission_artifact_reviews WHERE id=?", (review_id,)).fetchone()[0] == "pending"
+        assert con.execute("SELECT COUNT(*) FROM mission_review_decisions WHERE review_id=?", (review_id,)).fetchone()[0] == 0
+
+
+def test_write_grant_revoked_before_revision_commit_fails_closed(client, monkeypatch):
+    csrf = login(client)
+    grants = mission_all_grants(client, csrf)
+    _, review_id = create_and_run_step(client, csrf, "Escrita revogada")
+    detail = client.get(f"/real/reviews/{review_id}", headers={"origin": ORIGIN}).json()
+    assert client.post(
+        f"/real/reviews/{review_id}/decide",
+        headers={"origin": ORIGIN, "x-csrf-token": csrf},
+        json={"decision": "changes_requested", "expected_revision": 1,
+              "expected_artifact_sha256": detail["artifact_sha256"],
+              "reason": "Ajustar", "idempotency_key": "request-before-revoke"},
+    ).status_code == 200
+    entered, release = threading.Event(), threading.Event()
+    import mission_repository
+    def pause():
+        entered.set()
+        assert release.wait(5)
+    monkeypatch.setattr(mission_repository, "_pause_review_if_requested", pause)
+    sink = []
+    def revise():
+        sink.append(client.post(
+            f"/real/reviews/{review_id}/revise",
+            headers={"origin": ORIGIN, "x-csrf-token": csrf},
+            json={"new_content": "Nova versão", "idempotency_key": "revise-revoke-race"},
+        ).status_code)
+    worker = threading.Thread(target=revise)
+    worker.start()
+    assert entered.wait(5)
+    try:
+        assert client.post(f"/real/grants/{grants['write']}/revoke",
+                           headers={"origin": ORIGIN, "x-csrf-token": csrf}).status_code == 200
+    finally:
+        release.set()
+        worker.join(timeout=5)
+    assert sink == [403]
+    with sqlite3.connect(client.database_path) as con:
+        assert con.execute("SELECT COUNT(*) FROM mission_artifact_reviews WHERE artifact_id=?",
+                           (detail["artifact_id"],)).fetchone()[0] == 1
+
+
+def test_review_queue_filters_domain_before_pagination(client):
+    csrf = login(client)
+    mission_all_grants(client, csrf, "dom_synthetic_a")
+    hidden_grants = mission_all_grants(client, csrf, "dom_synthetic_b")
+    _, visible_id = create_and_run_step(client, csrf, "Visível", "dom_synthetic_a")
+    _, hidden_id = create_and_run_step(client, csrf, "Oculto", "dom_synthetic_b")
+    with sqlite3.connect(client.database_path) as con:
+        con.execute("UPDATE mission_artifact_reviews SET id='rev_000_hidden' WHERE id=?", (hidden_id,))
+        con.execute("UPDATE mission_artifact_reviews SET id='rev_999_visible' WHERE id=?", (visible_id,))
+    for resource in ("read", "review"):
+        assert client.post(f"/real/grants/{hidden_grants[resource]}/revoke",
+                           headers={"origin": ORIGIN, "x-csrf-token": csrf}).status_code == 200
+    page = client.get("/real/reviews?limit=1", headers={"origin": ORIGIN})
+    assert page.status_code == 200
+    assert [item["id"] for item in page.json()["items"]] == ["rev_999_visible"]
+    assert page.json()["next_cursor"] is None
+
+
+def test_corrupt_review_pointer_returns_409_on_mutation(client):
+    csrf = login(client)
+    mission_all_grants(client, csrf)
+    _, review_id = create_and_run_step(client, csrf, "Ponteiro inválido")
+    detail = client.get(f"/real/reviews/{review_id}", headers={"origin": ORIGIN}).json()
+    with sqlite3.connect(client.database_path) as con:
+        con.execute("UPDATE mission_artifact_reviews SET artifact_snapshot_json='{}' WHERE id=?", (review_id,))
+    response = client.post(
+        f"/real/reviews/{review_id}/decide",
+        headers={"origin": ORIGIN, "x-csrf-token": csrf},
+        json={"decision": "approved", "expected_revision": 1,
+              "expected_artifact_sha256": detail["artifact_sha256"],
+              "idempotency_key": "corrupt-pointer-decision"},
+    )
+    assert response.status_code == 409
+    assert response.json()["detail"] == "integridade do registro de revisão"
 
 
 def test_corrupted_review_data_fails_closed_without_deleting_row(client):
