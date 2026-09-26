@@ -32,6 +32,11 @@ def _content_sha(content: str) -> str:
 
 
 def _source_review(connection, row):
+    if row["source_review_id"]:
+        return connection.execute(
+            "SELECT * FROM mission_artifact_reviews WHERE id=? AND mission_id=? AND owner=?",
+            (row["source_review_id"], row["mission_id"], row["owner"]),
+        ).fetchone()
     if not row["id"].startswith("knowledge_capture_"):
         return None
     artifact_id = "artifact_capture_" + row["id"].removeprefix("knowledge_capture_")
@@ -68,6 +73,7 @@ def list_knowledge(request: Request, domain_id: str | None = None) -> dict:
             with request.app.state.memory_store.transaction() as connection:
                 rows = connection.execute(
                     f"""SELECT k.id, k.mission_id, k.domain_id, k.content, k.skill_version,
+                           k.kind,
                            k.created_at, d.decision, d.decided_at, d.source_review_id
                     FROM mission_knowledge k LEFT JOIN mission_knowledge_decisions d
                       ON d.knowledge_id=k.id AND d.owner=k.owner
@@ -150,7 +156,8 @@ def decide_knowledge(knowledge_id: str, body: KnowledgeDecisionIn, request: Requ
 def assemble_context(connection, owner: str, mission_id: str, domain_id: str, max_chars: int) -> dict:
     """Read only approved, matching source snapshots in one authorized transaction."""
     rows = connection.execute(
-                    """SELECT k.*, d.decision, d.knowledge_sha256, d.source_review_id,
+                    """SELECT k.*, d.decision, d.knowledge_sha256,
+                              d.source_review_id AS decision_source_review_id,
                               d.source_artifact_sha256
                        FROM mission_knowledge k LEFT JOIN mission_knowledge_decisions d
                          ON d.knowledge_id=k.id AND d.owner=k.owner
@@ -168,7 +175,7 @@ def assemble_context(connection, owner: str, mission_id: str, domain_id: str, ma
             reason = "integridade"
         else:
             source = _source_review(connection, row)
-            if (not _valid_source(source) or source["id"] != row["source_review_id"]
+            if (not _valid_source(source) or source["id"] != row["decision_source_review_id"]
                     or source["artifact_sha256"] != row["source_artifact_sha256"]):
                 reason = "fonte_desatualizada"
             elif total + len(row["content"]) > max_chars:
@@ -178,7 +185,7 @@ def assemble_context(connection, owner: str, mission_id: str, domain_id: str, ma
         else:
             included.append({"knowledge_id": row["id"], "content": row["content"],
                              "content_sha256": row["knowledge_sha256"],
-                             "source_review_id": row["source_review_id"],
+                             "source_review_id": row["decision_source_review_id"],
                              "source_artifact_sha256": row["source_artifact_sha256"],
                              "domain_id": row["domain_id"], "fetched_at": row["created_at"]})
             total += len(row["content"])

@@ -29,6 +29,7 @@ from local_security import router as real_router
 from mission_api import router as mission_router
 from review_api import router as review_router
 from knowledge_api import router as knowledge_router
+from selected_source_api import router as selected_source_router
 from loopback import ALLOWED_ORIGINS, is_allowed_host_header, is_loopback_address
 from memory_store import MemoryStoreError, SQLiteMemoryStore
 from mission_engine import recover_interrupted
@@ -149,6 +150,7 @@ def create_app(config: LocalServerConfig, *, database_path: str | Path | None = 
     app.include_router(mission_router)
     app.include_router(review_router)
     app.include_router(knowledge_router)
+    app.include_router(selected_source_router)
 
     @app.middleware("http")
     async def local_transport_boundary(request: Request, call_next):

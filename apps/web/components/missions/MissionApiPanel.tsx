@@ -11,6 +11,7 @@ import { loadMissions, MISSION_STORAGE_KEY } from "@/lib/mission-store";
 type Listed = { dataset: "api_synthetic"; items: Array<MissionRecord & { available_actions?: string[] }>; next_cursor: string | null };
 type KnowledgeItem = {
   id: string; mission_id: string; domain_id: string; content: string;
+  kind: "skill_derived" | "selected_original";
   content_sha256: string; state: "staged" | "approved" | "rejected";
   source_review_id: string | null; created_at: string;
 };
@@ -82,6 +83,62 @@ export function MissionApiPanel() {
   const [knowledge, setKnowledge] = useState<KnowledgeItem[]>([]);
   const [knowledgeNotice, setKnowledgeNotice] = useState("Conhecimento derivado permanece em preparação até revisão humana separada.");
   const [contextBundle, setContextBundle] = useState<ContextBundle | null>(null);
+  const [selectedFile, setSelectedFile] = useState<{ name: string; content: string; sha256: string } | null>(null);
+  const [selectedMissionId, setSelectedMissionId] = useState("");
+  const [confirmSyntheticFile, setConfirmSyntheticFile] = useState(false);
+  const [sourceNotice, setSourceNotice] = useState("Selecione apenas um arquivo fictício .txt, .md ou .json.");
+  const sourceAttempts = useRef(new Map<string, string>());
+
+  async function chooseSyntheticFile(file: File | undefined) {
+    setSelectedFile(null);
+    setConfirmSyntheticFile(false);
+    if (!file) return;
+    if (!/^[A-Za-z0-9][A-Za-z0-9._ -]{0,115}\.(txt|md|json)$/.test(file.name) || file.size < 1 || file.size > 50000) {
+      setSourceNotice("Arquivo inválido: use .txt, .md ou .json fictício de até 50 KB.");
+      return;
+    }
+    const content = await file.text();
+    if (content.includes("\0") || new TextEncoder().encode(content).length !== file.size) {
+      setSourceNotice("Arquivo inválido: selecione texto UTF-8 sem bytes nulos.");
+      return;
+    }
+    const bytes = new TextEncoder().encode(content);
+    const digest = await crypto.subtle.digest("SHA-256", bytes);
+    const sha256 = [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, "0")).join("");
+    setSelectedFile({ name: file.name, content, sha256 });
+    setSourceNotice(`Prévia local: ${file.name}, ${file.size} bytes, SHA-256 ${sha256.slice(0, 16)}… Nenhum envio ainda.`);
+  }
+
+  async function importSyntheticFile() {
+    if (!selectedFile || !selectedMissionId || !confirmSyntheticFile) return;
+    setBusy(true);
+    try {
+      const session = await localApiRequest<LocalSession>("/real/session");
+      if (!session.data?.csrf_token) throw new Error("sessão ausente");
+      const attempt = `${selectedMissionId}:${selectedFile.sha256}`;
+      let key = sourceAttempts.current.get(attempt);
+      if (!key) {
+        key = `selected-${crypto.randomUUID()}`;
+        sourceAttempts.current.set(attempt, key);
+      }
+      const { data } = await localApiRequest<{ dataset: string; review_id?: string; replayed: boolean }>(
+        `/real/missions/${encodeURIComponent(selectedMissionId)}/sources`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json", "X-CSRF-Token": session.data.csrf_token },
+          body: JSON.stringify({ display_name: selectedFile.name, content: selectedFile.content,
+            expected_content_sha256: selectedFile.sha256, idempotency_key: key, confirm_synthetic: true })
+        });
+      if (data?.dataset !== "api_synthetic") throw new Error("dataset divergente");
+      setSourceNotice(`Fonte sintética registrada. Revisão do artefato: ${data.review_id ?? "já criada"}. O conhecimento continua aguardando aprovação própria.`);
+      setSelectedFile(null);
+      setConfirmSyntheticFile(false);
+      await load();
+    } catch (error) {
+      setSourceNotice(`Envio não confirmado: ${messageFor(error)} Repita com a mesma seleção; a chave de idempotência será mantida.`);
+    } finally {
+      setBusy(false);
+    }
+  }
 
   async function load() {
     setBusy(true);
@@ -121,7 +178,7 @@ export function MissionApiPanel() {
       const { data } = await localApiRequest<{ dataset: string; items: KnowledgeItem[] }>("/real/knowledge");
       if (!data || data.dataset !== "api_synthetic") throw new Error("dataset divergente");
       setKnowledge(data.items);
-      setKnowledgeNotice(`${data.items.length} registro(s) derivados na API local sintética.`);
+      setKnowledgeNotice(`${data.items.length} registro(s) sintéticos na API local.`);
     } catch (error) {
       setKnowledge([]);
       setKnowledgeNotice(`Conhecimento indisponível: ${messageFor(error)}`);
@@ -428,11 +485,34 @@ export function MissionApiPanel() {
         <p className="mt-2 text-xs text-ink-faint">Prévia: {previewCount} aceita(s), {quarantineCount} em quarentena.</p>
       </div>
 
+      <section className="mt-6 border-t border-paper-border pt-4" aria-labelledby="selected-source-heading" data-testid="selected-source-section">
+        <h3 id="selected-source-heading" className="text-base font-semibold text-ink">Selecionar fonte fictícia</h3>
+        <p className="mt-1 text-sm text-ink-subtle">Escolha manualmente um arquivo de texto fictício. O envio cria uma evidência pendente; só duas aprovações humanas liberam seu uso no contexto.</p>
+        <div className="mt-3 grid gap-3 sm:grid-cols-2">
+          <label className="text-sm text-ink">Missão de destino
+            <select className="mt-1 w-full rounded-xl border border-paper-border bg-white p-2" value={selectedMissionId} onChange={(event) => setSelectedMissionId(event.target.value)}>
+              <option value="">Selecione uma missão</option>
+              {records.map((record) => <option key={record.mission.id} value={record.mission.id}>{record.mission.title}</option>)}
+            </select>
+          </label>
+          <label className="text-sm text-ink">Arquivo fictício (.txt, .md, .json; até 50 KB)
+            <input data-testid="selected-source-file" className="mt-1 block w-full text-sm" type="file" accept=".txt,.md,.json,text/plain,application/json" onChange={(event) => void chooseSyntheticFile(event.target.files?.[0])} />
+          </label>
+        </div>
+        {selectedFile && <pre className="mt-3 max-h-32 overflow-auto whitespace-pre-wrap break-words rounded-xl border border-paper-border p-3 text-xs">{selectedFile.content}</pre>}
+        <label className="mt-3 flex items-start gap-2 text-sm text-ink">
+          <input type="checkbox" checked={confirmSyntheticFile} onChange={(event) => setConfirmSyntheticFile(event.target.checked)} />
+          Confirmo que este arquivo contém apenas dados fictícios de teste e autorizo o envio para esta API local.
+        </label>
+        <Button className="mt-3" type="button" disabled={busy || !selectedFile || !selectedMissionId || !confirmSyntheticFile} onClick={() => void importSyntheticFile()}>Registrar fonte sintética</Button>
+        <p className="mt-2 text-sm text-ink-subtle" role="status">{sourceNotice}</p>
+      </section>
+
       <section className="mt-6 border-t border-paper-border pt-4" aria-labelledby="knowledge-heading" data-testid="knowledge-section">
         <div className="flex flex-wrap items-center justify-between gap-2">
           <div>
             <h3 id="knowledge-heading" className="text-base font-semibold text-ink">Conhecimento e contexto</h3>
-            <p className="text-sm text-ink-subtle">Derivações sintéticas aguardam aprovação própria. Aprovar um artefato não promove o conhecimento automaticamente.</p>
+            <p className="text-sm text-ink-subtle">Conhecimento sintético aguarda aprovação própria. Aprovar um artefato não promove o conhecimento automaticamente.</p>
           </div>
           <Button type="button" variant="outline" disabled={busy} onClick={() => void loadKnowledge()}>Atualizar conhecimento</Button>
         </div>
@@ -446,7 +526,7 @@ export function MissionApiPanel() {
                   {item.state === "staged" && <Button type="button" size="sm" disabled={busy} onClick={() => void decideKnowledge(item)}>Aprovar conhecimento</Button>}
                 </div>
                 <p className="mt-1 whitespace-pre-wrap text-ink">{item.content}</p>
-                <p className="mt-1 text-xs text-ink-faint">Missão {item.mission_id} · Domínio {item.domain_id} · SHA-256 {item.content_sha256.slice(0, 16)}…</p>
+                <p className="mt-1 text-xs text-ink-faint">{item.kind === "selected_original" ? "Arquivo fictício escolhido" : "Derivação sintética"} · Missão {item.mission_id} · Domínio {item.domain_id} · SHA-256 {item.content_sha256.slice(0, 16)}…</p>
               </li>
             ))}
           </ul>
