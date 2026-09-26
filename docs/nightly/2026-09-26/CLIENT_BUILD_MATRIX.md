@@ -1,0 +1,10 @@
+# Matriz de builds de clientes
+
+| Cliente | Artefato e existência | Tamanho / SHA-256 | Inicialização e capacidade real | Bloqueio |
+|---|---|---|---|---|
+| Web Next.js | `apps/web/.next` **GERADO** na worktree; build de 11 rotas estáticas | Diretório gerado, sem pacote único a hashear | Build e E2E em loopback desktop/mobile PASS; DEMO e API sintética local mediante sessão/grants | Sem hospedagem/deploy. |
+| macOS Tauri 0.1.0 x86_64 | `/Users/vic/.codex/worktrees/jarvis-overnight-unified-2026-09-26/Jarvis-Victor-OS/apps/desktop/src-tauri/target/release/bundle/macos/JARVIS.app` **GERADO** | 4.378.426 bytes de arquivos; tree SHA-256 `9901ec61c728eb4816b88dc051da20a313d2853fc606a1357b9af19e47ab296f`. Binário `Contents/MacOS/desktop`: 4.279.016 bytes, SHA-256 `550b74bd0d4ad3f3d6ee43e1fb8ff8c79972cc73ee854d0190c704becef0d4c4` | `file`: Mach-O 64-bit x86_64. `open -n -a` exit 0, PID 41686 observado e encerrado. Shell DEMO offline com captura fictícia local; **sem API sintética no app**. | Sem assinatura/notarização. UI nativa não foi percorrida por automação GUI. |
+| macOS `.dmg` | **NÃO GERADO** | — | — | Bundling nesta rodada produziu `.app`; não houve teste de DMG. |
+| Android Capacitor 1.0, `app.jarvis.mobile`, minSdk 24 | `/Users/vic/.codex/worktrees/jarvis-overnight-unified-2026-09-26/Jarvis-Victor-OS/apps/mobile/android/app/build/outputs/apk/debug/app-debug.apk`: **NÃO GERADO** | — | Vite/web shell DEMO offline, 2 unit + 4 E2E PASS, `cap sync android` PASS; **nenhuma execução em dispositivo/emulador**. | `./gradlew assembleDebug` exit 1: nenhum Java Runtime; Android SDK/build-tools também ausentes. Exige instalação/licenças antes do build debug. |
+
+`EXPORTS_MANIFEST.json` contém cada arquivo do `.app` e 22 capturas com tamanho e SHA-256; `generate_manifest.py` reproduz o cálculo. O tree hash ordena `relative_path`, bytes e SHA de cada arquivo do bundle. Nenhum binário/captura foi commitado. Rust oficial ficou em `CARGO_HOME=/tmp/jarvis-nightly-cargo`, `RUSTUP_HOME=/tmp/jarvis-nightly-rustup`; Node global não foi alterado. Nenhuma licença nova de Android foi aceita.

@@ -1,0 +1,149 @@
+{
+  "date": "2026-09-26",
+  "classification": "synthetic_test_only",
+  "macos_app": {
+    "status": "GERADO",
+    "path": "/Users/vic/.codex/worktrees/jarvis-overnight-unified-2026-09-26/Jarvis-Victor-OS/apps/desktop/src-tauri/target/release/bundle/macos/JARVIS.app",
+    "files": [
+      {
+        "relative_path": "Contents/Info.plist",
+        "path": "/Users/vic/.codex/worktrees/jarvis-overnight-unified-2026-09-26/Jarvis-Victor-OS/apps/desktop/src-tauri/target/release/bundle/macos/JARVIS.app/Contents/Info.plist",
+        "bytes": 959,
+        "sha256": "3070af5ccb37e453af5e2e38e9a1ca6dd6d5002787206059e67d9c54f71cdc18"
+      },
+      {
+        "relative_path": "Contents/MacOS/desktop",
+        "path": "/Users/vic/.codex/worktrees/jarvis-overnight-unified-2026-09-26/Jarvis-Victor-OS/apps/desktop/src-tauri/target/release/bundle/macos/JARVIS.app/Contents/MacOS/desktop",
+        "bytes": 4279016,
+        "sha256": "550b74bd0d4ad3f3d6ee43e1fb8ff8c79972cc73ee854d0190c704becef0d4c4"
+      },
+      {
+        "relative_path": "Contents/Resources/icon.icns",
+        "path": "/Users/vic/.codex/worktrees/jarvis-overnight-unified-2026-09-26/Jarvis-Victor-OS/apps/desktop/src-tauri/target/release/bundle/macos/JARVIS.app/Contents/Resources/icon.icns",
+        "bytes": 98451,
+        "sha256": "3dc10493b7de48a61de58f768f8a5708d3a44a068c148cedf0502b9b9b71ba5d"
+      }
+    ],
+    "total_file_bytes": 4378426,
+    "tree_sha256": "9901ec61c728eb4816b88dc051da20a313d2853fc606a1357b9af19e47ab296f",
+    "tree_hash_method": "sha256 of sorted relative_path\\0bytes\\0sha256\\n"
+  },
+  "android_apk": {
+    "status": "NÃO GERADO",
+    "path": "/Users/vic/.codex/worktrees/jarvis-overnight-unified-2026-09-26/Jarvis-Victor-OS/apps/mobile/android/app/build/outputs/apk/debug/app-debug.apk",
+    "reason": "Java Runtime e Android SDK ausentes; assembleDebug exit 1"
+  },
+  "captures": [
+    {
+      "path": "/Users/vic/.codex/worktrees/jarvis-overnight-unified-2026-09-26/Jarvis-Victor-OS/exports/nightly/2026-09-26/captures/drawer-desktop.png",
+      "bytes": 195747,
+      "sha256": "a3d1c32eb345b34a76eb5146fba13009eb4a90ea10a1a939561c7c9e2540d071"
+    },
+    {
+      "path": "/Users/vic/.codex/worktrees/jarvis-overnight-unified-2026-09-26/Jarvis-Victor-OS/exports/nightly/2026-09-26/captures/drawer-mobile.png",
+      "bytes": 131190,
+      "sha256": "4764595812bfff158664b5687f74f2ee80598db1e0e20bfe72d8a425dc583498"
+    },
+    {
+      "path": "/Users/vic/.codex/worktrees/jarvis-overnight-unified-2026-09-26/Jarvis-Victor-OS/exports/nightly/2026-09-26/captures/foco-desktop.png",
+      "bytes": 168077,
+      "sha256": "e3398d2fecd27fe35191c537a93cda3190b742640b48310a9b844a39237a061d"
+    },
+    {
+      "path": "/Users/vic/.codex/worktrees/jarvis-overnight-unified-2026-09-26/Jarvis-Victor-OS/exports/nightly/2026-09-26/captures/foco-mobile.png",
+      "bytes": 281207,
+      "sha256": "eab3216d6d62395d25e471908e9481f1e080d0310f66fa30874ceee701e72e91"
+    },
+    {
+      "path": "/Users/vic/.codex/worktrees/jarvis-overnight-unified-2026-09-26/Jarvis-Victor-OS/exports/nightly/2026-09-26/captures/gate2-e-demo-desktop.png",
+      "bytes": 175342,
+      "sha256": "364ad7c47eeab6a2aeb2e5955ee14f5c2fc1f7bf194a287dcb1a236848e7732c"
+    },
+    {
+      "path": "/Users/vic/.codex/worktrees/jarvis-overnight-unified-2026-09-26/Jarvis-Victor-OS/exports/nightly/2026-09-26/captures/gate2-e-demo-mobile.png",
+      "bytes": 275982,
+      "sha256": "e21361a378538e3b0fe71fc0b9987d163a5cf420db37dfece6be46970a789250"
+    },
+    {
+      "path": "/Users/vic/.codex/worktrees/jarvis-overnight-unified-2026-09-26/Jarvis-Victor-OS/exports/nightly/2026-09-26/captures/gate2-e-integrado-desktop.png",
+      "bytes": 35034,
+      "sha256": "9af29c64321bf001780c405fefb7925cd2bfbc11a05c106a7ff972d576fcdbdb"
+    },
+    {
+      "path": "/Users/vic/.codex/worktrees/jarvis-overnight-unified-2026-09-26/Jarvis-Victor-OS/exports/nightly/2026-09-26/captures/gate2-e-integrado-mobile.png",
+      "bytes": 126767,
+      "sha256": "9c6fce456b38d9069a8de87f5497bc28903654998e29a421961d509e27fa5557"
+    },
+    {
+      "path": "/Users/vic/.codex/worktrees/jarvis-overnight-unified-2026-09-26/Jarvis-Victor-OS/exports/nightly/2026-09-26/captures/missions-desktop.png",
+      "bytes": 420068,
+      "sha256": "d3f1ed934fded1c6ee84a099e10a6314812895eba3d7ada867a3d6ccb1b9629d"
+    },
+    {
+      "path": "/Users/vic/.codex/worktrees/jarvis-overnight-unified-2026-09-26/Jarvis-Victor-OS/exports/nightly/2026-09-26/captures/missions-mobile.png",
+      "bytes": 1171435,
+      "sha256": "d60f8fced7a36f294c03ec4c3f378fd75c38b86a03f927def35e1cd5d4144e41"
+    },
+    {
+      "path": "/Users/vic/.codex/worktrees/jarvis-overnight-unified-2026-09-26/Jarvis-Victor-OS/exports/nightly/2026-09-26/captures/web-integrado-1024.png",
+      "bytes": 118577,
+      "sha256": "dbda72161911bf16e96f1ffca827ab82f31a4b08dca89af1b90d53d771e05303"
+    },
+    {
+      "path": "/Users/vic/.codex/worktrees/jarvis-overnight-unified-2026-09-26/Jarvis-Victor-OS/exports/nightly/2026-09-26/captures/web-integrado-1440.png",
+      "bytes": 122913,
+      "sha256": "80c06007381435b33b17fcc7dd39317202f22c86e0cc25b7dfa3704eb7a5e0c6"
+    },
+    {
+      "path": "/Users/vic/.codex/worktrees/jarvis-overnight-unified-2026-09-26/Jarvis-Victor-OS/exports/nightly/2026-09-26/captures/web-integrado-1920.png",
+      "bytes": 125896,
+      "sha256": "fa615f6d87159e05dad94c6e23599d73badc4e0152be5cea5952f34876b2f26b"
+    },
+    {
+      "path": "/Users/vic/.codex/worktrees/jarvis-overnight-unified-2026-09-26/Jarvis-Victor-OS/exports/nightly/2026-09-26/captures/web-integrado-360.png",
+      "bytes": 70616,
+      "sha256": "7897b4445b19f6683e56913ab0ed9e1b4d63116f77fff7c1ea58895602cce492"
+    },
+    {
+      "path": "/Users/vic/.codex/worktrees/jarvis-overnight-unified-2026-09-26/Jarvis-Victor-OS/exports/nightly/2026-09-26/captures/web-integrado-390.png",
+      "bytes": 69668,
+      "sha256": "d001a6a878604d23005aaff46e2e876feacb76e11ea76487e0b3fd31f183ebf3"
+    },
+    {
+      "path": "/Users/vic/.codex/worktrees/jarvis-overnight-unified-2026-09-26/Jarvis-Victor-OS/exports/nightly/2026-09-26/captures/web-integrado-768.png",
+      "bytes": 122196,
+      "sha256": "ab8ca7202c8f3a0335bad43442471b9d21b31a2946592756fc36afb5cecb4664"
+    },
+    {
+      "path": "/Users/vic/.codex/worktrees/jarvis-overnight-unified-2026-09-26/Jarvis-Victor-OS/exports/nightly/2026-09-26/captures/web-missoes-1024.png",
+      "bytes": 146816,
+      "sha256": "dd4f326a84d724cbd99ae663ec143c472f77686ed44e3d935115aed2e1eb9cb2"
+    },
+    {
+      "path": "/Users/vic/.codex/worktrees/jarvis-overnight-unified-2026-09-26/Jarvis-Victor-OS/exports/nightly/2026-09-26/captures/web-missoes-1440.png",
+      "bytes": 150761,
+      "sha256": "23395e268c8f6bde1adf2b81155753c48d4a4a09cd43a3bea9c0bf6805a4044e"
+    },
+    {
+      "path": "/Users/vic/.codex/worktrees/jarvis-overnight-unified-2026-09-26/Jarvis-Victor-OS/exports/nightly/2026-09-26/captures/web-missoes-1920.png",
+      "bytes": 153652,
+      "sha256": "dc28ab3827c252641cb5ba487856bc83687d169ebb8f28f64d04c9190963122b"
+    },
+    {
+      "path": "/Users/vic/.codex/worktrees/jarvis-overnight-unified-2026-09-26/Jarvis-Victor-OS/exports/nightly/2026-09-26/captures/web-missoes-360.png",
+      "bytes": 79948,
+      "sha256": "286d45800530d73000820589a06f792fc1be47d0fd83e2efea202c5f1a4bdfec"
+    },
+    {
+      "path": "/Users/vic/.codex/worktrees/jarvis-overnight-unified-2026-09-26/Jarvis-Victor-OS/exports/nightly/2026-09-26/captures/web-missoes-390.png",
+      "bytes": 80698,
+      "sha256": "0bdb74e0eab2ed5bdfb2c9d9f3f4dabea22409c0365367eb00feea6946692ab9"
+    },
+    {
+      "path": "/Users/vic/.codex/worktrees/jarvis-overnight-unified-2026-09-26/Jarvis-Victor-OS/exports/nightly/2026-09-26/captures/web-missoes-768.png",
+      "bytes": 147159,
+      "sha256": "f4bf4df5d17432a3df407a9759558340e9feebab86d5a0392bcc6740772500b7"
+    }
+  ],
+  "capture_count": 22
+}
