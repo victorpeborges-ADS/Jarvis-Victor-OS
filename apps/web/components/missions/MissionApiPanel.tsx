@@ -9,6 +9,16 @@ import { planMissionImport } from "@/lib/mission-import";
 import { loadMissions, MISSION_STORAGE_KEY } from "@/lib/mission-store";
 
 type Listed = { dataset: "api_synthetic"; items: Array<MissionRecord & { available_actions?: string[] }>; next_cursor: string | null };
+type KnowledgeItem = {
+  id: string; mission_id: string; domain_id: string; content: string;
+  content_sha256: string; state: "staged" | "approved" | "rejected";
+  source_review_id: string | null; created_at: string;
+};
+type ContextBundle = {
+  mission_id: string; domain_id: string; used_chars: number;
+  included: Array<{ knowledge_id: string; content: string; source_review_id: string; content_sha256: string }>;
+  omitted: Array<{ knowledge_id: string; reason: string }>;
+};
 
 export interface ReviewItem {
   id: string;
@@ -68,6 +78,10 @@ export function MissionApiPanel() {
   const [reviseContent, setReviseContent] = useState("");
   const [modalNotice, setModalNotice] = useState<string | null>(null);
   const decisionAttempts = useRef(new Map<string, string>());
+  const knowledgeAttempts = useRef(new Map<string, string>());
+  const [knowledge, setKnowledge] = useState<KnowledgeItem[]>([]);
+  const [knowledgeNotice, setKnowledgeNotice] = useState("Conhecimento derivado permanece em preparação até revisão humana separada.");
+  const [contextBundle, setContextBundle] = useState<ContextBundle | null>(null);
 
   async function load() {
     setBusy(true);
@@ -81,6 +95,7 @@ export function MissionApiPanel() {
       setRecords(data.items);
       setNotice(`${data.items.length} missão(ões) na API local sintética.`);
       await loadReviews();
+      await loadKnowledge();
     } catch (error) {
       setRecords([]);
       setNotice(messageFor(error));
@@ -98,6 +113,57 @@ export function MissionApiPanel() {
     } catch (error) {
       setReviews([]);
       setNotice(`Não foi possível carregar a fila de revisão: ${messageFor(error)}`);
+    }
+  }
+
+  async function loadKnowledge() {
+    try {
+      const { data } = await localApiRequest<{ dataset: string; items: KnowledgeItem[] }>("/real/knowledge");
+      if (!data || data.dataset !== "api_synthetic") throw new Error("dataset divergente");
+      setKnowledge(data.items);
+      setKnowledgeNotice(`${data.items.length} registro(s) derivados na API local sintética.`);
+    } catch (error) {
+      setKnowledge([]);
+      setKnowledgeNotice(`Conhecimento indisponível: ${messageFor(error)}`);
+    }
+  }
+
+  async function decideKnowledge(item: KnowledgeItem) {
+    setBusy(true);
+    try {
+      const session = await localApiRequest<LocalSession>("/real/session");
+      if (!session.data?.csrf_token) throw new Error("sessão ausente");
+      const attempt = `${item.id}:${item.content_sha256}:approved`;
+      let key = knowledgeAttempts.current.get(attempt);
+      if (!key) {
+        key = `knowledge-${crypto.randomUUID()}`;
+        knowledgeAttempts.current.set(attempt, key);
+      }
+      await localApiRequest(`/real/knowledge/${encodeURIComponent(item.id)}/decide`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "X-CSRF-Token": session.data.csrf_token },
+        body: JSON.stringify({ decision: "approved", expected_content_sha256: item.content_sha256, idempotency_key: key })
+      });
+      await loadKnowledge();
+      setKnowledgeNotice("Conhecimento aprovado separadamente. O artefato de origem já precisava estar aprovado.");
+    } catch (error) {
+      await loadKnowledge();
+      setKnowledgeNotice(`Aprovação do conhecimento não confirmada: ${messageFor(error)} Verifique a revisão do artefato de origem e atualize a lista.`);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function loadContext(missionId: string) {
+    setBusy(true);
+    setContextBundle(null);
+    try {
+      const { data } = await localApiRequest<ContextBundle>(`/real/knowledge/context/${encodeURIComponent(missionId)}`);
+      if (data) setContextBundle(data);
+    } catch (error) {
+      setKnowledgeNotice(`Pacote de contexto indisponível: ${messageFor(error)}`);
+    } finally {
+      setBusy(false);
     }
   }
 
@@ -343,6 +409,9 @@ export function MissionApiPanel() {
                     {action}
                   </Button>
                 ))}
+                <Button type="button" variant="outline" disabled={busy} onClick={() => void loadContext(record.mission.id)}>
+                  Ver contexto autorizado
+                </Button>
               </div>
             </li>
           ))}
@@ -358,6 +427,39 @@ export function MissionApiPanel() {
         </label>
         <p className="mt-2 text-xs text-ink-faint">Prévia: {previewCount} aceita(s), {quarantineCount} em quarentena.</p>
       </div>
+
+      <section className="mt-6 border-t border-paper-border pt-4" aria-labelledby="knowledge-heading" data-testid="knowledge-section">
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <div>
+            <h3 id="knowledge-heading" className="text-base font-semibold text-ink">Conhecimento e contexto</h3>
+            <p className="text-sm text-ink-subtle">Derivações sintéticas aguardam aprovação própria. Aprovar um artefato não promove o conhecimento automaticamente.</p>
+          </div>
+          <Button type="button" variant="outline" disabled={busy} onClick={() => void loadKnowledge()}>Atualizar conhecimento</Button>
+        </div>
+        <p className="mt-2 text-sm text-ink-subtle" role="status">{knowledgeNotice}</p>
+        {knowledge.length === 0 ? <p className="mt-2 text-sm text-ink-faint">Nenhum conhecimento derivado disponível neste escopo.</p> : (
+          <ul className="mt-3 space-y-2">
+            {knowledge.map((item) => (
+              <li key={item.id} className="rounded-xl border border-paper-border p-3 text-sm" data-testid="knowledge-card">
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <strong>{item.state === "staged" ? "Aguardando revisão" : item.state === "approved" ? "Aprovado para contexto" : "Rejeitado"}</strong>
+                  {item.state === "staged" && <Button type="button" size="sm" disabled={busy} onClick={() => void decideKnowledge(item)}>Aprovar conhecimento</Button>}
+                </div>
+                <p className="mt-1 whitespace-pre-wrap text-ink">{item.content}</p>
+                <p className="mt-1 text-xs text-ink-faint">Missão {item.mission_id} · Domínio {item.domain_id} · SHA-256 {item.content_sha256.slice(0, 16)}…</p>
+              </li>
+            ))}
+          </ul>
+        )}
+        {contextBundle && (
+          <div className="mt-3 rounded-xl border border-paper-border bg-paper-muted p-3 text-sm" data-testid="context-bundle">
+            <h4 className="font-semibold">Pacote de contexto autorizado · {contextBundle.domain_id}</h4>
+            <p>{contextBundle.included.length} incluído(s), {contextBundle.omitted.length} omitido(s), {contextBundle.used_chars} caracteres.</p>
+            <ul className="mt-2 space-y-1">{contextBundle.included.map((entry) => <li key={entry.knowledge_id}>{entry.content} · Origem: {entry.source_review_id}</li>)}</ul>
+            <ul className="mt-2 space-y-1 text-ink-subtle">{contextBundle.omitted.map((entry) => <li key={entry.knowledge_id}>{entry.knowledge_id}: {entry.reason}</li>)}</ul>
+          </div>
+        )}
+      </section>
 
       {/* Seção de Fila de Revisão Humana */}
       <div className="mt-6 border-t border-paper-border pt-4" data-testid="review-queue-section">

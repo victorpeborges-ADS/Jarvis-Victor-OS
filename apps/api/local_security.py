@@ -290,6 +290,19 @@ def authorized_calendar_inventory_domains(principal: str) -> frozenset[str]:
 
 
 @contextmanager
+def mission_read_confirmed(principal: str, domain_id: str, session_token: str | None = None):
+    """Keep a synthetic mission read grant active while assembling its response."""
+    with _grant_lock:
+        if session_token is not None:
+            session = _sessions.get(session_token)
+            if session is None or session.principal != principal or session.expires_at <= _now():
+                raise PermissionError("sessão encerrada ou expirada")
+        if domain_id not in mission_domains(principal, MISSION_READ_RESOURCE):
+            raise PermissionError("concessão de leitura revogada ou expirada")
+        yield
+
+
+@contextmanager
 def mission_write_confirmed(principal: str, domain_id: str, session_token: str | None = None):
     """Hold grant revocation stable until the caller finishes its SQLite commit.
 

@@ -205,7 +205,12 @@ class MissionEngine:
             raise MissionDenied("concessão de missão revogada ou expirada") from exc
 
     def _confirm_locked(self, store, owner, mission_id, execution_id, required_phase, expected_revision, task, artifact, knowledge, now, idempotency_key, body_hash):
-        from mission_repository import MissionConflict, MissionRejected, _check_mission, _record_from_row
+        from mission_repository import MissionConflict, MissionRejected, _check_mission, _record_from_row, _sha
+        from local_security import mission_domains
+        context_allowed = (
+            task["id"] == "task_context"
+            and artifact["source_refs"][0]["domain_id"] in mission_domains(owner, "mission:read")
+        )
         with store.transaction() as connection:
             current = connection.execute(
                 "SELECT phase FROM mission_executions WHERE id=? AND mission_id=? AND owner=?",
@@ -217,6 +222,34 @@ class MissionEngine:
             record = _record_from_row(fresh)
             mission = record["mission"]
             task = next(item for item in mission["tasks"] if item["id"] == task["id"])
+            if task["id"] == "task_context":
+                artifact["skill_id"] = "build-context"
+                artifact["skill_version"] = "1.1.0"
+                if context_allowed:
+                    from knowledge_api import assemble_context
+                    bundle = assemble_context(connection, owner, mission_id, mission["domain_id"], 3000)
+                    artifact["content"] = "\n".join(
+                        f"Fonte {item['knowledge_id']} · revisão {item['source_review_id']}: {item['content']}"
+                        for item in bundle["included"]
+                    ) or "Nenhuma fonte aprovada para este contexto."
+                    artifact["source_refs"] = [
+                        {"source_id": f"synthetic:knowledge:{item['knowledge_id']}", "uri": None,
+                         "observed_at": item["fetched_at"], "last_verified_at": bundle["assembled_at"],
+                         "valid_until": None, "domain_id": mission["domain_id"]}
+                        for item in bundle["included"]
+                    ]
+                    artifact["input_digest"] = _sha([
+                        (item["knowledge_id"], item["content_sha256"], item["source_artifact_sha256"])
+                        for item in bundle["included"]
+                    ])
+                else:
+                    artifact["content"] = "Sem concessão de leitura para montar contexto; nenhuma fonte foi incluída."
+                    artifact["source_refs"] = []
+                    artifact["input_digest"] = _sha([])
+                connection.execute(
+                    "UPDATE mission_executions SET skill_id=?, skill_version=?, input_digest=? WHERE id=? AND owner=?",
+                    (artifact["skill_id"], artifact["skill_version"], artifact["input_digest"], execution_id, owner),
+                )
             if not any(item["id"] == artifact["id"] for item in mission["artifacts"]):
                 mission["artifacts"].append(artifact)
             self.repository._sync_artifact_review(connection, mission, owner, artifact, now)

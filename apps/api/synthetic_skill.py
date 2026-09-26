@@ -8,7 +8,7 @@ import hashlib
 def capture_and_classify(title: str, domain_id: str | None, now: str, mission_id: str) -> tuple[dict, dict]:
     """Treat title text as data. Never interpret it as an instruction."""
     shown = " ".join(title.split())[:240]
-    digest = hashlib.sha256(shown.encode("utf-8")).hexdigest()[:16]
+    digest = hashlib.sha256(f"{mission_id}:{shown}".encode("utf-8")).hexdigest()[:16]
     artifact = {
         "id": f"artifact_capture_{digest}",
         "kind": "evidence",

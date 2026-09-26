@@ -53,7 +53,7 @@ async function setupReview(page: Page, title: string) {
     const queue = await queueResponse.json() as { items: Array<{ id: string; mission_id: string }> };
     const reviewId = queue.items.find((item) => item.mission_id === created.mission.id)?.id;
     if (!reviewId) throw new Error("review absent from API queue");
-    return { csrf, reviewGrantId, reviewId };
+    return { csrf, reviewGrantId, reviewId, missionId: created.mission.id };
   }, { api: apiOrigin, missionTitle: title });
   return setup;
 }
@@ -117,4 +117,40 @@ test("G5 auditoria independente da UI: grant revogado apresenta 403 e mantém o 
   await page.keyboard.press("Escape");
   await page.getByRole("button", { name: "Atualizar fila de revisão" }).click();
   await expect(card).toContainText("Aguardando revisão");
+});
+
+test("G6 UI: conhecimento exige decisão própria e contexto persiste após recarga", async ({ page }) => {
+  const title = `Ideia sintética com fonte ${Date.now()}`;
+  const { missionId } = await setupReview(page, title);
+  await openReview(page, title);
+  await page.getByTestId("review-approve-button").click();
+  await page.getByTestId("review-confirm-button").click();
+  await expect(page.getByTestId("review-modal-notice")).toContainText("confirmada pelo servidor");
+  await page.keyboard.press("Escape");
+  await page.getByRole("button", { name: "Ler missões da API" }).click();
+  const knowledge = page.getByTestId("knowledge-card").filter({ hasText: title });
+  await expect(knowledge).toContainText("Aguardando revisão");
+  const mission = page.getByTestId("mission-api-card").filter({ hasText: title });
+  await mission.getByRole("button", { name: "Ver contexto autorizado" }).click();
+  await expect(page.getByTestId("context-bundle")).toContainText("aguardando_revisao");
+  await knowledge.getByRole("button", { name: "Aprovar conhecimento" }).click();
+  await expect(knowledge).toContainText("Aprovado para contexto");
+  await mission.getByRole("button", { name: "Ver contexto autorizado" }).click();
+  await expect(page.getByTestId("context-bundle")).toContainText(title);
+  await mission.getByRole("button", { name: "run_next" }).click();
+  await expect(mission).toContainText("revisão 4");
+  const contextArtifact = await page.evaluate(async ({ api, id }) => {
+    const response = await fetch(`${api}/real/missions/${id}`, { credentials: "include" });
+    if (!response.ok) throw new Error(`mission read: ${response.status}`);
+    const record = await response.json() as { mission: { artifacts: Array<{ kind: string; content: string; source_refs: Array<{ source_id: string }> }> } };
+    return record.mission.artifacts.find((item) => item.kind === "context_bundle");
+  }, { api: apiOrigin, id: missionId });
+  expect(contextArtifact?.content).toContain(title);
+  expect(contextArtifact?.source_refs[0].source_id).toContain("synthetic:knowledge:");
+  await page.reload();
+  await page.getByTestId("mission-api-open").click();
+  await page.getByRole("button", { name: "Ler missões da API" }).click();
+  await expect(page.getByTestId("knowledge-card").filter({ hasText: title })).toContainText("Aprovado para contexto");
+  await page.getByTestId("mission-api-card").filter({ hasText: title }).getByRole("button", { name: "Ver contexto autorizado" }).click();
+  await expect(page.getByTestId("context-bundle")).toContainText(title);
 });
