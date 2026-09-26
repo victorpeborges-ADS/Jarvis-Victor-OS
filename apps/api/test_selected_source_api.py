@@ -134,3 +134,36 @@ def test_concurrent_identical_selection_creates_one_artifact(client):
     assert len(client.get(path, headers={"origin": ORIGIN}).json()["items"]) == 1
     with sqlite3.connect(client.database_path) as con:
         assert con.execute("SELECT COUNT(*) FROM mission_knowledge WHERE kind='selected_original'").fetchone()[0] == 1
+
+
+def test_selected_original_cannot_diverge_from_approved_artifact_snapshot(client):
+    csrf = login(client)
+    mission_all_grants(client, csrf)
+    mission_id = _mission(client, csrf)
+    path = f"/real/missions/{mission_id}/sources"
+    posted = client.post(path, headers=_headers(csrf), json=_body()).json()
+    review = client.get(f"/real/reviews/{posted['review_id']}", headers={"origin": ORIGIN}).json()
+    approved = client.post(f"/real/reviews/{posted['review_id']}/decide", headers=_headers(csrf), json={
+        "decision": "approved", "expected_revision": 1,
+        "expected_artifact_sha256": review["artifact_sha256"],
+        "idempotency_key": "approve-original-integrity",
+    })
+    assert approved.status_code == 200, approved.text
+    knowledge = next(item for item in client.get("/real/knowledge", headers={"origin": ORIGIN}).json()["items"]
+                     if item["kind"] == "selected_original")
+    with sqlite3.connect(client.database_path) as con:
+        con.execute("UPDATE mission_knowledge SET content='texto divergente' WHERE id=?", (knowledge["id"],))
+    decision = {"decision": "approved", "expected_content_sha256": hashlib.sha256(b"texto divergente").hexdigest(),
+                "idempotency_key": "approve-divergent-original"}
+    refused = client.post(f"/real/knowledge/{knowledge['id']}/decide", headers=_headers(csrf), json=decision)
+    assert refused.status_code == 409
+    with sqlite3.connect(client.database_path) as con:
+        con.execute("UPDATE mission_knowledge SET content=? WHERE id=?", (_body()["content"], knowledge["id"]))
+    decision["expected_content_sha256"] = knowledge["content_sha256"]
+    decision["idempotency_key"] = "approve-matching-original"
+    assert client.post(f"/real/knowledge/{knowledge['id']}/decide", headers=_headers(csrf), json=decision).status_code == 200
+    with sqlite3.connect(client.database_path) as con:
+        con.execute("UPDATE mission_knowledge SET content='texto divergente' WHERE id=?", (knowledge["id"],))
+    bundle = client.get(f"/real/knowledge/context/{mission_id}", headers={"origin": ORIGIN}).json()
+    assert bundle["included"] == []
+    assert bundle["omitted"][0]["reason"] == "integridade"

@@ -58,6 +58,18 @@ def _valid_source(row) -> bool:
         return False
 
 
+def _source_content_matches(row, source) -> bool:
+    if row["kind"] != "selected_original":
+        return True
+    if source is None:
+        return False
+    try:
+        snapshot = json.loads(source["artifact_snapshot_json"])
+        return snapshot.get("content") == row["content"]
+    except (TypeError, ValueError, AttributeError):
+        return False
+
+
 @router.get("")
 def list_knowledge(request: Request, domain_id: str | None = None) -> dict:
     session = _session_from(request)
@@ -131,7 +143,8 @@ def decide_knowledge(knowledge_id: str, body: KnowledgeDecisionIn, request: Requ
                 ).fetchone() is not None:
                     raise HTTPException(status_code=409, detail="conhecimento já decidido")
                 source = _source_review(connection, fresh)
-                if body.decision == "approved" and not _valid_source(source):
+                if body.decision == "approved" and (not _valid_source(source)
+                                                    or not _source_content_matches(fresh, source)):
                     raise HTTPException(status_code=409, detail="artefato de origem ainda não aprovado ou desatualizado")
                 source_id = source["id"] if source is not None else None
                 source_sha = source["artifact_sha256"] if source is not None else None
@@ -175,7 +188,8 @@ def assemble_context(connection, owner: str, mission_id: str, domain_id: str, ma
             reason = "integridade"
         else:
             source = _source_review(connection, row)
-            if (not _valid_source(source) or source["id"] != row["decision_source_review_id"]
+            if (not _valid_source(source) or not _source_content_matches(row, source)
+                    or source["id"] != row["decision_source_review_id"]
                     or source["artifact_sha256"] != row["source_artifact_sha256"]):
                 reason = "fonte_desatualizada"
             elif total + len(row["content"]) > max_chars:
