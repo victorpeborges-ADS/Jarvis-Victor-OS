@@ -3,7 +3,9 @@ ALTER TABLE mission_artifact_reviews ADD COLUMN artifact_snapshot_json TEXT;
 UPDATE mission_artifact_reviews
 SET artifact_snapshot_json = (
     SELECT artifact.value
-    FROM missions AS mission, json_each(mission.document_json, '$.artifacts') AS artifact
+    FROM missions AS mission,
+         json_each(CASE WHEN json_valid(mission.document_json)
+                        THEN mission.document_json ELSE '{}' END, '$.artifacts') AS artifact
     WHERE mission.id = mission_artifact_reviews.mission_id
       AND mission.owner = mission_artifact_reviews.owner
       AND json_extract(artifact.value, '$.id') = mission_artifact_reviews.artifact_id

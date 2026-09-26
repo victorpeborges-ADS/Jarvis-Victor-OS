@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useRef, useState } from "react";
 import { Dialog } from "@/components/ui/Dialog";
 import { Badge, Button, Card } from "@/components/ui/primitives";
 import { LocalApiError, localApiRequest, type LocalSession } from "@/lib/local-api";
@@ -67,6 +67,7 @@ export function MissionApiPanel() {
   const [decisionReason, setDecisionReason] = useState("");
   const [reviseContent, setReviseContent] = useState("");
   const [modalNotice, setModalNotice] = useState<string | null>(null);
+  const decisionAttempts = useRef(new Map<string, string>());
 
   async function load() {
     setBusy(true);
@@ -94,8 +95,9 @@ export function MissionApiPanel() {
       if (data?.items) {
         setReviews(data.items);
       }
-    } catch {
-      // Ignora erro se usuário não tiver permissão para reviews ainda
+    } catch (error) {
+      setReviews([]);
+      setNotice(`Não foi possível carregar a fila de revisão: ${messageFor(error)}`);
     }
   }
 
@@ -198,7 +200,13 @@ export function MissionApiPanel() {
         setModalNotice("Sessão ausente (401). Entre na integração local.");
         return;
       }
-      const idempotencyKey = `decide-${selectedReview.id}-${decision}-${Date.now()}`;
+      const attempt = JSON.stringify([selectedReview.id, selectedReview.revision,
+        selectedReview.artifact_sha256, decision, decisionReason.trim()]);
+      let idempotencyKey = decisionAttempts.current.get(attempt);
+      if (!idempotencyKey) {
+        idempotencyKey = `decide-${crypto.randomUUID()}`;
+        decisionAttempts.current.set(attempt, idempotencyKey);
+      }
       const { data } = await localApiRequest<ReviewItem>(`/real/reviews/${encodeURIComponent(selectedReview.id)}/decide`, {
         method: "POST",
         headers: { "Content-Type": "application/json", "X-CSRF-Token": session.data.csrf_token },
@@ -219,7 +227,19 @@ export function MissionApiPanel() {
         await load();
       }
     } catch (error) {
-      setModalNotice(messageFor(error));
+      try {
+        const { data } = await localApiRequest<ReviewItem>(`/real/reviews/${encodeURIComponent(selectedReview.id)}`);
+        if (data && (data.revision !== selectedReview.revision || data.state !== selectedReview.state)) {
+          setSelectedReview(data);
+          setDecisionType(null);
+          setModalNotice(`O servidor registrou o estado “${data.state}”. A revisão foi atualizada após a resposta interrompida.`);
+          await loadReviews();
+        } else {
+          setModalNotice(`${messageFor(error)} O estado continua pendente; você pode repetir a decisão com a mesma chave.`);
+        }
+      } catch {
+        setModalNotice(`${messageFor(error)} Não foi possível confirmar o resultado. Tente novamente; a mesma chave será reutilizada.`);
+      }
     } finally {
       setBusy(false);
     }
