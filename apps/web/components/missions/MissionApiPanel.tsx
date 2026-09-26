@@ -3,7 +3,7 @@
 import { useRef, useState } from "react";
 import { Dialog } from "@/components/ui/Dialog";
 import { Badge, Button, Card } from "@/components/ui/primitives";
-import { LocalApiError, localApiRequest, type LocalSession } from "@/lib/local-api";
+import { LocalApiError, localApiRequest, type LocalGrant, type LocalSession } from "@/lib/local-api";
 import type { Artifact, Mission, MissionRecord } from "@/lib/mission-contracts";
 import { planMissionImport } from "@/lib/mission-import";
 import { loadMissions, MISSION_STORAGE_KEY } from "@/lib/mission-store";
@@ -431,6 +431,42 @@ export function MissionApiPanel() {
     }
   }
 
+  async function grantMissionReadWrite(domainId = "dom_synthetic_a") {
+    setBusy(true);
+    const confirmed: string[] = [];
+    try {
+      const session = await localApiRequest<LocalSession>("/real/session");
+      if (!session.data?.csrf_token) {
+        setNotice("Sessão ausente (401). Entre na API local antes de criar concessões.");
+        return;
+      }
+      const inventory = await localApiRequest<LocalGrant[]>("/real/grants");
+      for (const resource of ["mission:read", "mission:write"]) {
+        if (inventory.data?.some((grant) => grant.resource_ids.includes(resource) && grant.domain_ids.includes(domainId)
+          && !grant.revoked && Date.parse(grant.expires_at) > Date.now())) {
+          confirmed.push(resource);
+          continue;
+        }
+        await localApiRequest("/real/grants", {
+          method: "POST",
+          headers: { "Content-Type": "application/json", "X-CSRF-Token": session.data.csrf_token },
+          body: JSON.stringify({
+            connector: "mission_sim", permission: "read",
+            resource_ids: [resource], domain_ids: [domainId],
+            expires_at: new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString()
+          })
+        });
+        confirmed.push(resource);
+      }
+      await load();
+      setNotice(`Concessões mission:read e mission:write confirmadas para ${domainId}, por até 24 horas.`);
+    } catch (error) {
+      setNotice(`${confirmed.length ? `Concessão confirmada: ${confirmed.join(", ")}. ` : ""}Próxima concessão não confirmada: ${messageFor(error)} Confira a lista antes de repetir.`);
+    } finally {
+      setBusy(false);
+    }
+  }
+
   if (!open) {
     return (
       <div className="mt-6">
@@ -475,6 +511,7 @@ export function MissionApiPanel() {
         </ul>
         <div className="mt-3 flex flex-wrap gap-2">
           <Button type="button" disabled={busy} onClick={() => void load()}>Ler missões da API</Button>
+          <Button type="button" variant="outline" disabled={busy} onClick={() => void grantMissionReadWrite("dom_synthetic_a")}>Conceder leitura e escrita de Missões (Escopo A)</Button>
           <Button type="button" variant="outline" disabled={busy} onClick={preview}>Prévia da importação</Button>
           <Button type="button" variant="outline" disabled={busy || pending.length === 0} onClick={() => void confirmImport()}>Confirmar envio</Button>
         </div>
