@@ -7,7 +7,7 @@ export type LocalSession = {
 export type LocalGrant = {
   id: string;
   principal: string;
-  connector: "calendar_sim";
+  connector: "calendar_sim" | "mission_sim";
   permission: "read";
   resource_ids: string[];
   domain_ids: string[];
