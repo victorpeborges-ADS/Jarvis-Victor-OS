@@ -179,6 +179,9 @@ test("API local no navegador: PUT/CORS, sync, proveniência, estados, modos e re
   // Real API revocation out-of-band leaves the client grant view stale on
   // purpose; the following protected read must return 403 and clear UI data.
   await page.getByTestId("grant-domain").selectOption(domainForProject);
+  const renewedEvents = page.waitForResponse((response) =>
+    response.url().endsWith(`/real/events?domain_id=${domainForProject}`) && response.request().method() === "GET"
+  );
   const renewedGrant = page.waitForResponse((response) =>
     response.url().endsWith("/real/grants") && response.request().method() === "POST" && response.status() === 201
   );
@@ -189,6 +192,7 @@ test("API local no navegador: PUT/CORS, sync, proveniência, estados, modos e re
     activeGrantId = renewedBody.id;
   }
   await expect(page.getByTestId("grant-card").filter({ hasText: "Calendar fictício" })).toBeVisible();
+  expect((await renewedEvents).status()).toBe(200);
   expect(csrfToken).toBeTruthy();
   expect(activeGrantId).toBeTruthy();
   const revokeStatus = await page.evaluate(async ({ grantId, csrf, apiOrigin }) => {
