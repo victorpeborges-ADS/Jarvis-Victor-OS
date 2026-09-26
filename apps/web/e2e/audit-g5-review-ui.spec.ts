@@ -154,3 +154,40 @@ test("G6 UI: conhecimento exige decisão própria e contexto persiste após reca
   await page.getByTestId("mission-api-card").filter({ hasText: title }).getByRole("button", { name: "Ver contexto autorizado" }).click();
   await expect(page.getByTestId("context-bundle")).toContainText(title);
 });
+
+test("G6 UI: arquivo fictício escolhido entra somente após duas aprovações", async ({ page }) => {
+  const title = `Fonte escolhida ${Date.now()}`;
+  const { missionId } = await setupReview(page, title);
+  await page.goto("/missoes");
+  await page.getByTestId("mission-api-open").click();
+  await page.getByRole("button", { name: "Ler missões da API" }).click();
+  const sourceSection = page.getByTestId("selected-source-section");
+  await sourceSection.getByLabel("Missão de destino").selectOption(missionId);
+  await sourceSection.getByTestId("selected-source-file").setInputFiles({
+    name: "nota-ficticia.md", mimeType: "text/markdown",
+    buffer: Buffer.from("Nota inteiramente fictícia para contexto aprovado.\n"),
+  });
+  await expect(sourceSection).toContainText("Prévia local");
+  await sourceSection.getByRole("checkbox").check();
+  await sourceSection.getByRole("button", { name: "Registrar fonte sintética" }).click();
+  await expect(sourceSection).toContainText("Fonte sintética registrada");
+  const knowledge = page.getByTestId("knowledge-card").filter({ hasText: "Nota inteiramente fictícia" }).filter({ hasText: missionId });
+  await expect(knowledge).toContainText("Aguardando revisão");
+  const mission = page.getByTestId("mission-api-card").filter({ hasText: title });
+  await mission.getByRole("button", { name: "Ver contexto autorizado" }).click();
+  await expect(page.getByTestId("context-bundle")).not.toContainText("Nota inteiramente fictícia");
+  await page.getByRole("button", { name: "Atualizar fila de revisão" }).click();
+  const review = page.getByTestId("review-card").filter({ hasText: "nota-ficticia.md" }).filter({ hasText: title });
+  await review.getByTestId("review-open-button").click();
+  await expect(page.getByTestId("review-artifact-content")).toContainText("Nota inteiramente fictícia");
+  await page.getByTestId("review-approve-button").click();
+  await page.getByTestId("review-confirm-button").click();
+  await expect(page.getByTestId("review-modal-notice")).toContainText("confirmada pelo servidor");
+  await page.keyboard.press("Escape");
+  await mission.getByRole("button", { name: "Ver contexto autorizado" }).click();
+  await expect(page.getByTestId("context-bundle")).not.toContainText("Nota inteiramente fictícia");
+  await knowledge.getByRole("button", { name: "Aprovar conhecimento" }).click();
+  await expect(knowledge).toContainText("Aprovado para contexto");
+  await mission.getByRole("button", { name: "Ver contexto autorizado" }).click();
+  await expect(page.getByTestId("context-bundle")).toContainText("Nota inteiramente fictícia");
+});

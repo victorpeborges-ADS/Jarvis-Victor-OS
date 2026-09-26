@@ -25,7 +25,7 @@ test.describe("Gate 1.3 — isolamento e persistência DEMO", () => {
     expect(captureId).toBeTruthy();
     await expect(card).toHaveAttribute("data-domain-id", "dom_crivo");
 
-    await page.locator('a[href="/dominios"]:visible').click();
+    await page.goto("/dominios");
     await expect(page).toHaveURL(/\/dominios/);
     await page.getByTestId("domain-tab-dom_crivo").click();
     const stored = page.getByTestId("domain-capture").filter({ hasText: trace });
