@@ -23,6 +23,7 @@ from domain_registry import (
     CANONICAL_RESOURCES,
     MISSION_READ_RESOURCE,
     MISSION_WRITE_RESOURCE,
+    MISSION_REVIEW_RESOURCE,
 )
 from memory_models import ProvenanceRecord, ReadScope
 from memory_store import SQLiteMemoryStore, StoredEvent
@@ -302,12 +303,24 @@ def mission_write_confirmed(principal: str, domain_id: str):
         yield
 
 
+@contextmanager
+def mission_review_confirmed(principal: str, domain_id: str):
+    """Hold review grant revocation stable until the review decision SQLite commit.
+
+    Lock order is grant lock, then the SQLite write transaction.
+    """
+    with _grant_lock:
+        if domain_id not in mission_domains(principal, MISSION_REVIEW_RESOURCE):
+            raise PermissionError("concessão de revisão revogada ou expirada")
+        yield
+
+
 def mission_domains(principal: str, resource_id: str) -> frozenset[str]:
     """Domains covered by an active mission_sim grant for one resource.
 
     A calendar grant never contributes. domain_id classifies; it does not authorize.
     """
-    if resource_id not in {MISSION_READ_RESOURCE, MISSION_WRITE_RESOURCE}:
+    if resource_id not in {MISSION_READ_RESOURCE, MISSION_WRITE_RESOURCE, MISSION_REVIEW_RESOURCE}:
         return frozenset()
     allowed: set[str] = set()
     canonical = CANONICAL_RESOURCES["mission_sim"]

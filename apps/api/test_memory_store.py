@@ -110,8 +110,9 @@ def test_empty_database_migrates_once_uses_wal_and_private_permissions(tmp_path)
             ("0006_missions",),
             ("0007_import_idempotency_result",),
             ("0008_mission_executions",),
+            ("0009_artifact_reviews",),
         ]
-        for table in ("sources", "events", "event_provenance", "entities", "relations", "relation_evidence", "audit_entries", "calendar_sync_states", "calendar_sync_seen_events", "missions", "mission_events", "mission_idempotency", "mission_knowledge"):
+        for table in ("sources", "events", "event_provenance", "entities", "relations", "relation_evidence", "audit_entries", "calendar_sync_states", "calendar_sync_seen_events", "missions", "mission_events", "mission_idempotency", "mission_knowledge", "mission_artifact_reviews", "mission_review_decisions"):
             assert connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] == 0
 
 
@@ -148,6 +149,7 @@ def test_database_from_previous_migration_version_upgrades_without_replaying_ddl
         ("0006_missions",),
         ("0007_import_idempotency_result",),
         ("0008_mission_executions",),
+        ("0009_artifact_reviews",),
     ]
     assert "domain_id" in columns
     assert "audit_entries" in tables

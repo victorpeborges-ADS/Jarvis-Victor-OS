@@ -18,7 +18,8 @@ CALENDAR_READ_RESOURCE = "calendar:synthetic-primary"
 CALENDAR_INVENTORY_RESOURCE = "calendar:synthetic-inventory"
 MISSION_READ_RESOURCE = "mission:read"
 MISSION_WRITE_RESOURCE = "mission:write"
+MISSION_REVIEW_RESOURCE = "mission:review"
 CANONICAL_RESOURCES = {
     "calendar_sim": frozenset({CALENDAR_READ_RESOURCE, CALENDAR_INVENTORY_RESOURCE}),
-    "mission_sim": frozenset({MISSION_READ_RESOURCE, MISSION_WRITE_RESOURCE}),
+    "mission_sim": frozenset({MISSION_READ_RESOURCE, MISSION_WRITE_RESOURCE, MISSION_REVIEW_RESOURCE}),
 }

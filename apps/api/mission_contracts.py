@@ -58,7 +58,7 @@ class MissionTask(StrictContract):
 
 class MissionEvent(StrictContract):
     id: str = Field(pattern=r"^event_[A-Za-z0-9_-]{1,80}$")
-    type: Literal["mission_created", "task_started", "task_completed", "task_failed", "task_retried", "mission_cancelled", "artifact_created"]
+    type: Literal["mission_created", "task_started", "task_completed", "task_failed", "task_retried", "mission_cancelled", "artifact_created", "artifact_reviewed"]
     message: str = Field(max_length=1000)
     task_id: str | None = None
     created_at: datetime

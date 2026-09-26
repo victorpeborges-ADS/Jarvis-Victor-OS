@@ -231,3 +231,23 @@ def test_revoked_mission_grant_hides_the_next_read(client):
     ).status_code == 200
     hidden = client.get(f"/real/missions/{created['mission']['id']}", headers={"origin": ORIGIN})
     assert hidden.status_code == 403
+
+
+def test_mission_review_grant_authorization_and_guard(client):
+    csrf = login(client)
+    review_id = grant(client, csrf, "mission:review", domain="dom_synthetic_a")
+    from local_security import mission_domains, mission_review_confirmed
+    assert "dom_synthetic_a" in mission_domains("owner", "mission:review")
+    assert "dom_synthetic_b" not in mission_domains("owner", "mission:review")
+
+    with mission_review_confirmed("owner", "dom_synthetic_a"):
+        pass
+
+    assert client.post(
+        f"/real/grants/{review_id}/revoke", headers={"origin": ORIGIN, "x-csrf-token": csrf}
+    ).status_code == 200
+
+    import pytest
+    with pytest.raises(PermissionError, match="revogada ou expirada"):
+        with mission_review_confirmed("owner", "dom_synthetic_a"):
+            pass
