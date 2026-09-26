@@ -73,7 +73,7 @@ test.describe("Gate 1.2 — 3 jornadas E2E + regressões", () => {
     await page.keyboard.press("Tab");
     await expect(page.getByText("Pular para o conteúdo")).toBeFocused();
     await page.keyboard.press("Enter");
-    await expect(page.getByLabel(/Perguntar ao JARVIS — comando universal/)).toBeVisible();
+    await expect(page.getByRole("button", { name: "Perguntar ao JARVIS — comando universal" })).toBeVisible();
     await page.setViewportSize({ width: 390, height: 844 });
     await expect(page.getByRole("navigation", { name: /Navegação mobile/ })).toBeVisible();
   });

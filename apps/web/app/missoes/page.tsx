@@ -153,7 +153,7 @@ export default function MissionsPage() {
         </div>
       </section>}
 
-      <div className="mt-5 grid gap-5 md:grid-cols-[300px_1fr]">
+      <div className="mt-5 grid gap-5 lg:grid-cols-[300px_minmax(0,1fr)]">
         <section aria-labelledby="missions-list-heading">
           <Card className="p-4">
             <h2 id="missions-list-heading" className="text-sm font-semibold text-ink">Criar missão sintética</h2>

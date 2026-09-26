@@ -18,7 +18,7 @@ export default function FontesPage() {
       <Card className="mt-6 p-5">
         <h2 className="text-sm font-semibold text-ink">Estado dos conectores — Gate 1 (simulação)</h2>
         <p className="mt-1 text-xs text-ink-subtle">Nenhum status abaixo indica OAuth real. Relógio DEMO {formatTimeH(DEMO_NOW)}.</p>
-        <div className="mt-3 grid gap-3 md:grid-cols-3">
+        <div className="mt-3 grid gap-3 lg:grid-cols-3">
           {fixtures.sources.map((s) => (
             <div key={s.id} className="rounded-2xl border border-paper-border bg-paper-muted p-4">
               <div className="flex items-center justify-between gap-2">

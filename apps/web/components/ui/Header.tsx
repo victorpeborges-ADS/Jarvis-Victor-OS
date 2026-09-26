@@ -26,27 +26,55 @@ export function Header() {
           </span>
         </div>
 
-        <div className="flex min-w-0 flex-1 justify-center px-1 md:px-8">
+        <div className="flex min-w-0 flex-1 justify-center px-1 xl:px-8">
           {integrated ? (
-            <div className="w-full max-w-[560px] rounded-full border border-paper-border bg-paper-muted px-4 py-2.5 text-center text-xs text-ink-subtle">
-              Conversa e priorização não estão ativas no modo sintético
-            </div>
-          ) : (
-            <button
-              onClick={() => setOpen((v) => !v)}
-              className="flex w-full max-w-[560px] items-center gap-3 rounded-full border border-paper-border bg-paper-muted px-4 py-2.5 text-left text-sm text-ink-subtle shadow-sm transition hover:border-ink-faint hover:bg-white "
-              aria-label="Perguntar ao JARVIS — comando universal"
-            >
-              <svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden>
-                <path d="M7.333 12.667A5.333 5.333 0 1 0 7.333 2a5.333 5.333 0 0 0 0 10.667Z" stroke="currentColor" strokeWidth="1.3" />
-                <path d="M11.333 11.333 13.333 13.333" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round" />
-              </svg>
-              <span className="hidden sm:inline">Perguntar ao JARVIS — “O que mudou? Tenho 45 min…”</span>
-              <span className="sm:hidden">Perguntar…</span>
-              <span className="ml-auto hidden items-center gap-1 rounded-full bg-white px-2 py-1 text-xs font-medium text-ink-faint shadow-sm ring-1 ring-paper-border md:inline-flex">
-                ⌘K
+            <>
+              <div className="hidden w-full max-w-[560px] rounded-full border border-paper-border bg-paper-muted px-4 py-2.5 text-center text-xs text-ink-subtle xl:block">
+                Conversa e priorização não estão ativas no modo sintético
+              </div>
+              <span
+                className="inline-flex h-11 w-11 shrink-0 items-center justify-center rounded-full border border-paper-border bg-paper-muted text-xs font-semibold text-ink-subtle xl:hidden"
+                aria-label="Conversa e priorização não estão ativas no modo sintético"
+                title="Conversa e priorização não estão ativas no modo sintético"
+                role="status"
+              >
+                API
               </span>
-            </button>
+            </>
+          ) : (
+            <>
+              <button
+                type="button"
+                onClick={() => setOpen((v) => !v)}
+                className="hidden min-w-0 w-full max-w-[560px] items-center gap-3 rounded-full border border-paper-border bg-paper-muted px-4 py-2.5 text-left text-sm text-ink-subtle shadow-sm transition hover:border-ink-faint hover:bg-white xl:flex"
+                aria-label="Perguntar ao JARVIS — comando universal"
+                aria-expanded={open}
+                aria-controls="command-palette"
+              >
+                <svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden>
+                  <path d="M7.333 12.667A5.333 5.333 0 1 0 7.333 2a5.333 5.333 0 0 0 0 10.667Z" stroke="currentColor" strokeWidth="1.3" />
+                  <path d="M11.333 11.333 13.333 13.333" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round" />
+                </svg>
+                <span className="min-w-0 flex-1 truncate whitespace-nowrap">Perguntar ao JARVIS — “O que mudou? Tenho 45 min…”</span>
+                <span className="ml-auto inline-flex shrink-0 items-center gap-1 rounded-full bg-white px-2 py-1 text-xs font-medium text-ink-faint shadow-sm ring-1 ring-paper-border">
+                  ⌘K
+                </span>
+              </button>
+              <button
+                type="button"
+                onClick={() => setOpen((v) => !v)}
+                className="inline-flex h-11 w-11 shrink-0 items-center justify-center rounded-full border border-paper-border bg-paper-muted text-ink-subtle shadow-sm transition hover:border-ink-faint hover:bg-white focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-violet-500 xl:hidden"
+                aria-label="Perguntar ao JARVIS — comando universal"
+                aria-expanded={open}
+                aria-controls="command-palette"
+                title="Perguntar ao JARVIS"
+              >
+                <svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden>
+                  <path d="M7.333 12.667A5.333 5.333 0 1 0 7.333 2a5.333 5.333 0 0 0 0 10.667Z" stroke="currentColor" strokeWidth="1.3" />
+                  <path d="M11.333 11.333 13.333 13.333" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round" />
+                </svg>
+              </button>
+            </>
           )}
         </div>
 
@@ -70,7 +98,7 @@ export function Header() {
 
       {/* Mock command palette */}
       {open && !integrated && (
-        <div className="border-t border-paper-border bg-white px-4 py-4 md:px-6">
+        <div id="command-palette" className="border-t border-paper-border bg-white px-4 py-4 md:px-6">
           <div className="mx-auto max-w-[560px] rounded-2xl border border-paper-border bg-paper-muted p-3 shadow-soft">
             <div className="px-2 py-1 text-xs font-medium tracking-widest text-ink-faint">SUGESTÕES CONTEXTUAIS — DEMO</div>
             <div className="mt-2 space-y-1">
