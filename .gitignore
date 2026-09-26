@@ -53,6 +53,7 @@ playwright/.cache/
 .vitest/
 
 # Misc
+exports/nightly/
 tmp/
 temp/
 tsconfig.tsbuildinfo

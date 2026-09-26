@@ -26,7 +26,7 @@ export function Header() {
           </span>
         </div>
 
-        <div className="flex flex-1 justify-center px-2 md:px-8">
+        <div className="flex min-w-0 flex-1 justify-center px-1 md:px-8">
           {integrated ? (
             <div className="w-full max-w-[560px] rounded-full border border-paper-border bg-paper-muted px-4 py-2.5 text-center text-xs text-ink-subtle">
               Conversa e priorização não estão ativas no modo sintético
@@ -50,16 +50,17 @@ export function Header() {
           )}
         </div>
 
-        <div className="flex items-center gap-2">
+        <div className="flex shrink-0 items-center gap-2">
           <Link href={integrated ? "/" : "/integrado"} aria-label={integrated ? "Mudar para modo DEMO" : "Abrir integração sintética com API local"}
-            className="inline-flex items-center rounded-full border border-paper-border bg-white px-3 py-2 text-xs font-semibold text-ink transition hover:bg-paper-muted">
+            className="inline-flex min-h-[44px] items-center rounded-full border border-paper-border bg-white px-3 py-2 text-xs font-semibold text-ink transition hover:bg-paper-muted">
             {integrated ? "DEMO" : "API local"}
           </Link>
           {!integrated && <Link
             href="/inbox"
-            className="inline-flex items-center gap-2 rounded-full bg-ink px-4 py-2 text-sm font-medium text-white transition hover:bg-action-hover "
+            aria-label="Captura rápida"
+            className="inline-flex min-h-[44px] min-w-[44px] items-center justify-center gap-2 rounded-full bg-ink px-3 py-2 text-sm font-medium text-white transition hover:bg-action-hover sm:px-4"
           >
-            <span aria-hidden>+</span> Captura rápida
+            <span aria-hidden>+</span><span className="hidden sm:inline">Captura rápida</span>
           </Link>}
           <div className="hidden h-8 w-8 items-center justify-center rounded-full bg-paper-muted text-xs font-semibold text-ink-muted md:flex" aria-hidden>
             V
