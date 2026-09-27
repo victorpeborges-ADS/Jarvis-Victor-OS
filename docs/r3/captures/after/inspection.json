@@ -1,0 +1,746 @@
+{
+  "phase": "after",
+  "baseUrl": "http://127.0.0.1:13001",
+  "widths": [
+    320,
+    390,
+    767,
+    768,
+    769,
+    1024,
+    1440
+  ],
+  "routes": [
+    [
+      "agora",
+      "/"
+    ],
+    [
+      "perguntar",
+      "/conversa"
+    ],
+    [
+      "entrada",
+      "/inbox"
+    ],
+    [
+      "dominios",
+      "/dominios"
+    ],
+    [
+      "aprovacoes",
+      "/aprovacoes"
+    ],
+    [
+      "fontes",
+      "/fontes"
+    ],
+    [
+      "missoes",
+      "/missoes"
+    ],
+    [
+      "integracao",
+      "/integrado"
+    ],
+    [
+      "nao-encontrado",
+      "/r3-endereco-inexistente"
+    ]
+  ],
+  "results": [
+    {
+      "route": "/",
+      "file": "agora-320.png",
+      "width": 320,
+      "viewport": 320,
+      "documentWidth": 320,
+      "horizontalOverflow": false,
+      "undersizedTargets": [],
+      "heading": "Bom dia, Victor.",
+      "pageErrors": []
+    },
+    {
+      "route": "/",
+      "file": "agora-390.png",
+      "width": 390,
+      "viewport": 390,
+      "documentWidth": 390,
+      "horizontalOverflow": false,
+      "undersizedTargets": [],
+      "heading": "Bom dia, Victor.",
+      "pageErrors": []
+    },
+    {
+      "route": "/",
+      "file": "agora-767.png",
+      "width": 767,
+      "viewport": 767,
+      "documentWidth": 767,
+      "horizontalOverflow": false,
+      "undersizedTargets": [],
+      "heading": "Bom dia, Victor.",
+      "pageErrors": []
+    },
+    {
+      "route": "/",
+      "file": "agora-768.png",
+      "width": 768,
+      "viewport": 768,
+      "documentWidth": 768,
+      "horizontalOverflow": false,
+      "undersizedTargets": [],
+      "heading": "Bom dia, Victor.",
+      "pageErrors": []
+    },
+    {
+      "route": "/",
+      "file": "agora-769.png",
+      "width": 769,
+      "viewport": 769,
+      "documentWidth": 769,
+      "horizontalOverflow": false,
+      "undersizedTargets": [],
+      "heading": "Bom dia, Victor.",
+      "pageErrors": []
+    },
+    {
+      "route": "/",
+      "file": "agora-1024.png",
+      "width": 1024,
+      "viewport": 1024,
+      "documentWidth": 1024,
+      "horizontalOverflow": false,
+      "undersizedTargets": [],
+      "heading": "Bom dia, Victor.",
+      "pageErrors": []
+    },
+    {
+      "route": "/",
+      "file": "agora-1440.png",
+      "width": 1440,
+      "viewport": 1440,
+      "documentWidth": 1440,
+      "horizontalOverflow": false,
+      "undersizedTargets": [],
+      "heading": "Bom dia, Victor.",
+      "pageErrors": []
+    },
+    {
+      "route": "/conversa",
+      "file": "perguntar-320.png",
+      "width": 320,
+      "viewport": 320,
+      "documentWidth": 320,
+      "horizontalOverflow": false,
+      "undersizedTargets": [],
+      "heading": "Perguntar ao JARVIS",
+      "pageErrors": []
+    },
+    {
+      "route": "/conversa",
+      "file": "perguntar-390.png",
+      "width": 390,
+      "viewport": 390,
+      "documentWidth": 390,
+      "horizontalOverflow": false,
+      "undersizedTargets": [],
+      "heading": "Perguntar ao JARVIS",
+      "pageErrors": []
+    },
+    {
+      "route": "/conversa",
+      "file": "perguntar-767.png",
+      "width": 767,
+      "viewport": 767,
+      "documentWidth": 767,
+      "horizontalOverflow": false,
+      "undersizedTargets": [],
+      "heading": "Perguntar ao JARVIS",
+      "pageErrors": []
+    },
+    {
+      "route": "/conversa",
+      "file": "perguntar-768.png",
+      "width": 768,
+      "viewport": 768,
+      "documentWidth": 768,
+      "horizontalOverflow": false,
+      "undersizedTargets": [],
+      "heading": "Perguntar ao JARVIS",
+      "pageErrors": []
+    },
+    {
+      "route": "/conversa",
+      "file": "perguntar-769.png",
+      "width": 769,
+      "viewport": 769,
+      "documentWidth": 769,
+      "horizontalOverflow": false,
+      "undersizedTargets": [],
+      "heading": "Perguntar ao JARVIS",
+      "pageErrors": []
+    },
+    {
+      "route": "/conversa",
+      "file": "perguntar-1024.png",
+      "width": 1024,
+      "viewport": 1024,
+      "documentWidth": 1024,
+      "horizontalOverflow": false,
+      "undersizedTargets": [],
+      "heading": "Perguntar ao JARVIS",
+      "pageErrors": []
+    },
+    {
+      "route": "/conversa",
+      "file": "perguntar-1440.png",
+      "width": 1440,
+      "viewport": 1440,
+      "documentWidth": 1440,
+      "horizontalOverflow": false,
+      "undersizedTargets": [],
+      "heading": "Perguntar ao JARVIS",
+      "pageErrors": []
+    },
+    {
+      "route": "/inbox",
+      "file": "entrada-320.png",
+      "width": 320,
+      "viewport": 320,
+      "documentWidth": 320,
+      "horizontalOverflow": false,
+      "undersizedTargets": [],
+      "heading": "Caixa de entrada",
+      "pageErrors": []
+    },
+    {
+      "route": "/inbox",
+      "file": "entrada-390.png",
+      "width": 390,
+      "viewport": 390,
+      "documentWidth": 390,
+      "horizontalOverflow": false,
+      "undersizedTargets": [],
+      "heading": "Caixa de entrada",
+      "pageErrors": []
+    },
+    {
+      "route": "/inbox",
+      "file": "entrada-767.png",
+      "width": 767,
+      "viewport": 767,
+      "documentWidth": 767,
+      "horizontalOverflow": false,
+      "undersizedTargets": [],
+      "heading": "Caixa de entrada",
+      "pageErrors": []
+    },
+    {
+      "route": "/inbox",
+      "file": "entrada-768.png",
+      "width": 768,
+      "viewport": 768,
+      "documentWidth": 768,
+      "horizontalOverflow": false,
+      "undersizedTargets": [],
+      "heading": "Caixa de entrada",
+      "pageErrors": []
+    },
+    {
+      "route": "/inbox",
+      "file": "entrada-769.png",
+      "width": 769,
+      "viewport": 769,
+      "documentWidth": 769,
+      "horizontalOverflow": false,
+      "undersizedTargets": [],
+      "heading": "Caixa de entrada",
+      "pageErrors": []
+    },
+    {
+      "route": "/inbox",
+      "file": "entrada-1024.png",
+      "width": 1024,
+      "viewport": 1024,
+      "documentWidth": 1024,
+      "horizontalOverflow": false,
+      "undersizedTargets": [],
+      "heading": "Caixa de entrada",
+      "pageErrors": []
+    },
+    {
+      "route": "/inbox",
+      "file": "entrada-1440.png",
+      "width": 1440,
+      "viewport": 1440,
+      "documentWidth": 1440,
+      "horizontalOverflow": false,
+      "undersizedTargets": [],
+      "heading": "Caixa de entrada",
+      "pageErrors": []
+    },
+    {
+      "route": "/dominios",
+      "file": "dominios-320.png",
+      "width": 320,
+      "viewport": 320,
+      "documentWidth": 320,
+      "horizontalOverflow": false,
+      "undersizedTargets": [],
+      "heading": "Domínios",
+      "pageErrors": []
+    },
+    {
+      "route": "/dominios",
+      "file": "dominios-390.png",
+      "width": 390,
+      "viewport": 390,
+      "documentWidth": 390,
+      "horizontalOverflow": false,
+      "undersizedTargets": [],
+      "heading": "Domínios",
+      "pageErrors": []
+    },
+    {
+      "route": "/dominios",
+      "file": "dominios-767.png",
+      "width": 767,
+      "viewport": 767,
+      "documentWidth": 767,
+      "horizontalOverflow": false,
+      "undersizedTargets": [],
+      "heading": "Domínios",
+      "pageErrors": []
+    },
+    {
+      "route": "/dominios",
+      "file": "dominios-768.png",
+      "width": 768,
+      "viewport": 768,
+      "documentWidth": 768,
+      "horizontalOverflow": false,
+      "undersizedTargets": [],
+      "heading": "Domínios",
+      "pageErrors": []
+    },
+    {
+      "route": "/dominios",
+      "file": "dominios-769.png",
+      "width": 769,
+      "viewport": 769,
+      "documentWidth": 769,
+      "horizontalOverflow": false,
+      "undersizedTargets": [],
+      "heading": "Domínios",
+      "pageErrors": []
+    },
+    {
+      "route": "/dominios",
+      "file": "dominios-1024.png",
+      "width": 1024,
+      "viewport": 1024,
+      "documentWidth": 1024,
+      "horizontalOverflow": false,
+      "undersizedTargets": [],
+      "heading": "Domínios",
+      "pageErrors": []
+    },
+    {
+      "route": "/dominios",
+      "file": "dominios-1440.png",
+      "width": 1440,
+      "viewport": 1440,
+      "documentWidth": 1440,
+      "horizontalOverflow": false,
+      "undersizedTargets": [],
+      "heading": "Domínios",
+      "pageErrors": []
+    },
+    {
+      "route": "/aprovacoes",
+      "file": "aprovacoes-320.png",
+      "width": 320,
+      "viewport": 320,
+      "documentWidth": 320,
+      "horizontalOverflow": false,
+      "undersizedTargets": [],
+      "heading": "Aprovações",
+      "pageErrors": []
+    },
+    {
+      "route": "/aprovacoes",
+      "file": "aprovacoes-390.png",
+      "width": 390,
+      "viewport": 390,
+      "documentWidth": 390,
+      "horizontalOverflow": false,
+      "undersizedTargets": [],
+      "heading": "Aprovações",
+      "pageErrors": []
+    },
+    {
+      "route": "/aprovacoes",
+      "file": "aprovacoes-767.png",
+      "width": 767,
+      "viewport": 767,
+      "documentWidth": 767,
+      "horizontalOverflow": false,
+      "undersizedTargets": [],
+      "heading": "Aprovações",
+      "pageErrors": []
+    },
+    {
+      "route": "/aprovacoes",
+      "file": "aprovacoes-768.png",
+      "width": 768,
+      "viewport": 768,
+      "documentWidth": 768,
+      "horizontalOverflow": false,
+      "undersizedTargets": [],
+      "heading": "Aprovações",
+      "pageErrors": []
+    },
+    {
+      "route": "/aprovacoes",
+      "file": "aprovacoes-769.png",
+      "width": 769,
+      "viewport": 769,
+      "documentWidth": 769,
+      "horizontalOverflow": false,
+      "undersizedTargets": [],
+      "heading": "Aprovações",
+      "pageErrors": []
+    },
+    {
+      "route": "/aprovacoes",
+      "file": "aprovacoes-1024.png",
+      "width": 1024,
+      "viewport": 1024,
+      "documentWidth": 1024,
+      "horizontalOverflow": false,
+      "undersizedTargets": [],
+      "heading": "Aprovações",
+      "pageErrors": []
+    },
+    {
+      "route": "/aprovacoes",
+      "file": "aprovacoes-1440.png",
+      "width": 1440,
+      "viewport": 1440,
+      "documentWidth": 1440,
+      "horizontalOverflow": false,
+      "undersizedTargets": [],
+      "heading": "Aprovações",
+      "pageErrors": []
+    },
+    {
+      "route": "/fontes",
+      "file": "fontes-320.png",
+      "width": 320,
+      "viewport": 320,
+      "documentWidth": 320,
+      "horizontalOverflow": false,
+      "undersizedTargets": [],
+      "heading": "Fontes e privacidade",
+      "pageErrors": []
+    },
+    {
+      "route": "/fontes",
+      "file": "fontes-390.png",
+      "width": 390,
+      "viewport": 390,
+      "documentWidth": 390,
+      "horizontalOverflow": false,
+      "undersizedTargets": [],
+      "heading": "Fontes e privacidade",
+      "pageErrors": []
+    },
+    {
+      "route": "/fontes",
+      "file": "fontes-767.png",
+      "width": 767,
+      "viewport": 767,
+      "documentWidth": 767,
+      "horizontalOverflow": false,
+      "undersizedTargets": [],
+      "heading": "Fontes e privacidade",
+      "pageErrors": []
+    },
+    {
+      "route": "/fontes",
+      "file": "fontes-768.png",
+      "width": 768,
+      "viewport": 768,
+      "documentWidth": 768,
+      "horizontalOverflow": false,
+      "undersizedTargets": [],
+      "heading": "Fontes e privacidade",
+      "pageErrors": []
+    },
+    {
+      "route": "/fontes",
+      "file": "fontes-769.png",
+      "width": 769,
+      "viewport": 769,
+      "documentWidth": 769,
+      "horizontalOverflow": false,
+      "undersizedTargets": [],
+      "heading": "Fontes e privacidade",
+      "pageErrors": []
+    },
+    {
+      "route": "/fontes",
+      "file": "fontes-1024.png",
+      "width": 1024,
+      "viewport": 1024,
+      "documentWidth": 1024,
+      "horizontalOverflow": false,
+      "undersizedTargets": [],
+      "heading": "Fontes e privacidade",
+      "pageErrors": []
+    },
+    {
+      "route": "/fontes",
+      "file": "fontes-1440.png",
+      "width": 1440,
+      "viewport": 1440,
+      "documentWidth": 1440,
+      "horizontalOverflow": false,
+      "undersizedTargets": [],
+      "heading": "Fontes e privacidade",
+      "pageErrors": []
+    },
+    {
+      "route": "/missoes",
+      "file": "missoes-320.png",
+      "width": 320,
+      "viewport": 320,
+      "documentWidth": 320,
+      "horizontalOverflow": false,
+      "undersizedTargets": [],
+      "heading": "Missões",
+      "pageErrors": []
+    },
+    {
+      "route": "/missoes",
+      "file": "missoes-390.png",
+      "width": 390,
+      "viewport": 390,
+      "documentWidth": 390,
+      "horizontalOverflow": false,
+      "undersizedTargets": [],
+      "heading": "Missões",
+      "pageErrors": []
+    },
+    {
+      "route": "/missoes",
+      "file": "missoes-767.png",
+      "width": 767,
+      "viewport": 767,
+      "documentWidth": 767,
+      "horizontalOverflow": false,
+      "undersizedTargets": [],
+      "heading": "Missões",
+      "pageErrors": []
+    },
+    {
+      "route": "/missoes",
+      "file": "missoes-768.png",
+      "width": 768,
+      "viewport": 768,
+      "documentWidth": 768,
+      "horizontalOverflow": false,
+      "undersizedTargets": [],
+      "heading": "Missões",
+      "pageErrors": []
+    },
+    {
+      "route": "/missoes",
+      "file": "missoes-769.png",
+      "width": 769,
+      "viewport": 769,
+      "documentWidth": 769,
+      "horizontalOverflow": false,
+      "undersizedTargets": [],
+      "heading": "Missões",
+      "pageErrors": []
+    },
+    {
+      "route": "/missoes",
+      "file": "missoes-1024.png",
+      "width": 1024,
+      "viewport": 1024,
+      "documentWidth": 1024,
+      "horizontalOverflow": false,
+      "undersizedTargets": [],
+      "heading": "Missões",
+      "pageErrors": []
+    },
+    {
+      "route": "/missoes",
+      "file": "missoes-1440.png",
+      "width": 1440,
+      "viewport": 1440,
+      "documentWidth": 1440,
+      "horizontalOverflow": false,
+      "undersizedTargets": [],
+      "heading": "Missões",
+      "pageErrors": []
+    },
+    {
+      "route": "/integrado",
+      "file": "integracao-320.png",
+      "width": 320,
+      "viewport": 320,
+      "documentWidth": 320,
+      "horizontalOverflow": false,
+      "undersizedTargets": [],
+      "heading": "Integração local",
+      "pageErrors": []
+    },
+    {
+      "route": "/integrado",
+      "file": "integracao-390.png",
+      "width": 390,
+      "viewport": 390,
+      "documentWidth": 390,
+      "horizontalOverflow": false,
+      "undersizedTargets": [],
+      "heading": "Integração local",
+      "pageErrors": []
+    },
+    {
+      "route": "/integrado",
+      "file": "integracao-767.png",
+      "width": 767,
+      "viewport": 767,
+      "documentWidth": 767,
+      "horizontalOverflow": false,
+      "undersizedTargets": [],
+      "heading": "Integração local",
+      "pageErrors": []
+    },
+    {
+      "route": "/integrado",
+      "file": "integracao-768.png",
+      "width": 768,
+      "viewport": 768,
+      "documentWidth": 768,
+      "horizontalOverflow": false,
+      "undersizedTargets": [],
+      "heading": "Integração local",
+      "pageErrors": []
+    },
+    {
+      "route": "/integrado",
+      "file": "integracao-769.png",
+      "width": 769,
+      "viewport": 769,
+      "documentWidth": 769,
+      "horizontalOverflow": false,
+      "undersizedTargets": [],
+      "heading": "Integração local",
+      "pageErrors": []
+    },
+    {
+      "route": "/integrado",
+      "file": "integracao-1024.png",
+      "width": 1024,
+      "viewport": 1024,
+      "documentWidth": 1024,
+      "horizontalOverflow": false,
+      "undersizedTargets": [],
+      "heading": "Integração local",
+      "pageErrors": []
+    },
+    {
+      "route": "/integrado",
+      "file": "integracao-1440.png",
+      "width": 1440,
+      "viewport": 1440,
+      "documentWidth": 1440,
+      "horizontalOverflow": false,
+      "undersizedTargets": [],
+      "heading": "Integração local",
+      "pageErrors": []
+    },
+    {
+      "route": "/r3-endereco-inexistente",
+      "file": "nao-encontrado-320.png",
+      "width": 320,
+      "viewport": 320,
+      "documentWidth": 320,
+      "horizontalOverflow": false,
+      "undersizedTargets": [],
+      "heading": "404",
+      "pageErrors": []
+    },
+    {
+      "route": "/r3-endereco-inexistente",
+      "file": "nao-encontrado-390.png",
+      "width": 390,
+      "viewport": 390,
+      "documentWidth": 390,
+      "horizontalOverflow": false,
+      "undersizedTargets": [],
+      "heading": "404",
+      "pageErrors": []
+    },
+    {
+      "route": "/r3-endereco-inexistente",
+      "file": "nao-encontrado-767.png",
+      "width": 767,
+      "viewport": 767,
+      "documentWidth": 767,
+      "horizontalOverflow": false,
+      "undersizedTargets": [],
+      "heading": "404",
+      "pageErrors": []
+    },
+    {
+      "route": "/r3-endereco-inexistente",
+      "file": "nao-encontrado-768.png",
+      "width": 768,
+      "viewport": 768,
+      "documentWidth": 768,
+      "horizontalOverflow": false,
+      "undersizedTargets": [],
+      "heading": "404",
+      "pageErrors": []
+    },
+    {
+      "route": "/r3-endereco-inexistente",
+      "file": "nao-encontrado-769.png",
+      "width": 769,
+      "viewport": 769,
+      "documentWidth": 769,
+      "horizontalOverflow": false,
+      "undersizedTargets": [],
+      "heading": "404",
+      "pageErrors": []
+    },
+    {
+      "route": "/r3-endereco-inexistente",
+      "file": "nao-encontrado-1024.png",
+      "width": 1024,
+      "viewport": 1024,
+      "documentWidth": 1024,
+      "horizontalOverflow": false,
+      "undersizedTargets": [],
+      "heading": "404",
+      "pageErrors": []
+    },
+    {
+      "route": "/r3-endereco-inexistente",
+      "file": "nao-encontrado-1440.png",
+      "width": 1440,
+      "viewport": 1440,
+      "documentWidth": 1440,
+      "horizontalOverflow": false,
+      "undersizedTargets": [],
+      "heading": "404",
+      "pageErrors": []
+    }
+  ]
+}
