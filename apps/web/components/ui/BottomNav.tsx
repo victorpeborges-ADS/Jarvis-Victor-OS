@@ -40,19 +40,19 @@ export function BottomNav() {
               aria-label={it.ariaLabel ?? it.label}
               aria-current={active ? "page" : undefined}
               className={[
-                "flex min-h-[44px] flex-col items-center justify-center rounded-xl px-1 py-1.5 text-xs transition ",
+                "flex min-h-[44px] w-full min-w-0 flex-col items-center justify-center overflow-hidden rounded-xl px-1 py-1.5 text-xs transition ",
                 active ? "bg-ink text-white" : "text-ink-subtle hover:bg-paper-muted"
               ].join(" ")}
             >
               <span aria-hidden className="text-lg leading-none">
                 {it.icon}
               </span>
-              <span className="mt-1 break-words text-center text-xs font-semibold leading-none tracking-tight">{it.label}</span>
+              <span className="mt-1 block w-full min-w-0 break-words whitespace-normal text-center text-[11px] font-semibold leading-tight tracking-tight [overflow-wrap:anywhere]">{it.label}</span>
             </Link>
           );
         })}
         <button type="button" aria-expanded={moreOpen} aria-haspopup="dialog" onClick={() => setMoreOpen(true)}
-          className={["flex min-h-[44px] flex-col items-center justify-center rounded-xl px-1 py-1.5 text-xs transition",
+          className={["flex min-h-[44px] w-full min-w-0 flex-col items-center justify-center overflow-hidden rounded-xl px-1 py-1.5 text-xs transition",
             moreActive ? "bg-ink text-white" : "text-ink-subtle hover:bg-paper-muted"].join(" ")}>
           <span aria-hidden className="text-lg leading-none">⋯</span><span className="mt-1 text-xs font-semibold leading-none">Mais</span>
         </button>

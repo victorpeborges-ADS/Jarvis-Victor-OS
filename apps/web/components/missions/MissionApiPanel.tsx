@@ -12,8 +12,13 @@ type Listed = { dataset: "api_synthetic"; items: Array<MissionRecord & { availab
 type KnowledgeItem = {
   id: string; mission_id: string; domain_id: string; content: string;
   kind: "skill_derived" | "selected_original";
-  content_sha256: string; state: "staged" | "approved" | "rejected";
+  content_sha256: string; state: "staged" | "approved" | "rejected" | "quarantined";
+  content_withheld?: boolean; classification?: string;
   source_review_id: string | null; created_at: string;
+};
+type SourceFixture = {
+  id: string; display_name: string; content_sha256: string; classification: "synthetic_verified";
+  provenance: { kind: string; catalog_id: string; catalog_version: string; fixture_id: string; note: string };
 };
 type ContextBundle = {
   mission_id: string; domain_id: string; used_chars: number;
@@ -39,7 +44,8 @@ export interface ReviewItem {
   revision: number;
   created_at: string;
   updated_at: string;
-  artifact?: Artifact;
+  artifact?: Artifact & { content_withheld?: boolean };
+  content_withheld?: boolean;
   history?: Array<{
     id: string;
     decision: string;
@@ -83,39 +89,19 @@ export function MissionApiPanel() {
   const [knowledge, setKnowledge] = useState<KnowledgeItem[]>([]);
   const [knowledgeNotice, setKnowledgeNotice] = useState("Conhecimento derivado permanece em preparação até revisão humana separada.");
   const [contextBundle, setContextBundle] = useState<ContextBundle | null>(null);
-  const [selectedFile, setSelectedFile] = useState<{ name: string; content: string; sha256: string } | null>(null);
+  const [sourceFixtures, setSourceFixtures] = useState<SourceFixture[]>([]);
+  const [selectedFixtureId, setSelectedFixtureId] = useState("");
   const [selectedMissionId, setSelectedMissionId] = useState("");
-  const [confirmSyntheticFile, setConfirmSyntheticFile] = useState(false);
-  const [sourceNotice, setSourceNotice] = useState("Selecione apenas um arquivo fictício .txt, .md ou .json.");
+  const [sourceNotice, setSourceNotice] = useState("Escolha uma fixture mantida no catálogo local do servidor.");
   const sourceAttempts = useRef(new Map<string, string>());
 
-  async function chooseSyntheticFile(file: File | undefined) {
-    setSelectedFile(null);
-    setConfirmSyntheticFile(false);
-    if (!file) return;
-    if (!/^[A-Za-z0-9][A-Za-z0-9._ -]{0,115}\.(txt|md|json)$/.test(file.name) || file.size < 1 || file.size > 50000) {
-      setSourceNotice("Arquivo inválido: use .txt, .md ou .json fictício de até 50 KB.");
-      return;
-    }
-    const content = await file.text();
-    if (content.includes("\0") || new TextEncoder().encode(content).length !== file.size) {
-      setSourceNotice("Arquivo inválido: selecione texto UTF-8 sem bytes nulos.");
-      return;
-    }
-    const bytes = new TextEncoder().encode(content);
-    const digest = await crypto.subtle.digest("SHA-256", bytes);
-    const sha256 = [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, "0")).join("");
-    setSelectedFile({ name: file.name, content, sha256 });
-    setSourceNotice(`Prévia local: ${file.name}, ${file.size} bytes, SHA-256 ${sha256.slice(0, 16)}… Nenhum envio ainda.`);
-  }
-
-  async function importSyntheticFile() {
-    if (!selectedFile || !selectedMissionId || !confirmSyntheticFile) return;
+  async function importSyntheticFixture() {
+    if (!selectedFixtureId || !selectedMissionId) return;
     setBusy(true);
     try {
       const session = await localApiRequest<LocalSession>("/real/session");
       if (!session.data?.csrf_token) throw new Error("sessão ausente");
-      const attempt = `${selectedMissionId}:${selectedFile.sha256}`;
+      const attempt = `${selectedMissionId}:${selectedFixtureId}`;
       let key = sourceAttempts.current.get(attempt);
       if (!key) {
         key = `selected-${crypto.randomUUID()}`;
@@ -125,13 +111,10 @@ export function MissionApiPanel() {
         `/real/missions/${encodeURIComponent(selectedMissionId)}/sources`, {
           method: "POST",
           headers: { "Content-Type": "application/json", "X-CSRF-Token": session.data.csrf_token },
-          body: JSON.stringify({ display_name: selectedFile.name, content: selectedFile.content,
-            expected_content_sha256: selectedFile.sha256, idempotency_key: key, confirm_synthetic: true })
+          body: JSON.stringify({ fixture_id: selectedFixtureId, idempotency_key: key })
         });
       if (data?.dataset !== "api_synthetic") throw new Error("dataset divergente");
-      setSourceNotice(`Fonte sintética registrada. Revisão do artefato: ${data.review_id ?? "já criada"}. O conhecimento continua aguardando aprovação própria.`);
-      setSelectedFile(null);
-      setConfirmSyntheticFile(false);
+      setSourceNotice(`Fixture sintética verificada registrada. Revisão do artefato: ${data.review_id ?? "já criada"}. O conhecimento continua aguardando aprovação própria.`);
       await load();
     } catch (error) {
       setSourceNotice(`Envio não confirmado: ${messageFor(error)} Repita com a mesma seleção; a chave de idempotência será mantida.`);
@@ -151,6 +134,8 @@ export function MissionApiPanel() {
       }
       setRecords(data.items);
       setNotice(data.items.length === 1 ? "1 missão encontrada na integração local." : `${data.items.length} missões encontradas na integração local.`);
+      const catalog = await localApiRequest<{ dataset: string; items: SourceFixture[] }>("/real/missions/source-catalog/fixtures");
+      if (catalog.data?.dataset === "api_synthetic") setSourceFixtures(catalog.data.items);
       await loadReviews();
       await loadKnowledge();
     } catch (error) {
@@ -524,7 +509,7 @@ export function MissionApiPanel() {
 
       <section className="mt-6 border-t border-paper-border pt-4" aria-labelledby="selected-source-heading" data-testid="selected-source-section">
         <h3 id="selected-source-heading" className="text-base font-semibold text-ink">Selecionar fonte fictícia</h3>
-        <p className="mt-1 text-sm text-ink-subtle">Escolha manualmente um arquivo de texto fictício. O envio cria uma evidência pendente; só duas aprovações humanas liberam seu uso no contexto.</p>
+        <p className="mt-1 text-sm text-ink-subtle">Escolha uma fixture curada e versionada no servidor. Arquivos arbitrários não são enviados para a API sintética. A fonte cria uma evidência pendente; duas aprovações humanas liberam seu uso no contexto.</p>
         <div className="mt-3 grid gap-3 sm:grid-cols-2">
           <label className="text-sm text-ink">Missão de destino
             <select className="mt-1 w-full rounded-xl border border-paper-border bg-white p-2" value={selectedMissionId} onChange={(event) => setSelectedMissionId(event.target.value)}>
@@ -532,16 +517,20 @@ export function MissionApiPanel() {
               {records.map((record) => <option key={record.mission.id} value={record.mission.id}>{record.mission.title}</option>)}
             </select>
           </label>
-          <label className="text-sm text-ink">Arquivo fictício (.txt, .md, .json; até 50 KB)
-            <input data-testid="selected-source-file" className="mt-1 block w-full text-sm" type="file" accept=".txt,.md,.json,text/plain,application/json" onChange={(event) => void chooseSyntheticFile(event.target.files?.[0])} />
+          <label className="text-sm text-ink">Fixture sintética
+            <select data-testid="source-fixture-select" className="mt-1 w-full rounded-xl border border-paper-border bg-white p-2" value={selectedFixtureId} onChange={(event) => setSelectedFixtureId(event.target.value)}>
+              <option value="">Selecione uma fixture</option>
+              {sourceFixtures.map((fixture) => <option key={fixture.id} value={fixture.id}>{fixture.display_name}</option>)}
+            </select>
           </label>
         </div>
-        {selectedFile && <pre className="mt-3 max-h-32 overflow-auto whitespace-pre-wrap break-words rounded-xl border border-paper-border p-3 text-xs">{selectedFile.content}</pre>}
-        <label className="mt-3 flex items-start gap-2 text-sm text-ink">
-          <input type="checkbox" checked={confirmSyntheticFile} onChange={(event) => setConfirmSyntheticFile(event.target.checked)} />
-          Confirmo que este arquivo contém apenas dados fictícios de teste e autorizo o envio para esta API local.
-        </label>
-        <Button className="mt-3" type="button" disabled={busy || !selectedFile || !selectedMissionId || !confirmSyntheticFile} onClick={() => void importSyntheticFile()}>Registrar fonte sintética</Button>
+        {selectedFixtureId && sourceFixtures.find((fixture) => fixture.id === selectedFixtureId) && (() => {
+          const fixture = sourceFixtures.find((item) => item.id === selectedFixtureId)!;
+          return <p className="mt-3 rounded-xl border border-paper-border p-3 text-xs text-ink-subtle">
+            Catálogo verificado · {fixture.provenance.catalog_id} v{fixture.provenance.catalog_version} · SHA-256 {fixture.content_sha256.slice(0, 16)}…
+          </p>;
+        })()}
+        <Button className="mt-3" type="button" disabled={busy || !selectedFixtureId || !selectedMissionId} onClick={() => void importSyntheticFixture()}>Registrar fixture sintética</Button>
         <p className="mt-2 text-sm text-ink-subtle" role="status">{sourceNotice}</p>
       </section>
 
@@ -559,11 +548,11 @@ export function MissionApiPanel() {
             {knowledge.map((item) => (
               <li key={item.id} className="rounded-xl border border-paper-border p-3 text-sm" data-testid="knowledge-card">
                 <div className="flex flex-wrap items-center justify-between gap-2">
-                  <strong>{item.state === "staged" ? "Aguardando revisão" : item.state === "approved" ? "Aprovado para contexto" : "Rejeitado"}</strong>
+                  <strong>{item.state === "staged" ? "Aguardando revisão" : item.state === "approved" ? "Aprovado para contexto" : item.state === "quarantined" ? "Fonte em quarentena" : "Rejeitado"}</strong>
                   {item.state === "staged" && <Button type="button" size="sm" disabled={busy} onClick={() => void decideKnowledge(item)}>Aprovar conhecimento</Button>}
                 </div>
-                <p className="mt-1 whitespace-pre-wrap text-ink">{item.content}</p>
-                <p className="mt-1 text-xs text-ink-faint">{item.kind === "selected_original" ? "Arquivo fictício escolhido" : "Derivação sintética"} · Missão {item.mission_id} · Domínio {item.domain_id} · SHA-256 {item.content_sha256.slice(0, 16)}…</p>
+                {item.content_withheld ? <p className="mt-1 text-sm text-ink-subtle">Conteúdo retido enquanto a proveniência permanece sem verificação.</p> : <p className="mt-1 whitespace-pre-wrap text-ink">{item.content}</p>}
+                <p className="mt-1 text-xs text-ink-faint">{item.kind === "selected_original" ? "Fixture sintética selecionada" : "Derivação sintética"} · Missão {item.mission_id} · Domínio {item.domain_id} · SHA-256 {item.content_sha256.slice(0, 16)}…</p>
               </li>
             ))}
           </ul>
@@ -655,9 +644,11 @@ export function MissionApiPanel() {
             {/* Conteúdo Exato */}
             <div className="rounded-xl border border-paper-border bg-paper-muted p-3">
               <div className="text-xs font-semibold text-ink-subtle">CONTEÚDO DO RASCUNHO (SNAPSHOT IMUTÁVEL)</div>
-              <pre className="mt-2 max-h-48 overflow-auto whitespace-pre-wrap rounded border border-paper-border bg-white p-2.5 text-xs font-mono text-ink" data-testid="review-artifact-content">
-                {selectedReview.artifact?.content ?? "Carregando conteúdo..."}
-              </pre>
+              {selectedReview.content_withheld || selectedReview.artifact?.content_withheld
+                ? <p className="mt-2 rounded border border-paper-border bg-white p-2.5 text-xs text-ink-subtle" data-testid="review-artifact-content">Conteúdo retido: a fonte está em quarentena até que sua proveniência seja verificada.</p>
+                : <pre className="mt-2 max-h-48 overflow-auto whitespace-pre-wrap rounded border border-paper-border bg-white p-2.5 text-xs font-mono text-ink" data-testid="review-artifact-content">
+                    {selectedReview.artifact?.content ?? "Carregando conteúdo..."}
+                  </pre>}
               <div className="mt-2 flex flex-wrap gap-3 text-xs text-ink-faint">
                 <span>Digest: <span className="font-mono">{selectedReview.artifact_sha256.slice(0, 16)}...</span></span>
                 <span>Tipo: {selectedReview.artifact_kind}</span>
