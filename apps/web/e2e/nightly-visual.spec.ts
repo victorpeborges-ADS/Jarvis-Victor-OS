@@ -78,12 +78,12 @@ test("navegação mobile Mais mantém áreas acessíveis por teclado", async ({ 
   await more.click();
   const dialog = page.getByRole("dialog", { name: "Mais áreas" });
   await expect(dialog).toBeVisible();
-  await expect(dialog.getByRole("link", { name: /API local sintética/ })).toBeVisible();
+  await expect(dialog.getByRole("link", { name: /Integração local/ })).toBeVisible();
   await page.keyboard.press("Escape");
   await expect(dialog).toHaveCount(0);
   await expect(more).toBeFocused();
   await more.click();
-  await dialog.getByRole("link", { name: /API local sintética/ }).click();
+  await dialog.getByRole("link", { name: /Integração local/ }).click();
   await expect(page).toHaveURL(/\/integrado$/);
   await expect(nav.getByRole("button", { name: "Mais" })).toHaveAttribute("aria-expanded", "false");
 });

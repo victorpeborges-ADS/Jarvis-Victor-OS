@@ -6,15 +6,15 @@ import { Dialog } from "./Dialog";
 
 const items = [
   { href: "/", label: "Agora", icon: "◐" },
-  { href: "/inbox", label: "Inbox", icon: "▭" },
+  { href: "/conversa", label: "Perguntar", icon: "✦" },
   { href: "/missoes", label: "Missões", icon: "◎" },
-  { href: "/aprovacoes", label: "Aprovar", icon: "✓" }
+  { href: "/aprovacoes", label: "Aprovações", ariaLabel: "Aprovações", icon: "✓" }
 ];
 const moreItems = [
-  { href: "/conversa", label: "Conversa JARVIS", detail: "Comandos DEMO locais" },
-  { href: "/dominios", label: "Domínios", detail: "Escopos separados" },
-  { href: "/fontes", label: "Fontes e privacidade", detail: "Origem e validade" },
-  { href: "/integrado", label: "API local sintética", detail: "Sessão e concessões locais" }
+  { href: "/inbox", label: "Caixa de entrada", detail: "Registre uma ideia ou referência" },
+  { href: "/dominios", label: "Domínios", detail: "Veja informações por área" },
+  { href: "/fontes", label: "Fontes e privacidade", detail: "Confira a origem dos dados" },
+  { href: "/integrado", label: "Integração local", detail: "Sessão e permissões deste aparelho" }
 ];
 
 export function BottomNav() {
@@ -37,6 +37,7 @@ export function BottomNav() {
             <Link
               key={it.href}
               href={it.href}
+              aria-label={it.ariaLabel ?? it.label}
               aria-current={active ? "page" : undefined}
               className={[
                 "flex min-h-[44px] flex-col items-center justify-center rounded-xl px-1 py-1.5 text-xs transition ",
@@ -46,7 +47,7 @@ export function BottomNav() {
               <span aria-hidden className="text-lg leading-none">
                 {it.icon}
               </span>
-              <span className="mt-1 text-xs font-semibold leading-none">{it.label}</span>
+              <span className="mt-1 break-words text-center text-xs font-semibold leading-none tracking-tight">{it.label}</span>
             </Link>
           );
         })}
@@ -60,7 +61,7 @@ export function BottomNav() {
     <Dialog open={moreOpen} onClose={() => setMoreOpen(false)} titleId="more-nav-title" label="Mais áreas do JARVIS">
       <div className="flex items-center justify-between border-b border-paper-border p-5">
         <h2 id="more-nav-title" className="text-xl font-semibold text-ink">Mais áreas</h2>
-        <button type="button" onClick={() => setMoreOpen(false)} className="rounded-lg px-3 py-2 text-sm text-ink focus-visible:outline focus-visible:outline-2 focus-visible:outline-action">Fechar</button>
+        <button type="button" onClick={() => setMoreOpen(false)} className="min-h-11 min-w-11 rounded-lg px-3 py-2 text-sm text-ink focus-visible:outline focus-visible:outline-2 focus-visible:outline-action">Fechar</button>
       </div>
       <div className="grid gap-2 p-5">{moreItems.map((item) => <Link key={item.href} href={item.href}
         onClick={() => setMoreOpen(false)}

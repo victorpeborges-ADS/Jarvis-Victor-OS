@@ -11,7 +11,7 @@ const apiDir = resolve(process.cwd(), "../api");
 function scopeForProject(project: string) {
   return project === "mobile"
     ? { domain: "dom_synthetic_b", calendar: "sim_calendar_b" }
-    : { domain: "dom_synthetic_a", calendar: "sim_calendar_a" };
+    : { domain: "dom_synthetic_c", calendar: "sim_calendar_c" };
 }
 
 function prepareState(status: "stale" | "error", databaseCalendar: string) {
@@ -72,7 +72,7 @@ test("API local no navegador: PUT/CORS, sync, proveniência, estados, modos e re
     } catch { /* empty responses have no JSON body */ }
   });
   await page.goto("/integrado");
-  await expect(page.getByRole("heading", { name: /Agora · integração sintética/ })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Integração local", exact: true })).toBeVisible();
   await expect(page.getByTestId("google-not-connected")).toBeVisible();
 
   const uniqueInvalidPhrase = `bad-e2e-${Date.now()}-never-reflect`;
@@ -84,11 +84,11 @@ test("API local no navegador: PUT/CORS, sync, proveniência, estados, modos e re
   await page.getByTestId("local-passphrase").fill(passphrase ?? "");
   await page.getByTestId("local-login-submit").click();
   await expect(page.getByRole("heading", { name: "Concessões locais" })).toBeVisible();
-  await expect(page.getByTestId("calendar-card")).toHaveCount(0);
-  await expect(page.getByText(/Conceda leitura no escopo escolhido/)).toBeVisible();
+  await expect(page.getByTestId("integrated-events").getByText(/Compromisso sintético/)).toHaveCount(0);
+  await expect(page.getByTestId("grant-create")).toBeEnabled();
   await expect(page.getByText(/^connected$/)).toHaveCount(0);
 
-  if (domainForProject === "dom_synthetic_b") {
+  if (domainForProject !== "dom_synthetic_a") {
     await page.getByTestId("domain-filter").selectOption(domainForProject);
   }
   const calendarCard = await grantAndClassify(page, domainForProject, calendarForProject);
@@ -121,16 +121,16 @@ test("API local no navegador: PUT/CORS, sync, proveniência, estados, modos e re
     path: resolve(screenshots, `gate2-e-integrado-${testInfo.project.name}.png`)
   });
 
-  await page.getByRole("link", { name: "Mudar para modo DEMO" }).click();
-  await expect(page.getByText(/DEMO ·/).first()).toBeVisible();
+  await page.locator("header").getByRole("link", { name: "Voltar à demonstração" }).click();
+  await expect(page.getByText(/Demonstração ·/).first()).toBeVisible();
   await expect(page.getByText(syntheticTitle, { exact: true })).toHaveCount(0);
   await expect(page.getByText("Daily MedSyn — revisão sprint").first()).toBeVisible();
   await page.goto("/");
-  await expect(page.getByText(/DEMO ·/).first()).toBeVisible();
+  await expect(page.getByText(/Demonstração ·/).first()).toBeVisible();
   await expect(page.locator("main > div.animate-fadeIn")).toHaveCSS("opacity", "1");
   await page.screenshot({ path: resolve(screenshots, `gate2-e-demo-${testInfo.project.name}.png`) });
 
-  await page.getByRole("link", { name: "Abrir integração sintética com API local" }).click();
+  await page.locator("header").getByRole("link", { name: "Abrir integração local" }).click();
   await expect(page.getByRole("heading", { name: "Concessões locais" })).toBeVisible();
   if (domainForProject !== "dom_synthetic_a") {
     await expect(page.getByText(syntheticTitle, { exact: true })).toHaveCount(0);

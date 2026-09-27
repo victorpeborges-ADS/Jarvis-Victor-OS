@@ -10,7 +10,7 @@ export type SyncStatus = Source["sync_status"];
 
 export const fixtures = demo;
 
-/** Relógio DEMO canônico — nunca Date.now() para coerência do Gate 1 */
+/** Horário de referência da demonstração para manter os dados coerentes. */
 export const DEMO_NOW = fixtures.meta.generated_at;
 
 export function getEvent(id: string) {
@@ -85,11 +85,12 @@ export function messagesToday() {
     .sort((a, b) => new Date(b.occurred_at).getTime() - new Date(a.occurred_at).getTime());
 }
 
-/** Labels inequívocos Gate 1 — nunca “connected” cru */
+/** Os estados de exemplo não se confundem com uma conexão ativa. */
 export function syncStatusLabel(status: SyncStatus): string {
-  if (status === "connected") return "simulado · ok";
-  if (status === "stale") return "simulado · desatualizado";
-  return `simulado · ${status}`;
+  if (status === "connected") return "exemplo · atualizado";
+  if (status === "stale") return "exemplo · desatualizado";
+  if (status === "error") return "exemplo · indisponível";
+  return `exemplo · ${status}`;
 }
 
 export function sensitivityLabel(s: string): string {

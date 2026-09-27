@@ -43,8 +43,8 @@ test("voltar do DEMO mantém as concessões quando o escopo muda durante o carre
   await calendarCard.getByRole("button", { name: `Sincronizar ${calendarId}` }).click();
   await expect(page.getByTestId("integrated-events").getByText(syntheticTitle)).toBeVisible();
 
-  await page.getByRole("link", { name: "Mudar para modo DEMO" }).click();
-  await expect(page.getByText(/DEMO ·/).first()).toBeVisible();
+  await page.locator("header").getByRole("link", { name: "Voltar à demonstração" }).click();
+  await expect(page.getByText(/Demonstração ·/).first()).toBeVisible();
 
   let delayedGrantGet = false;
   await page.route("**/real/grants", async (route) => {
@@ -58,9 +58,9 @@ test("voltar do DEMO mantém as concessões quando o escopo muda durante o carre
   const reloadedGrants = page.waitForResponse((response) =>
     response.url().endsWith("/real/grants") && response.request().method() === "GET"
   );
-  await page.getByRole("link", { name: "Abrir integração sintética com API local" }).click();
+  await page.locator("header").getByRole("link", { name: "Abrir integração local" }).click();
   await expect(page.getByRole("heading", { name: "Concessões locais" })).toBeVisible();
-  await expect(page.getByText(/Sessão local ativa/)).toBeVisible();
+  await expect(page.getByText(/Sessão ativa neste aparelho/)).toBeVisible();
   await page.getByTestId("domain-filter").selectOption(domainId);
   const reloaded = await reloadedGrants;
   expect(reloaded.status(), "o carregamento das concessões não pode ser cancelado ao trocar o escopo").toBe(200);

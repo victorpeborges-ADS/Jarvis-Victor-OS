@@ -11,7 +11,7 @@ test.describe("Gate 1.2 — 3 jornadas E2E + regressões", () => {
     await expect(page.getByText(/COMPROMISSOS · 3/)).toBeVisible();
     await expect(page.getByText(/MENSAGENS · 2/)).toBeVisible();
     await page.getByRole("button", { name: /Por que isso importa/i }).click();
-    await expect(page.getByText("PROVENIÊNCIA", { exact: true }).first()).toBeVisible();
+    await expect(page.getByText("ORIGEM DAS INFORMAÇÕES", { exact: true }).first()).toBeVisible();
     await page.getByRole("button", { name: /Fechar/i }).click();
     await expect(page.getByText("Linha do tempo — hoje")).toBeVisible();
   });
@@ -21,14 +21,14 @@ test.describe("Gate 1.2 — 3 jornadas E2E + regressões", () => {
     await page.getByRole("link", { name: /Resolver conflito/i }).click();
     await expect(page).toHaveURL(/aprovacoes/);
     await expect(page.getByRole("heading", { name: /Mover Academia para 17h\?/ })).toBeVisible();
-    await expect(page.getByText("DIFF EM LINGUAGEM NATURAL")).toBeVisible();
+    await expect(page.getByText("RESUMO DA MUDANÇA")).toBeVisible();
     await expect(page.getByText("Antecipar academia para 17h")).toBeVisible();
     await expect(page.getByText("Manter academia 18h mas encurtar")).toBeVisible();
 
     await page.getByRole("radio", { name: /Manter academia 18h/i }).check();
-    await page.getByRole("button", { name: /Aprovar Alt B — rascunho local/i }).click();
-    await expect(page.getByText(/Aprovado — rascunho local \(Alt B\)/i)).toBeVisible();
-    await expect(page.getByText(/nenhuma escrita externa/i)).toBeVisible();
+    await page.getByRole("button", { name: /Aprovar sugestão B — somente nesta tela/i }).click();
+    await expect(page.getByText(/Sugestão aprovada nesta demonstração \(opção B\)/i)).toBeVisible();
+    await expect(page.getByText(/nenhuma conta foi alterada/i)).toBeVisible();
 
     await page.getByRole("button", { name: /Reabrir/i }).click();
     await page.getByRole("button", { name: /Rejeitar/i }).click();
@@ -37,8 +37,8 @@ test.describe("Gate 1.2 — 3 jornadas E2E + regressões", () => {
 
   test("Jornada 3: capturar ideia e relacionar a projeto — sem criar reunião", async ({ page }) => {
     await page.goto("/inbox");
-    await expect(page.getByText("NOVA CAPTURA — JORNADA 3")).toBeVisible();
-    const textarea = page.getByPlaceholder("Ex: Ideia CRIVO — triagem por similaridade semântica com embeddings locais...");
+    await expect(page.getByText("NOVA CAPTURA")).toBeVisible();
+    const textarea = page.getByPlaceholder("Ex.: Ideia para organizar referências do projeto CRIVO...");
     await textarea.fill("Ideia teste E2E: validar jornada 3 em ambiente mock");
     await page.getByRole("button", { name: /Classificar e salvar/i }).click();
     await expect(page.getByText("Ideia teste E2E")).toBeVisible();
@@ -57,14 +57,14 @@ test.describe("Gate 1.2 — 3 jornadas E2E + regressões", () => {
 
   test("Estados honestos: simulação, desatualizado e DEMO sempre visíveis", async ({ page }) => {
     await page.goto("/");
-    await expect(page.getByText(/DEMO ·/).first()).toBeVisible();
+    await expect(page.getByText(/Demonstração ·/).first()).toBeVisible();
     await expect(page.getByText(/Dados possivelmente desatualizados/)).toBeVisible();
     await page.goto("/fontes");
-    await expect(page.getByText(/Estado dos conectores — Gate 1/)).toBeVisible();
+    await expect(page.getByText(/Estado das fontes de exemplo/)).toBeVisible();
     // Preferir main: sidebar desktop tem o mesmo texto mas pode estar hidden em mobile
     const main = page.locator("main");
-    await expect(main.getByText(/simulado · desatualizado/).first()).toBeVisible();
-    await expect(main.getByText(/simulado · ok/).first()).toBeVisible();
+    await expect(main.getByText(/exemplo · desatualizado/).first()).toBeVisible();
+    await expect(main.getByText(/exemplo · atualizado/).first()).toBeVisible();
     await expect(page.getByText(/^connected$/)).toHaveCount(0);
   });
 
@@ -94,7 +94,7 @@ test.describe("Gate 1.2 — 3 jornadas E2E + regressões", () => {
     expect(ctaBox!.y + ctaBox!.height).toBeLessThanOrEqual(navBox!.y + 2);
 
     await page.goto("/aprovacoes");
-    const approve = page.getByRole("button", { name: /Aprovar Alt A — rascunho local/i });
+    const approve = page.getByRole("button", { name: /Aprovar sugestão A — somente nesta tela/i });
     await approve.scrollIntoViewIfNeeded();
     const approveBox = await approve.boundingBox();
     const navBox2 = await nav.boundingBox();

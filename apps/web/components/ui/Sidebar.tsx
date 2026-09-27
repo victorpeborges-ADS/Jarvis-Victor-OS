@@ -6,12 +6,12 @@ import { ConnectorBadge } from "@/components/ui/primitives";
 
 const items = [
   { href: "/", label: "Agora", desc: "Visão do momento", icon: "◐" },
-  { href: "/conversa", label: "Conversa", desc: "Perguntar ao JARVIS", icon: "✦" },
-  { href: "/inbox", label: "Inbox", desc: "Captura rápida", icon: "▭" },
+  { href: "/conversa", label: "Perguntar ao JARVIS", desc: "Conversa", icon: "✦" },
+  { href: "/inbox", label: "Caixa de entrada", desc: "Captura rápida", icon: "▭" },
   { href: "/dominios", label: "Domínios", desc: "Filtros de vida", icon: "⬡" },
-  { href: "/missoes", label: "Missões", desc: "Execução sintética", icon: "◎" },
-  { href: "/aprovacoes", label: "Aprovações", desc: "Fila explícita", icon: "✓" },
-  { href: "/fontes", label: "Fontes", desc: "Privacidade", icon: "⬢" }
+  { href: "/missoes", label: "Missões", desc: "Etapas e rascunhos", icon: "◎" },
+  { href: "/aprovacoes", label: "Aprovações", desc: "Decisões pendentes", icon: "✓" },
+  { href: "/fontes", label: "Fontes e privacidade", desc: "Origem dos dados", icon: "⬢" }
 ];
 
 export function Sidebar() {
@@ -28,7 +28,7 @@ export function Sidebar() {
                 href={it.href}
                 aria-current={active ? "page" : undefined}
                 className={[
-                  "flex items-center gap-3 rounded-xl px-3 py-2.5 text-sm transition ",
+                  "flex min-h-11 items-center gap-3 rounded-xl px-3 py-2.5 text-sm transition ",
                   active ? "bg-ink text-white shadow-sm" : "text-ink-muted hover:bg-paper-muted hover:text-ink"
                 ].join(" ")}
               >
@@ -45,18 +45,18 @@ export function Sidebar() {
         </div>
 
         <Link href={pathname === "/integrado" ? "/" : "/integrado"}
-          className="mt-5 flex items-center justify-between rounded-xl border border-violet-200 bg-violet-50 px-3 py-3 text-sm font-medium text-violet-950 hover:bg-violet-100">
-          <span>{pathname === "/integrado" ? "Voltar ao modo DEMO" : "Integração sintética"}</span>
+          className="mt-5 flex min-h-11 items-center justify-between rounded-xl border border-violet-200 bg-violet-50 px-3 py-3 text-sm font-medium text-violet-950 hover:bg-violet-100">
+          <span>{pathname === "/integrado" ? "Voltar à demonstração" : "Integração local"}</span>
           <span aria-hidden>↔</span>
         </Link>
 
         {pathname === "/integrado" ? (
           <div className="mt-4 rounded-xl border border-violet-200 bg-white px-3 py-3">
-            <div className="text-xs font-semibold tracking-wide text-violet-900">API LOCAL · SIMULAÇÃO</div>
-            <p className="mt-1 text-xs leading-relaxed text-ink-subtle">Provider Calendar fictício. Nenhuma conta Google está conectada.</p>
+            <div className="text-xs font-semibold tracking-wide text-violet-900">DADOS DE DEMONSTRAÇÃO</div>
+            <p className="mt-1 text-xs leading-relaxed text-ink-subtle">Agenda de exemplo. Nenhuma conta Google está conectada.</p>
           </div>
         ) : <div className="mt-6 rounded-2xl border border-paper-border bg-paper-muted p-4">
-          <div className="text-xs font-semibold tracking-widest text-ink-faint">CONECTORES — GATE 1</div>
+          <div className="text-xs font-semibold tracking-widest text-ink-faint">FONTES DE EXEMPLO</div>
           <div className="mt-2 space-y-2 text-xs">
             {fixtures.sources.map((s) => (
               <div key={s.id} className="flex items-center justify-between gap-2">
@@ -66,13 +66,13 @@ export function Sidebar() {
             ))}
           </div>
           <p className="mt-3 text-xs leading-relaxed text-ink-faint">
-            Simulação sinalizada. Última verificação mock: {formatTimeH(fixtures.sources[0].last_success)}. Sem escrita externa.
+            Última conferência de exemplo: {formatTimeH(fixtures.sources[0].last_success)}. Nenhuma alteração externa é realizada.
           </p>
         </div>}
 
         <div className="mt-4 rounded-xl bg-amber-50 px-3 py-3 ring-1 ring-amber-200">
-          <div className="text-xs font-semibold text-amber-800">DEMO</div>
-          <p className="mt-1 text-xs leading-relaxed text-amber-700">Tudo aqui é fictício. Veja Fontes para proveniência.</p>
+          <div className="text-xs font-semibold text-amber-800">DEMONSTRAÇÃO</div>
+          <p className="mt-1 text-xs leading-relaxed text-amber-700">Os dados são exemplos. Veja Fontes para conferir a origem.</p>
         </div>
       </nav>
     </aside>

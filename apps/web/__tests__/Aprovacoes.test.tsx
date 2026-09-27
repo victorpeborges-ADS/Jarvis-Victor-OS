@@ -4,11 +4,11 @@ import AprovacoesPage from "../app/aprovacoes/page";
 describe("Aprovações — jornada 2: conflito sem escrita externa", () => {
   it("mostra proposta de conflito com diff e alternativas selecionáveis", () => {
     render(<AprovacoesPage />);
-    expect(screen.getByText(/CENTRAL DE APROVAÇÃO/i)).toBeInTheDocument();
+    expect(screen.getByText(/DECISÕES/i)).toBeInTheDocument();
     expect(screen.getAllByText(/Mover Academia para 17h/i).length).toBeGreaterThan(0);
     expect(screen.getByText(/Alternativa A/i)).toBeInTheDocument();
     expect(screen.getByText(/Alternativa B/i)).toBeInTheDocument();
-    expect(screen.getByText(/DIFF EM LINGUAGEM NATURAL/i)).toBeInTheDocument();
+    expect(screen.getByText(/RESUMO DA MUDANÇA/i)).toBeInTheDocument();
     expect(screen.getByRole("radio", { name: /Antecipar academia/i })).toBeChecked();
     expect(screen.getByRole("radio", { name: /Manter academia 18h/i })).not.toBeChecked();
   });
@@ -17,8 +17,8 @@ describe("Aprovações — jornada 2: conflito sem escrita externa", () => {
     render(<AprovacoesPage />);
     fireEvent.click(screen.getByRole("radio", { name: /Manter academia 18h/i }));
     expect(screen.getByRole("radio", { name: /Manter academia 18h/i })).toBeChecked();
-    fireEvent.click(screen.getByRole("button", { name: /Aprovar Alt B — rascunho local/i }));
-    expect(screen.getByText(/Aprovado — rascunho local \(Alt B\)/i)).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: /Aprovar sugestão B — somente nesta tela/i }));
+    expect(screen.getByText(/Sugestão aprovada nesta demonstração \(opção B\)/i)).toBeInTheDocument();
     expect(screen.queryByText(/idempotente/i)).not.toBeInTheDocument();
   });
 
@@ -31,7 +31,7 @@ describe("Aprovações — jornada 2: conflito sem escrita externa", () => {
 
   it("distingue rascunho local de alteração externa", () => {
     render(<AprovacoesPage />);
-    expect(screen.getAllByText(/Rascunho local/i).length).toBeGreaterThan(0);
-    expect(screen.getAllByText(/Alteração externa/i).length).toBeGreaterThan(0);
+    expect(screen.getByText(/As escolhas nesta página são demonstrações locais/i)).toBeInTheDocument();
+    expect(screen.getByText(/Nenhuma conta ou agenda é alterada/i)).toBeInTheDocument();
   });
 });

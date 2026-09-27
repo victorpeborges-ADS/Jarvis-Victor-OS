@@ -91,6 +91,8 @@ test("aprovação persistente de artefatos na API local sintética (G5)", async 
   await expect(page.getByTestId("review-detail")).toBeVisible();
   await expect(page.getByTestId("review-artifact-content")).toBeVisible();
   await expect(page.getByTestId("review-artifact-content")).toContainText("Código determinístico v1.0.0");
+  const originalReviewId = await page.getByTestId("review-detail").getAttribute("data-review-id");
+  expect(originalReviewId).toBeTruthy();
 
   // 7. Request changes flow
   await page.getByTestId("review-changes-button").click();
@@ -112,11 +114,24 @@ test("aprovação persistente de artefatos na API local sintética (G5)", async 
   await page.getByTestId("review-revise-input").fill("Conteúdo revisado e formatado com sucesso.");
   await page.getByTestId("review-revise-button").click();
   await expect(page.getByTestId("review-modal-notice")).toContainText("Versão 2");
+  await expect(page.getByTestId("review-detail")).toHaveAttribute("data-review-version", "2");
+  await expect(page.getByTestId("review-detail")).not.toHaveAttribute("data-review-id", originalReviewId!);
+  const revisedReviewId = await page.getByTestId("review-detail").getAttribute("data-review-id");
+  expect(revisedReviewId).toBeTruthy();
+  if (!revisedReviewId) throw new Error("revised review ID missing");
+  expect(revisedReviewId).not.toBe(originalReviewId);
 
   // 9. Approve the revised version
   await page.getByTestId("review-approve-button").click();
   await page.getByTestId("review-confirm-button").click();
   await expect(page.getByTestId("review-modal-notice")).toContainText("approved");
+  const approvedVersion = await page.evaluate(async ({ origin, id }) => {
+    const response = await fetch(`${origin}/real/reviews/${encodeURIComponent(id)}`, { credentials: "include" });
+    if (!response.ok) throw new Error(`revised review read: ${response.status}`);
+    const review = await response.json() as { id: string; artifact_version: number; state: string };
+    return { id: review.id, version: review.artifact_version, state: review.state };
+  }, { origin: apiOrigin, id: revisedReviewId });
+  expect(approvedVersion).toEqual({ id: revisedReviewId, version: 2, state: "approved" });
 
   // Close dialog and verify queue state
   await page.keyboard.press("Escape");

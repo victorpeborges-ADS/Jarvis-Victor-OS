@@ -1,28 +1,39 @@
 "use client";
 import Link from "next/link";
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { usePathname } from "next/navigation";
 
 export function Header() {
   const [open, setOpen] = useState(false);
   const integrated = usePathname() === "/integrado";
+  useEffect(() => {
+    function onKeyDown(event: KeyboardEvent) {
+      if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "k") {
+        event.preventDefault();
+        setOpen((value) => !value);
+      }
+      if (event.key === "Escape") setOpen(false);
+    }
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, []);
   return (
     <header className="sticky top-0 z-40 border-b border-paper-border bg-paper-elevated/80 backdrop-blur">
       <div className="mx-auto flex h-[64px] max-w-[1280px] items-center justify-between gap-4 px-4 md:px-6">
         <div className="flex items-center gap-3">
           <Link href="/" className="flex items-center gap-3 rounded-lg ">
-            <div className="flex h-8 w-8 items-center justify-center rounded-lg bg-ink text-[11px] font-semibold tracking-widest text-white">
+            <div className="flex h-8 w-8 items-center justify-center rounded-lg bg-ink text-xs font-semibold tracking-widest text-white">
               JVS
             </div>
             <div className="hidden md:block">
               <div className="text-sm font-semibold tracking-tight text-ink">JARVIS</div>
-              <div className=" -mt-1 text-[11px] font-medium tracking-widest text-ink-subtle">{integrated ? "API LOCAL · SIMULADA" : "VICTOR OS · DEMO"}</div>
+              <div className=" -mt-1 text-xs font-medium tracking-wide text-ink-subtle">{integrated ? "INTEGRAÇÃO LOCAL" : "ASSISTENTE PESSOAL"}</div>
             </div>
           </Link>
           <span className="hidden h-6 w-px bg-paper-border md:block" aria-hidden />
           <span className="hidden items-center gap-2 rounded-full border border-amber-200 bg-amber-50 px-3 py-1 text-xs font-medium text-amber-800 md:inline-flex">
             <span className="h-2 w-2 rounded-full bg-amber-500" aria-hidden />
-            {integrated ? "Gate 2 · sintético" : "Gate 1 · mock"}
+            {integrated ? "Sessão neste aparelho" : "Dados de exemplo"}
           </span>
         </div>
 
@@ -30,12 +41,12 @@ export function Header() {
           {integrated ? (
             <>
               <div className="hidden w-full max-w-[560px] rounded-full border border-paper-border bg-paper-muted px-4 py-2.5 text-center text-xs text-ink-subtle xl:block">
-                Conversa e priorização não estão ativas no modo sintético
+                A conversa e a priorização usam dados de exemplo
               </div>
               <span
-                className="inline-flex h-11 w-11 shrink-0 items-center justify-center rounded-full border border-paper-border bg-paper-muted text-xs font-semibold text-ink-subtle xl:hidden"
-                aria-label="Conversa e priorização não estão ativas no modo sintético"
-                title="Conversa e priorização não estão ativas no modo sintético"
+                className="hidden h-11 w-11 shrink-0 items-center justify-center rounded-full border border-paper-border bg-paper-muted text-xs font-semibold text-ink-subtle min-[360px]:inline-flex xl:hidden"
+                aria-label="A conversa e a priorização usam dados de exemplo"
+                title="A conversa e a priorização usam dados de exemplo"
                 role="status"
               >
                 API
@@ -46,7 +57,7 @@ export function Header() {
               <button
                 type="button"
                 onClick={() => setOpen((v) => !v)}
-                className="hidden min-w-0 w-full max-w-[560px] items-center gap-3 rounded-full border border-paper-border bg-paper-muted px-4 py-2.5 text-left text-sm text-ink-subtle shadow-sm transition hover:border-ink-faint hover:bg-white xl:flex"
+                className="hidden min-h-11 min-w-0 w-full max-w-[560px] items-center gap-3 rounded-full border border-paper-border bg-paper-muted px-4 py-2.5 text-left text-sm text-ink-subtle shadow-sm transition hover:border-ink-faint hover:bg-white xl:flex"
                 aria-label="Perguntar ao JARVIS — comando universal"
                 aria-expanded={open}
                 aria-controls="command-palette"
@@ -57,7 +68,7 @@ export function Header() {
                 </svg>
                 <span className="min-w-0 flex-1 truncate whitespace-nowrap">Perguntar ao JARVIS — “O que mudou? Tenho 45 min…”</span>
                 <span className="ml-auto inline-flex shrink-0 items-center gap-1 rounded-full bg-white px-2 py-1 text-xs font-medium text-ink-faint shadow-sm ring-1 ring-paper-border">
-                  ⌘K
+                  Ctrl/⌘ K
                 </span>
               </button>
               <button
@@ -79,9 +90,9 @@ export function Header() {
         </div>
 
         <div className="flex shrink-0 items-center gap-2">
-          <Link href={integrated ? "/" : "/integrado"} aria-label={integrated ? "Mudar para modo DEMO" : "Abrir integração sintética com API local"}
-            className="inline-flex min-h-[44px] items-center rounded-full border border-paper-border bg-white px-3 py-2 text-xs font-semibold text-ink transition hover:bg-paper-muted">
-            {integrated ? "DEMO" : "API local"}
+          <Link href={integrated ? "/" : "/integrado"} aria-label={integrated ? "Voltar à demonstração" : "Abrir integração local"}
+            className="hidden min-h-[44px] items-center rounded-full border border-paper-border bg-white px-3 py-2 text-xs font-semibold text-ink transition hover:bg-paper-muted min-[360px]:inline-flex">
+            {integrated ? "Demonstração" : "Integração"}
           </Link>
           {!integrated && <Link
             href="/inbox"
@@ -96,25 +107,26 @@ export function Header() {
         </div>
       </div>
 
-      {/* Mock command palette */}
+      {/* Paleta de atalhos */}
       {open && !integrated && (
-        <div id="command-palette" className="border-t border-paper-border bg-white px-4 py-4 md:px-6">
+        <div id="command-palette" role="region" aria-label="Atalhos para começar" className="border-t border-paper-border bg-white px-4 py-4 md:px-6">
           <div className="mx-auto max-w-[560px] rounded-2xl border border-paper-border bg-paper-muted p-3 shadow-soft">
-            <div className="px-2 py-1 text-xs font-medium tracking-widest text-ink-faint">SUGESTÕES CONTEXTUAIS — DEMO</div>
+            <div className="px-2 py-1 text-xs font-medium tracking-widest text-ink-faint">ATALHOS PARA COMEÇAR</div>
             <div className="mt-2 space-y-1">
               {["Resumir o dia com evidências", "Mostrar conflito Academia × MedSyn", "Capturar ideia sobre CRIVO"].map((s) => (
-                <button
+                <Link
                   key={s}
-                  className="w-full rounded-xl bg-white px-3 py-2.5 text-left text-sm text-ink transition hover:bg-ink hover:text-white"
+                  href={`/conversa?pergunta=${encodeURIComponent(s)}`}
+                  className="flex min-h-11 w-full items-center rounded-xl bg-white px-3 py-2.5 text-left text-sm text-ink transition hover:bg-ink hover:text-white"
                   onClick={() => setOpen(false)}
                 >
                   {s}
-                </button>
+                </Link>
               ))}
             </div>
             <div className="mt-3 flex items-center gap-2 px-2 text-xs text-ink-subtle">
               <span className="inline-flex h-5 w-5 items-center justify-center rounded-full bg-paper-border text-[10px]">🎙</span>
-              Voz — paridade com texto, placeholder honesto (Gate 5)
+              Voz ainda não está disponível. Use a conversa por texto.
             </div>
           </div>
         </div>

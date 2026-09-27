@@ -20,7 +20,7 @@ const newsreader = Newsreader({
 
 export const metadata: Metadata = {
   title: "JARVIS — Victor OS",
-  description: "Victor OS + Victor Context Hub — protótipo Gate 1 com dados DEMO fictícios"
+  description: "JARVIS — assistente pessoal em demonstração com informações de exemplo"
 };
 
 export const viewport = {

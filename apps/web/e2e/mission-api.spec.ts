@@ -6,9 +6,9 @@ test("painel da API sintética não apaga o DEMO e admite sessão ausente", asyn
   await page.getByRole("button", { name: "Criar missão" }).click();
   await expect(page.getByRole("heading", { name: "Missão que permanece no navegador", exact: true })).toBeVisible();
   await page.getByTestId("mission-api-open").click();
-  await expect(page.getByTestId("mission-api-panel")).toContainText("API local sintética");
+  await expect(page.getByTestId("mission-api-panel")).toContainText("Integração local de Missões");
   await page.getByRole("button", { name: "Ler missões da API" }).click();
-  await expect(page.getByTestId("mission-api-panel")).toContainText("401");
+  await expect(page.getByTestId("mission-api-panel")).toContainText("Sua sessão terminou. Entre novamente na integração local.");
   await expect(page.getByRole("heading", { name: "Missão que permanece no navegador", exact: true })).toBeVisible();
 });
 
@@ -28,7 +28,7 @@ test("concessões de Missões dependem de clique explícito e habilitam importa�
   await page.getByRole("button", { name: "Conceder leitura e escrita de Missões (Escopo A)" }).click();
   await expect(page.getByTestId("mission-api-panel")).toContainText("mission:read e mission:write confirmadas");
   await page.getByRole("button", { name: "Prévia da importação" }).click();
-  await expect(page.getByTestId("mission-api-panel")).toContainText("1 válida(s) para envio");
+  await expect(page.getByTestId("mission-api-panel")).toContainText("1 item válido para envio; 0 itens em quarentena.");
   await page.getByRole("button", { name: "Confirmar envio" }).click();
   await expect(page.getByTestId("mission-api-card").filter({ hasText: title })).toBeVisible();
 });

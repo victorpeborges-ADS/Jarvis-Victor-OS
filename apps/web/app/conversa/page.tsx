@@ -14,8 +14,8 @@ export default function ConversaPage() {
   const [msgs, setMsgs] = useState<Msg[]>([
     {
       role: "assistant",
-      text: "Olá, Victor. Estou no Gate 1 — só com dados DEMO fictícios, sem acesso real ao Calendar ou Gmail. Posso mostrar o briefing com fontes, as 2 alternativas do conflito e a captura vinculada ao CRIVO. Respostas são regras + fixtures, não um modelo de linguagem ativo.",
-      provenance: { origin: "Fixtures + regra determinística", last_checked: "2026-09-23T08:47:00-03:00", confidence: "alta", scope: "pessoal" }
+      text: "Olá, Victor. Esta demonstração usa informações de exemplo e não acessa suas contas. Posso resumir o dia, comparar duas alternativas ou registrar uma ideia. As respostas são pré-definidas; nada é enviado ou alterado fora desta página.",
+      provenance: { origin: "Informações de exemplo", last_checked: "2026-09-23T08:47:00-03:00", confidence: "alta", scope: "pessoal" }
     }
   ]);
   const [input, setInput] = useState("");
@@ -28,6 +28,11 @@ export default function ConversaPage() {
   useEffect(() => {
     listRef.current?.scrollTo({ top: listRef.current.scrollHeight, behavior: "smooth" });
   }, [msgs]);
+
+  useEffect(() => {
+    const question = new URLSearchParams(window.location.search).get("pergunta");
+    if (question) setInput(question);
+  }, []);
 
   useEffect(() => {
     return () => {
@@ -52,11 +57,11 @@ export default function ConversaPage() {
     const answer: Msg = {
       role: "assistant",
       text: text.toLowerCase().includes("45")
-        ? "Você tem 45 min antes da daily às 09h30 (relógio DEMO). Recomendo: finalizar 1 slide da demo MedSyn (prioridade essencial). Evidência: entrega 19h depende deste artefato. Alternativa curta: revisar orçamento SOFF (5 min). Nenhuma ação externa será feita sem sua aprovação."
+        ? "Você tem 45 minutos antes da reunião às 9h30. Sugestão: finalizar um slide da apresentação MedSyn. A entrega das 19h depende desse material. Alternativa curta: revisar o orçamento SOFF por cinco minutos. Esta é uma resposta de exemplo; nenhuma conta será alterada."
         : text.toLowerCase().includes("conflito")
-          ? "Conflito detectado: Academia 18h × Entrega 19h. 2 alternativas sem escrever no Calendar: (A) mover academia para 17h, (B) encurtar treino para 40min. Ambas são rascunhos. Diga qual prefere e prepare o diff em Aprovações."
-          : "Ideia “triagem por similaridade semântica” capturada às 08h10, classificada como referência e vinculada ao projeto CRIVO. Não criei reunião nem e-mail. Revise em Inbox → Domínios → CRIVO.",
-      provenance: { origin: "Fixtures DEMO (não LLM)", last_checked: "2026-09-23T08:47:00-03:00", confidence: "média", scope: "pessoal" }
+          ? "Há um conflito de exemplo: Academia às 18h e entrega às 19h. Duas opções: (A) mover a academia para as 17h ou (B) reduzir o treino para 40 minutos. São sugestões; escolha uma para revisar em Aprovações."
+          : "Ideia de exemplo registrada às 8h10, classificada como referência e associada ao projeto CRIVO. Nenhuma reunião ou mensagem foi criada. Você pode revê-la na Caixa de entrada ou em Domínios.",
+      provenance: { origin: "Informações de exemplo", last_checked: "2026-09-23T08:47:00-03:00", confidence: "média", scope: "pessoal" }
     };
     let i = 0;
     const full = answer.text;
@@ -86,11 +91,11 @@ export default function ConversaPage() {
     <div className="mx-auto flex min-h-[calc(100vh-64px-var(--bottom-nav-height))] max-w-[880px] flex-col px-4 py-4 md:min-h-[calc(100vh-64px)] md:px-8">
       <div className="flex items-center justify-between gap-3">
         <div>
-          <div className="text-xs font-semibold tracking-widest text-ink-faint">CONVERSA JARVIS</div>
+          <div className="text-xs font-semibold tracking-widest text-ink-faint">CONVERSA</div>
           <h1 className="text-lg font-semibold tracking-tight text-ink">Perguntar ao JARVIS</h1>
-          <p className="mt-0.5 text-sm text-ink-subtle">Respostas com evidências e ações confirmáveis. Gate 1: fixtures, não LLM.</p>
+          <p className="mt-0.5 text-sm text-ink-subtle">Respostas de exemplo, com a origem visível. Nada é enviado ou alterado fora desta página.</p>
         </div>
-        <Badge tone="amber">DEMO · respostas simuladas</Badge>
+        <Badge tone="amber">Demonstração</Badge>
       </div>
 
       {msgs.length <= 1 && (
@@ -101,7 +106,7 @@ export default function ConversaPage() {
               type="button"
               onClick={() => send(s.prompt)}
               disabled={streaming}
-              className="rounded-full border border-paper-border bg-white px-3 py-1.5 text-xs font-medium text-ink hover:bg-paper-muted disabled:opacity-50"
+              className="min-h-11 rounded-full border border-paper-border bg-white px-3 py-2 text-xs font-medium text-ink hover:bg-paper-muted disabled:opacity-50"
             >
               {s.label}
             </button>
@@ -129,9 +134,9 @@ export default function ConversaPage() {
                     <button
                       type="button"
                       onClick={() => setDrawer(idx)}
-                      className="mt-2 text-xs font-medium text-ink-muted underline decoration-ink/20 underline-offset-4 hover:decoration-ink"
+                      className="mt-2 inline-flex min-h-11 items-center text-xs font-medium text-ink-muted underline decoration-ink/20 underline-offset-4 hover:decoration-ink"
                     >
-                      ver fontes
+                      Ver origem das informações
                     </button>
                   )}
                 </div>
@@ -183,10 +188,10 @@ export default function ConversaPage() {
             </div>
           </form>
           <div className="mt-2 flex flex-wrap items-center gap-2 text-xs text-ink-faint">
-            <span className="inline-flex items-center gap-1 rounded-full bg-amber-50 px-2 py-1 text-amber-800 ring-1 ring-amber-200">
-              <span className="h-1.5 w-1.5 rounded-full bg-amber-500" aria-hidden /> simulação · sem LLM
+            <span className="inline-flex min-h-11 items-center gap-1 rounded-full bg-amber-50 px-3 py-1 text-amber-800 ring-1 ring-amber-200">
+              <span className="h-1.5 w-1.5 rounded-full bg-amber-500" aria-hidden /> resposta de exemplo · sem inteligência artificial
             </span>
-            Voz ainda não disponível — use texto (paridade planejada para Gate 5).
+            Voz ainda não disponível — use a conversa por texto.
           </div>
         </div>
       </Card>
@@ -198,7 +203,7 @@ export default function ConversaPage() {
               key={i}
               open={drawer === i}
               onClose={() => setDrawer(null)}
-              title="Proveniência da resposta"
+              title="Origem das informações"
               provenance={m.provenance}
             />
           )

@@ -60,10 +60,11 @@ function LoginForm() {
 
   return (
     <Card className="mt-5 p-5 md:p-6">
-      <h2 className="text-lg font-semibold text-ink">Entrar na API local</h2>
+      <h2 className="text-lg font-semibold text-ink">Entrar na integração local</h2>
       <p className="mt-2 max-w-2xl text-sm leading-relaxed text-ink-subtle">
-        A frase de acesso é enviada diretamente à API em loopback e não é salva pelo navegador. A sessão usa cookie HttpOnly; o token CSRF fica somente na memória da aplicação.
+        Use a frase de acesso configurada para este serviço local. Esta área trabalha apenas com dados de exemplo.
       </p>
+      <details className="mt-2 text-xs text-ink-faint"><summary className="min-h-11 cursor-pointer py-3">Proteções técnicas</summary><p>A frase segue apenas para o serviço neste aparelho. A sessão usa cookie HttpOnly e a proteção contra envio cruzado mantém o token somente na memória desta aplicação.</p></details>
       <form className="mt-4 flex flex-col gap-3 sm:flex-row sm:items-end" onSubmit={submit}>
         <label className="min-w-0 flex-1 text-sm font-medium text-ink">
           Frase de acesso local
@@ -350,14 +351,19 @@ export default function IntegratedPage() {
     <div className="mx-auto max-w-[920px] px-4 py-6 pb-8 md:px-8 md:py-8">
       <div className="flex flex-wrap items-start justify-between gap-3">
         <div>
-          <div className="text-xs font-semibold tracking-widest text-ink-faint">MODO SEPARADO · VICTOR OS + API LOCAL</div>
-          <h1 className="prose-editorial mt-1 text-[28px] font-medium leading-tight tracking-tight text-ink md:text-[34px]">Agora · integração sintética</h1>
+          <div className="text-xs font-semibold tracking-widest text-ink-faint">ÁREA TÉCNICA</div>
+          <h1 className="prose-editorial mt-1 text-[28px] font-medium leading-tight tracking-tight text-ink md:text-[34px]">Integração local</h1>
           <p data-testid="google-not-connected" className="mt-2 max-w-[650px] text-sm leading-relaxed text-ink-subtle">
-            A API local usa SQLite e um provider fictício independente das fixtures DEMO. Nenhuma conta Google está conectada; nenhuma fixture foi importada.
+            Teste permissões e leitura de uma agenda de exemplo neste aparelho. Nenhuma conta externa está conectada.
           </p>
         </div>
-        <Badge tone="violet">API LOCAL · SIMULAÇÃO</Badge>
+        <Badge tone="violet">Demonstração local</Badge>
       </div>
+
+      <details className="mt-3 rounded-xl border border-paper-border bg-white px-4 py-3 text-xs text-ink-subtle">
+        <summary className="min-h-11 cursor-pointer py-3 font-medium text-ink">Sobre esta área técnica</summary>
+        <p>O serviço local usa SQLite e uma agenda fictícia, separada das demais informações de exemplo. Ele não importa dados da demonstração e não acessa contas reais.</p>
+      </details>
 
       {authStatus === "checking" ? (
         <div className="mt-5 rounded-2xl border border-paper-border bg-white p-5 text-sm text-ink-subtle" role="status">Verificando sessão local…</div>
@@ -367,7 +373,8 @@ export default function IntegratedPage() {
         <>
           <Card className="mt-5 flex flex-wrap items-center justify-between gap-3 px-4 py-3">
             <div className="text-sm text-ink-subtle">
-              Sessão local ativa até <span className="font-medium text-ink">{localDate(expiresAt)}</span>. Cookie HttpOnly; sessão e concessões não sobrevivem ao reinício da API.
+              Sessão ativa neste aparelho até <span className="font-medium text-ink">{localDate(expiresAt)}</span>.
+              <details className="mt-1 text-xs"><summary className="min-h-11 cursor-pointer py-3">Detalhes técnicos da sessão</summary><p>A sessão usa cookie HttpOnly. Sessões e permissões em memória expiram ao reiniciar o serviço.</p></details>
             </div>
             <Button size="sm" variant="outline" onClick={() => void logout()}>Encerrar sessão</Button>
           </Card>
@@ -395,8 +402,8 @@ export default function IntegratedPage() {
       )}
 
       <div className="mt-8 flex flex-wrap gap-2 border-t border-paper-border pt-4">
-        <Link href="/" className="inline-flex items-center rounded-full border border-paper-border bg-white px-4 py-2 text-sm font-medium text-ink hover:bg-paper-muted">Voltar ao Agora DEMO</Link>
-        <p className="self-center text-xs text-ink-subtle">Um único processo/worker local. Sem OAuth, rede externa, ações externas ou dados reais.</p>
+        <Link href="/" className="inline-flex min-h-11 items-center rounded-full border border-paper-border bg-white px-4 py-2 text-sm font-medium text-ink hover:bg-paper-muted">Voltar ao Agora</Link>
+        <details className="self-center text-xs text-ink-subtle"><summary className="min-h-11 cursor-pointer py-3">Limites técnicos</summary><p>Um processo local, sem conexão de rede externa, escrita em contas ou dados reais.</p></details>
       </div>
     </div>
   );

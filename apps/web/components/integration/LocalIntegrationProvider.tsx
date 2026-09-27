@@ -152,11 +152,14 @@ export function LocalIntegrationProvider({ children }: { children: ReactNode }) 
       if (error instanceof LocalApiError) {
         if (options.allowMissingSession && error.status === 401) return undefined;
         if (options.keepSessionOnForbidden && error.status === 403) {
-          setNotice(error.message);
+          setNotice("A agenda não está disponível para esta área. Confira as permissões locais.");
           return undefined;
         }
-        if (error.status === 401 || error.status === 403) invalidateSession(error.message, controller);
-        else setNotice(error.message);
+        if (error.status === 401 || error.status === 403) {
+          invalidateSession(error.status === 401 ? "Sua sessão terminou. Entre novamente para continuar." : "Sua sessão local não está disponível. Entre novamente.", controller);
+        } else {
+          setNotice(error.status === 409 ? "Os dados mudaram durante a operação. Atualize e tente novamente." : "A integração local não conseguiu concluir esta operação.");
+        }
       } else {
         setNotice("Não foi possível alcançar a API local. Verifique se o servidor oficial está ativo em loopback.");
         setEvents([]);
@@ -229,7 +232,7 @@ export function LocalIntegrationProvider({ children }: { children: ReactNode }) 
       setGrants(safeGrantsValue);
       setStates([]);
       setCalendars([]);
-      setNotice("Sessão autenticada sem concessão de leitura do Calendar. A API recusa o estado com 403; isto não é um catálogo vazio nem o modo DEMO.");
+      setNotice("A agenda de exemplo não está liberada para esta área. Revise as permissões locais.");
       return;
     }
     const calendarStates = await requestJson<{ provider_mode: "simulated"; states: CalendarSyncState[] }>(

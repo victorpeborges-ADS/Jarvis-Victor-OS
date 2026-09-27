@@ -32,9 +32,9 @@ export function Button({
     outline: "border border-paper-border bg-white text-ink hover:bg-paper-muted"
   };
   const sizes: Record<string, string> = {
-    sm: "px-3 py-1.5 text-xs",
-    md: "px-4 py-2 text-sm",
-    lg: "px-5 py-2.5 text-sm"
+    sm: "min-h-11 min-w-11 px-3 py-1.5 text-xs",
+    md: "min-h-11 min-w-11 px-4 py-2 text-sm",
+    lg: "min-h-11 min-w-11 px-5 py-2.5 text-sm"
   };
   return (
     <button
@@ -47,10 +47,10 @@ export function Button({
 }
 
 export function StatusDot({ status }: { status: "mock" | "connected" | "stale" | "error" | "pending_approval" }) {
-  // Gate 1: “connected” nunca usa verde de conexão real — âmbar = simulação
+  // O estado de exemplo usa cinza e não sugere uma conexão real.
   const map: Record<string, string> = {
-    mock: "bg-amber-500",
-    connected: "bg-amber-500",
+    mock: "bg-slate-500",
+    connected: "bg-emerald-600",
     stale: "bg-amber-600",
     error: "bg-red-500",
     pending_approval: "bg-violet-500"
@@ -58,7 +58,7 @@ export function StatusDot({ status }: { status: "mock" | "connected" | "stale" |
   return <span className={["inline-block h-2 w-2 rounded-full", map[status] ?? "bg-slate-400"].join(" ")} aria-hidden />;
 }
 
-/** Badge de conector Gate 1 — nunca exibe “connected” cru */
+/** A demonstração fica neutra; alertas de desatualização usam âmbar e símbolo. */
 export function ConnectorBadge({ status, label }: { status: string; label: string }) {
   const stale = status === "stale";
   const dotStatus: "mock" | "stale" | "error" | "pending_approval" =
@@ -67,10 +67,11 @@ export function ConnectorBadge({ status, label }: { status: string; label: strin
     <span
       className={[
         "inline-flex items-center gap-1.5 rounded-full px-2 py-1 text-xs font-medium ring-1",
-        stale ? "bg-amber-50 text-amber-800 ring-amber-200" : "bg-amber-50/80 text-amber-900 ring-amber-200"
+        stale ? "bg-amber-50 text-amber-900 ring-amber-300" : "bg-slate-100 text-slate-800 ring-slate-300"
       ].join(" ")}
-      title="Estado simulado — sem OAuth real no Gate 1"
+      title={stale ? "Dados de demonstração possivelmente desatualizados" : "Dados de demonstração; nenhuma conta está conectada"}
     >
+      {stale && <span aria-hidden>⚠</span>}
       <StatusDot status={dotStatus} />
       {label}
     </span>
@@ -78,52 +79,59 @@ export function ConnectorBadge({ status, label }: { status: string; label: strin
 }
 
 export function ProvenanceDrawer({ open, onClose, title, provenance, children }: { open: boolean; onClose: () => void; title: string; provenance: any; children?: React.ReactNode }) {
-  const titleId = "proveniencia-titulo";
+  const titleId = "origem-informacao-titulo";
+  const timestamp = (value?: string | null) => value && !Number.isNaN(Date.parse(value))
+    ? new Date(value).toLocaleString("pt-BR", { timeZone: "America/Sao_Paulo" })
+    : "Não informado nesta demonstração";
   return (
-    <Dialog open={open} onClose={onClose} titleId={titleId} label={title || "Proveniência"}>
+    <Dialog open={open} onClose={onClose} titleId={titleId} label={title || "Origem das informações"}>
       <div className="border-b border-paper-border p-6">
         <div className="flex items-start justify-between gap-4">
           <div>
-            <div className="text-xs font-semibold tracking-widest text-ink-faint">PROVENIÊNCIA</div>
+            <div className="text-xs font-semibold tracking-widest text-ink-faint">ORIGEM DAS INFORMAÇÕES</div>
             <h2 id={titleId} className="mt-1 text-lg font-semibold tracking-tight text-ink">{title}</h2>
           </div>
-          <button type="button" onClick={onClose} className="rounded-full bg-paper-muted p-2 text-ink-subtle hover:bg-paper-border" aria-label="Fechar" data-testid="drawer-close">
+          <button type="button" onClick={onClose} className="min-h-11 min-w-11 rounded-full bg-paper-muted p-2 text-ink-subtle hover:bg-paper-border" aria-label="Fechar" data-testid="drawer-close">
             <span aria-hidden>✕</span>
           </button>
         </div>
       </div>
       <div className="flex-1 overflow-auto p-6">
-        {provenance && (
-          <div className="space-y-3">
-            <div className="rounded-xl bg-paper-muted p-4">
-              <div className="text-xs font-semibold tracking-widest text-ink-faint">ORIGEM</div>
+          {provenance && (
+            <div className="space-y-3">
+              <div className="rounded-xl bg-paper-muted p-4">
+              <div className="text-xs font-semibold tracking-widest text-ink-faint">DE ONDE VEIO</div>
               <div className="mt-1 text-sm font-medium text-ink">{provenance.origin}</div>
               {provenance.url && <div className="mt-1 break-all text-xs text-ink-subtle">{provenance.url}</div>}
             </div>
-            <div className="grid grid-cols-2 gap-3">
-              <div className="rounded-xl border border-paper-border p-3">
-                <div className="text-xs text-ink-faint">Última verificação</div>
-                <div className="text-sm font-medium text-ink">{provenance.last_checked?.slice(0, 16).replace("T", " ")}</div>
-              </div>
-              <div className="rounded-xl border border-paper-border p-3">
-                <div className="text-xs text-ink-faint">Confiança</div>
-                <div className="text-sm font-medium capitalize text-ink">{provenance.confidence}</div>
-              </div>
+            <div className="grid gap-3 sm:grid-cols-2">
+              <div className="rounded-xl border border-paper-border p-3"><div className="text-xs text-ink-faint">Identificador da informação</div><div className="break-all text-sm font-medium text-ink">{provenance.id ?? "Não informado nesta demonstração"}</div></div>
+              <div className="rounded-xl border border-paper-border p-3"><div className="text-xs text-ink-faint">Identificador da fonte</div><div className="break-all text-sm font-medium text-ink">{provenance.source_id ?? "Não informado nesta demonstração"}</div></div>
+              <div className="rounded-xl border border-paper-border p-3"><div className="text-xs text-ink-faint">Referência na origem</div><div className="break-all text-sm font-medium text-ink">{provenance.external_ref ?? "Não informada nesta demonstração"}</div></div>
+              <div className="rounded-xl border border-paper-border p-3"><div className="text-xs text-ink-faint">Observada em</div><div className="text-sm font-medium text-ink">{timestamp(provenance.observed_at)}</div></div>
+              <div className="rounded-xl border border-paper-border p-3"><div className="text-xs text-ink-faint">Última verificação</div><div className="text-sm font-medium text-ink">{timestamp(provenance.last_checked ?? provenance.last_verified_at)}</div></div>
+              <div className="rounded-xl border border-paper-border p-3"><div className="text-xs text-ink-faint">Validade</div><div className="text-sm font-medium text-ink">{provenance.valid_until ? timestamp(provenance.valid_until) : "Sem prazo informado"}</div></div>
+              <div className="rounded-xl border border-paper-border p-3"><div className="text-xs text-ink-faint">Confiança da informação</div><div className="text-sm font-medium capitalize text-ink">{provenance.confidence ?? "Não informada"}</div></div>
+              <div className="rounded-xl border border-paper-border p-3"><div className="text-xs text-ink-faint">Área de aplicação</div><div className="text-sm font-medium capitalize text-ink">{provenance.scope ?? "Não informada"}</div></div>
             </div>
             {provenance.note && <div className="rounded-xl bg-amber-50 p-3 text-xs leading-relaxed text-amber-800 ring-1 ring-amber-200">{provenance.note}</div>}
             <div className="rounded-xl border border-dashed border-paper-border p-4">
-              <div className="text-xs font-semibold text-ink-faint">ESCOPO E VALIDADE</div>
+              <div className="text-xs font-semibold text-ink-faint">ONDE SE APLICA</div>
               <div className="mt-1 text-xs leading-relaxed text-ink-subtle">
-                Escopo: {provenance.scope ?? "pessoal"} · Validade: sincronização incremental · Distinção: observação (não inferência gerada por LLM).
+                {provenance.scope ?? "Área não informada"}. Informação observada nas fontes apresentadas; a demonstração não cria fatos por conta própria.
               </div>
             </div>
+            <details className="rounded-xl border border-paper-border px-4 py-3 text-xs text-ink-subtle">
+              <summary className="min-h-11 cursor-pointer py-3 font-medium text-ink">Detalhes técnicos da origem</summary>
+              <p className="mt-2">Registro de origem, horário da última conferência, nível de confiança e domínio de acesso.</p>
+            </details>
           </div>
         )}
         {children}
       </div>
       <div className="border-t border-paper-border p-4">
-        <div className="rounded-xl bg-ink px-4 py-3 text-xs leading-relaxed text-white">
-          <span className="font-semibold">DEMO</span> — dado fictício. Nenhuma fonte real foi consultada nesta tela.
+        <div className="rounded-xl bg-ink px-4 py-3 text-sm leading-relaxed text-white">
+          <span className="font-semibold">Demonstração</span> — dados de exemplo. Nenhuma conta pessoal ou institucional foi consultada.
         </div>
       </div>
     </Dialog>

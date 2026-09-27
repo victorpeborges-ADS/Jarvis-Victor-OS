@@ -25,9 +25,9 @@ describe("Agora — jornada 1: entender o dia em 5s", () => {
     expect(screen.getAllByText(/ALERTA COM CONSEQUÊNCIA/i).length).toBeGreaterThan(0);
   });
 
-  it("exibe estado stale do Drive e sinalização DEMO", () => {
+  it("exibe alerta de fonte desatualizada e sinalização de demonstração", () => {
     render(<AgoraPage />);
-    expect(screen.getAllByText(/DEMO/i).length).toBeGreaterThan(0);
+    expect(screen.getAllByText(/Demonstração/i).length).toBeGreaterThan(0);
     expect(screen.getByText(/Dados possivelmente desatualizados/i)).toBeInTheDocument();
   });
 
@@ -56,8 +56,8 @@ describe("Tempo DEMO — coerência", () => {
   });
 
   it("nunca rotula sync como connected cru", () => {
-    expect(syncStatusLabel("connected")).toBe("simulado · ok");
-    expect(syncStatusLabel("stale")).toBe("simulado · desatualizado");
+    expect(syncStatusLabel("connected")).toBe("exemplo · atualizado");
+    expect(syncStatusLabel("stale")).toBe("exemplo · desatualizado");
     expect(syncStatusLabel("connected")).not.toMatch(/^connected$/);
   });
 });

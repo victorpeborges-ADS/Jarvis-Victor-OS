@@ -52,20 +52,20 @@ export interface ReviewItem {
 
 function messageFor(error: unknown): string {
   if (error instanceof LocalApiError) {
-    if (error.status === 401) return "Sessão ausente (401). Entre na integração local antes de usar a API.";
-    if (error.status === 403) return "Concessão ausente (403). Exige concessão específica no domínio.";
-    if (error.status === 409) return "Conflito (409): a versão ou o estado já foi alterado no servidor. Recarregue.";
-    if (error.status === 422) return `Requisição rejeitada (422): ${error.message}`;
-    return error.message;
+    if (error.status === 401) return "Sua sessão terminou. Entre novamente na integração local.";
+    if (error.status === 403) return "Esta ação não está liberada para a área selecionada. Confira as permissões locais.";
+    if (error.status === 409) return "Os dados mudaram durante a revisão. Atualize e tente novamente.";
+    if (error.status === 422) return "Não foi possível aceitar estes dados. Confira a seleção e tente novamente.";
+    return "A integração local encontrou um erro. Consulte os detalhes técnicos.";
   }
-  return "A API local sintética não respondeu.";
+  return "A integração local não respondeu. Confira se o serviço está em execução.";
 }
 
 export function MissionApiPanel() {
   const [open, setOpen] = useState(false);
   const [records, setRecords] = useState<Array<MissionRecord & { available_actions?: string[] }>>([]);
   const [reviews, setReviews] = useState<ReviewItem[]>([]);
-  const [notice, setNotice] = useState("API local sintética desligada nesta tela. O modo DEMO continua no navegador.");
+  const [notice, setNotice] = useState("Esta integração é opcional. Suas missões neste navegador continuam disponíveis.");
   const [busy, setBusy] = useState(false);
   const [previewCount, setPreviewCount] = useState(0);
   const [quarantineCount, setQuarantineCount] = useState(0);
@@ -145,12 +145,12 @@ export function MissionApiPanel() {
     try {
       const { data } = await localApiRequest<Listed>("/real/missions?limit=20");
       if (!data || data.dataset !== "api_synthetic") {
-        setNotice("A resposta não é da API local sintética. Nada foi copiado do DEMO.");
+        setNotice("A resposta veio de outra origem. Os dados de exemplo não foram transferidos.");
         setRecords([]);
         return;
       }
       setRecords(data.items);
-      setNotice(`${data.items.length} missão(ões) na API local sintética.`);
+      setNotice(data.items.length === 1 ? "1 missão encontrada na integração local." : `${data.items.length} missões encontradas na integração local.`);
       await loadReviews();
       await loadKnowledge();
     } catch (error) {
@@ -178,7 +178,7 @@ export function MissionApiPanel() {
       const { data } = await localApiRequest<{ dataset: string; items: KnowledgeItem[] }>("/real/knowledge");
       if (!data || data.dataset !== "api_synthetic") throw new Error("dataset divergente");
       setKnowledge(data.items);
-      setKnowledgeNotice(`${data.items.length} registro(s) sintéticos na API local.`);
+      setKnowledgeNotice(data.items.length === 1 ? "1 registro encontrado na integração local." : `${data.items.length} registros encontrados na integração local.`);
     } catch (error) {
       setKnowledge([]);
       setKnowledgeNotice(`Conhecimento indisponível: ${messageFor(error)}`);
@@ -229,7 +229,7 @@ export function MissionApiPanel() {
     setPending(planned.accepted);
     setPreviewCount(planned.accepted.length);
     setQuarantineCount(planned.quarantined.length);
-    setNotice(`${planned.accepted.length} válida(s) para envio; ${planned.quarantined.length} em quarentena local. A fonte do navegador ainda não foi apagada.`);
+    setNotice(`${planned.accepted.length} ${planned.accepted.length === 1 ? "item válido" : "itens válidos"} para envio; ${planned.quarantined.length} ${planned.quarantined.length === 1 ? "item em quarentena" : "itens em quarentena"}. A fonte do navegador ainda não foi apagada.`);
   }
 
   async function confirmImport() {
@@ -282,7 +282,7 @@ export function MissionApiPanel() {
           idempotency_key: `${action}-${record.mission.id}-${record.revision}`.slice(0, 160)
         })
       });
-      setNotice(`Ação ${action} confirmada pelo servidor. O DEMO local não foi alterado.`);
+      setNotice(`Ação ${action} confirmada pelo serviço local. Os dados de exemplo não foram alterados.`);
       await load();
     } catch (error) {
       setNotice(messageFor(error));
@@ -471,7 +471,7 @@ export function MissionApiPanel() {
     return (
       <div className="mt-6">
         <Button type="button" variant="outline" data-testid="mission-api-open" onClick={() => setOpen(true)}>
-          Abrir API local sintética
+          Abrir área técnica da integração
         </Button>
       </div>
     );
@@ -481,10 +481,10 @@ export function MissionApiPanel() {
     <Card className="mt-6 p-5" data-testid="mission-api-panel">
       <div className="flex flex-wrap items-start justify-between gap-2">
         <div>
-          <h2 className="text-base font-semibold text-ink">API local sintética</h2>
-          <p className="mt-1 text-sm text-ink-subtle">Fonte de verdade separada do DEMO. Sem fallback silencioso e sem apagar o navegador antes da confirmação.</p>
+          <h2 className="text-base font-semibold text-ink">Integração local de Missões</h2>
+          <p className="mt-1 text-sm text-ink-subtle">Área técnica opcional, separada das missões neste navegador. A transferência exige confirmação.</p>
         </div>
-        <Badge tone="violet">API LOCAL · SINTÉTICA</Badge>
+        <Badge tone="violet">Demonstração local</Badge>
       </div>
       <p className="mt-3 text-sm text-ink" role="status">{notice}</p>
 
@@ -519,7 +519,7 @@ export function MissionApiPanel() {
           <input type="checkbox" checked={clearLocal} onChange={(event) => setClearLocal(event.target.checked)} />
           Apagar a fonte local só depois que o servidor confirmar todos os itens válidos
         </label>
-        <p className="mt-2 text-xs text-ink-faint">Prévia: {previewCount} aceita(s), {quarantineCount} em quarentena.</p>
+        <p className="mt-2 text-xs text-ink-faint">Prévia: {previewCount} {previewCount === 1 ? "item aceito" : "itens aceitos"}, {quarantineCount} em quarentena.</p>
       </div>
 
       <section className="mt-6 border-t border-paper-border pt-4" aria-labelledby="selected-source-heading" data-testid="selected-source-section">
@@ -571,7 +571,7 @@ export function MissionApiPanel() {
         {contextBundle && (
           <div className="mt-3 rounded-xl border border-paper-border bg-paper-muted p-3 text-sm" data-testid="context-bundle">
             <h4 className="font-semibold">Pacote de contexto autorizado · {contextBundle.domain_id}</h4>
-            <p>{contextBundle.included.length} incluído(s), {contextBundle.omitted.length} omitido(s), {contextBundle.used_chars} caracteres.</p>
+            <p>{contextBundle.included.length} {contextBundle.included.length === 1 ? "item incluído" : "itens incluídos"}, {contextBundle.omitted.length} {contextBundle.omitted.length === 1 ? "item omitido" : "itens omitidos"}, {contextBundle.used_chars} caracteres.</p>
             <ul className="mt-2 space-y-1">{contextBundle.included.map((entry) => <li key={entry.knowledge_id}>{entry.content} · Origem: {entry.source_review_id}</li>)}</ul>
             <ul className="mt-2 space-y-1 text-ink-subtle">{contextBundle.omitted.map((entry) => <li key={entry.knowledge_id}>{entry.knowledge_id}: {entry.reason}</li>)}</ul>
           </div>
@@ -636,7 +636,12 @@ export function MissionApiPanel() {
         label="Revisão de Artefato Sintético"
       >
         {selectedReview && (
-          <div className="space-y-4" data-testid="review-detail">
+          <div
+            className="space-y-4"
+            data-testid="review-detail"
+            data-review-id={selectedReview.id}
+            data-review-version={selectedReview.artifact_version}
+          >
             <div>
               <div className="text-xs font-semibold tracking-widest text-ink-faint">REVISÃO HUMANA · API LOCAL SINTÉTICA</div>
               <h2 id="review-dialog-title" className="mt-1 text-lg font-semibold text-ink">

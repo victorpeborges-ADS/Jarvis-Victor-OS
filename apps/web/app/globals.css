@@ -52,6 +52,15 @@ body {
   border-radius: 2px;
 }
 
+/* Alvos de toque confortáveis nas telas principais. */
+#conteudo button,
+#conteudo select {
+  min-height: 44px;
+}
+#conteudo button {
+  min-width: 44px;
+}
+
 /* Tipografia editorial */
 .prose-editorial {
   font-family: var(--font-newsreader), Georgia, serif;

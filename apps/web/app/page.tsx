@@ -40,9 +40,9 @@ export default function AgoraPage() {
           </p>
         </div>
         <div className="flex flex-col items-end gap-1.5">
-          <Badge tone="amber">DEMO · {fixtures.meta.timezone}</Badge>
-          <span className="text-[11px] text-ink-faint" title="Relógio fixo das fixtures">
-            Relógio DEMO {formatTimeH(DEMO_NOW)}
+          <Badge tone="amber">Demonstração · {fixtures.meta.timezone}</Badge>
+          <span className="text-xs text-ink-faint" title="Horário de referência dos dados de exemplo">
+            Horário de referência: {formatTimeH(DEMO_NOW)}
           </span>
         </div>
       </div>
@@ -57,7 +57,7 @@ export default function AgoraPage() {
         </h2>
         <div className="mt-2 flex flex-wrap items-center gap-2 text-sm text-ink-subtle">
           <span className="inline-flex items-center gap-1.5 rounded-full bg-paper-muted px-2.5 py-1 text-xs font-medium text-ink">
-            <span aria-hidden>◷</span> {nextEvent && formatTimeH(nextEvent.occurred_at)} · {nextEvent?.payload_minimized?.location}
+            <span aria-hidden>◷</span> {nextEvent && formatTimeH(nextEvent.occurred_at)} · {nextEvent?.payload_minimized?.location === "Meet" ? "videoconferência" : nextEvent?.payload_minimized?.location}
           </span>
         </div>
         <p className="mt-3 max-w-[520px] text-sm leading-relaxed text-ink-muted">
@@ -67,7 +67,7 @@ export default function AgoraPage() {
           <Button onClick={() => setDrawer("next")}>Por que isso importa</Button>
           <a
             href="#linha-do-tempo"
-            className="inline-flex items-center justify-center rounded-full border border-paper-border bg-white px-4 py-2 text-sm font-medium text-ink hover:bg-paper-muted"
+            className="inline-flex min-h-11 items-center justify-center rounded-full border border-paper-border bg-white px-4 py-2 text-sm font-medium text-ink hover:bg-paper-muted"
           >
             Ver linha do tempo
           </a>
@@ -89,7 +89,7 @@ export default function AgoraPage() {
             </Button>
             <Link
               href="/conversa"
-              className="inline-flex items-center rounded-full bg-paper-muted px-3 py-1.5 text-xs font-medium text-ink hover:bg-paper-border"
+            className="inline-flex min-h-11 items-center rounded-full bg-paper-muted px-3 py-2 text-xs font-medium text-ink hover:bg-paper-border"
             >
               Perguntar ao JARVIS
             </Link>
@@ -127,7 +127,7 @@ export default function AgoraPage() {
       <Card className="mt-4 p-5 md:p-6" id="linha-do-tempo">
         <div className="flex items-center justify-between gap-2">
           <h3 className="text-sm font-semibold tracking-tight text-ink">Linha do tempo — hoje</h3>
-          <Link href="/fontes" className="text-xs font-medium text-ink-subtle underline decoration-ink/20 underline-offset-4 hover:decoration-ink">
+          <Link href="/fontes" className="inline-flex min-h-11 items-center text-xs font-medium text-ink-subtle underline decoration-ink/20 underline-offset-4 hover:decoration-ink">
             Fontes
           </Link>
         </div>
@@ -150,7 +150,7 @@ export default function AgoraPage() {
                   </div>
                   <button
                     onClick={() => setDrawer(ev.id)}
-                    className="mt-1 text-xs font-medium text-ink underline decoration-ink/20 underline-offset-4 hover:decoration-ink"
+                    className="mt-1 inline-flex min-h-11 items-center text-xs font-medium text-ink underline decoration-ink/20 underline-offset-4 hover:decoration-ink"
                   >
                     evidência · {ev.provenance.origin}
                   </button>
@@ -171,7 +171,7 @@ export default function AgoraPage() {
                   <div className="text-sm font-medium leading-tight text-ink">{ev.title}</div>
                   <button
                     onClick={() => setDrawer(ev.id)}
-                    className="mt-1 text-xs font-medium text-ink-subtle underline decoration-ink/20 underline-offset-4"
+                    className="mt-1 inline-flex min-h-11 items-center text-xs font-medium text-ink-subtle underline decoration-ink/20 underline-offset-4"
                   >
                     {ev.provenance.origin}
                   </button>
@@ -183,7 +183,7 @@ export default function AgoraPage() {
         </div>
 
         <div className="mt-4 rounded-xl bg-paper-muted px-3 py-2 text-xs text-ink-subtle">
-          Fuso America/Sao_Paulo · {commitments.length} compromissos · {messages.length} mensagens · mock {formatTimeH(DEMO_NOW)}
+          Fuso America/Sao_Paulo · {commitments.length} compromissos · {messages.length} mensagens · exemplo {formatTimeH(DEMO_NOW)}
         </div>
       </Card>
 
@@ -194,37 +194,34 @@ export default function AgoraPage() {
       )}
 
       <div className="mt-4 flex flex-wrap gap-2">
-        <Link href="/inbox" className="inline-flex items-center rounded-full border border-paper-border bg-white px-4 py-2 text-sm font-medium text-ink hover:bg-paper-muted">
-          Inbox · captura CRIVO
+        <Link href="/inbox" className="inline-flex min-h-11 items-center rounded-full border border-paper-border bg-white px-4 py-2 text-sm font-medium text-ink hover:bg-paper-muted">
+          Caixa de entrada · captura CRIVO
         </Link>
-        <Link href="/aprovacoes" className="inline-flex items-center rounded-full border border-paper-border bg-white px-4 py-2 text-sm font-medium text-ink hover:bg-paper-muted">
+        <Link href="/aprovacoes" className="inline-flex min-h-11 items-center rounded-full border border-paper-border bg-white px-4 py-2 text-sm font-medium text-ink hover:bg-paper-muted">
           Aprovações · 2 alternativas
         </Link>
       </div>
 
       <div className="mt-8 rounded-2xl border border-dashed border-paper-border bg-paper-muted/40 px-4 py-3 text-center text-xs leading-relaxed text-ink-subtle">
-        Informações <span className="font-medium text-ink">DEMO fictícias</span> ·{" "}
-        <Link href="/fontes" className="underline">
-          proveniência por item
-        </Link>{" "}
-        · sem OAuth real neste Gate.
+        Demonstração com dados de exemplo; nenhuma conta está conectada. Consulte a{" "}
+        <Link href="/fontes" className="inline-flex min-h-11 items-center underline">origem das informações</Link>.
       </div>
 
-      <ProvenanceDrawer open={drawer === "next"} onClose={() => setDrawer(null)} title={nextEvent?.title ?? ""} provenance={nextEvent?.provenance} />
+      <ProvenanceDrawer open={drawer === "next"} onClose={() => setDrawer(null)} title={nextEvent?.title ?? ""} provenance={nextEvent ? { ...nextEvent.provenance, id: nextEvent.id, source_id: nextEvent.source_id, external_ref: nextEvent.external_ref, observed_at: nextEvent.observed_at } : null} />
       <ProvenanceDrawer
         open={drawer === "priority"}
         onClose={() => setDrawer(null)}
         title={briefing.priority.title}
-        provenance={{ origin: "Regra determinística + fixtures", last_checked: "2026-09-23T08:45:00-03:00", confidence: "alta", scope: "MedSyn" }}
+        provenance={{ origin: "Informações de exemplo", id: "priority-001", observed_at: DEMO_NOW, last_checked: DEMO_NOW, confidence: "alta", scope: "MedSyn" }}
       />
       <ProvenanceDrawer
         open={drawer === "alert"}
         onClose={() => setDrawer(null)}
         title={briefing.alerts[0].title}
-        provenance={getEvent(briefing.alerts[0].evidence_event_ids[0])?.provenance}
+        provenance={(() => { const event = getEvent(briefing.alerts[0].evidence_event_ids[0]); return event ? { ...event.provenance, id: event.id, source_id: event.source_id, external_ref: event.external_ref, observed_at: event.observed_at } : null; })()}
       />
       {fixtures.events.map((ev) => (
-        <ProvenanceDrawer key={ev.id} open={drawer === ev.id} onClose={() => setDrawer(null)} title={ev.title} provenance={ev.provenance} />
+        <ProvenanceDrawer key={ev.id} open={drawer === ev.id} onClose={() => setDrawer(null)} title={ev.title} provenance={{ ...ev.provenance, id: ev.id, source_id: ev.source_id, external_ref: ev.external_ref, observed_at: ev.observed_at }} />
       ))}
     </div>
   );

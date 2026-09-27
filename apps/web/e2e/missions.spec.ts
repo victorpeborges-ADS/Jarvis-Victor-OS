@@ -8,14 +8,15 @@ test("missão sintética executa skills, mantém proveniência e sobrevive ao re
   const apiCalls: string[] = [];
   page.on("request", (request) => { if (request.url().includes("/real/")) apiCalls.push(request.url()); });
   await page.goto("/missoes");
-  await expect(page.getByTestId("mission-simulation-banner")).toContainText("teto de custo 0");
-  await expect(page.getByText(/Missões criadas aqui permanecem no armazenamento local/)).toBeVisible();
+  await expect(page.getByTestId("mission-simulation-banner")).toContainText("As missões ficam neste navegador.");
+  await page.getByText("Detalhes técnicos", { exact: true }).first().click();
+  await expect(page.getByText(/limite de custo desta simulação: zero/)).toBeVisible();
   await page.getByLabel("Nome").fill("Síntese de exemplo fictício");
   await page.getByRole("button", { name: "Criar missão" }).click();
   await expect(page.getByRole("heading", { name: "Síntese de exemplo fictício", exact: true })).toBeVisible();
   await expect(page.getByTestId("mission-task")).toHaveCount(3);
 
-  const run = page.getByRole("button", { name: "Executar próxima etapa · simulada" });
+  const run = page.getByRole("button", { name: "Executar próxima etapa" });
   await run.click();
   await expect(page.getByText(/Uma etapa determinística foi concluída localmente/)).toBeVisible();
   await expect(page.getByTestId("mission-task").nth(0)).toContainText("Concluída");
@@ -24,9 +25,10 @@ test("missão sintética executa skills, mantém proveniência e sobrevive ao re
   await expect(page.getByTestId("mission-artifact").last()).toContainText("Comparação sintética minimizada:");
   await run.click();
   await expect(page.getByRole("heading", { name: "Rascunho: Síntese de exemplo fictício" })).toBeVisible();
-  await expect(page.getByText("MISSÃO SINTÉTICA · CONCLUÍDA")).toBeVisible();
+  await expect(page.getByTestId("mission-artifact").last()).toContainText("Rascunho local aguardando revisão humana");
   await expect(page.getByTestId("mission-artifact").last().getByText(/Origem: synthetic:mission:/)).toBeVisible();
-  await expect(page.getByText(/skill 1.0.0/).last()).toBeVisible();
+  await page.getByText("Detalhes técnicos", { exact: true }).last().click();
+  await expect(page.getByText(/versão da regra: 1.0.0/)).toBeVisible();
   await expect(page.getByText(/nenhuma informação foi enviada/i)).toBeVisible();
   await page.getByRole("button", { name: /Revisar fontes e decisão/ }).click();
   await expect(page.getByRole("dialog")).toContainText("Fontes e aprovação");
@@ -59,14 +61,14 @@ test("falha sintética admite retry e cancelamento local", async ({ page }) => {
   await page.goto("/missoes");
   await page.getByLabel("Nome").fill("Teste de retry local");
   await page.getByRole("button", { name: "Criar missão" }).click();
-  await page.getByRole("button", { name: "Demonstrar falha/retry" }).click();
+  await page.getByRole("button", { name: "Simular uma falha" }).click();
   await expect(page.getByText(/Falhou · tentativa 1/)).toBeVisible();
-  await expect(page.getByRole("button", { name: "Preparar retry local" })).toBeVisible();
-  await page.getByRole("button", { name: "Preparar retry local" }).click();
+  await expect(page.getByRole("button", { name: "Tentar novamente" })).toBeVisible();
+  await page.getByRole("button", { name: "Tentar novamente" }).click();
   await expect(page.getByText(/Planejada · tentativa 2/)).toBeVisible();
   await page.getByRole("button", { name: "Cancelar" }).click();
   await expect(page.locator("p[role='status']")).toHaveText("Missão cancelada localmente.");
-  await expect(page.getByText("MISSÃO SINTÉTICA · CANCELADA")).toBeVisible();
+  await expect(page.getByText("Cancelada", { exact: true }).first()).toBeVisible();
 });
 
 test("missões inválidas são isoladas e a cópia pode ser recuperada sem perder as válidas", async ({ page }) => {
@@ -80,7 +82,7 @@ test("missões inválidas são isoladas e a cópia pode ser recuperada sem perde
   });
   await page.reload();
   await expect(page.getByRole("heading", { name: "Missão válida preservada", exact: true })).toBeVisible();
-  await expect(page.getByTestId("mission-quarantine-notice")).toContainText("1 registro(s) local(is) inválido(s) foram isolados");
+  await expect(page.getByTestId("mission-quarantine-notice")).toContainText("1 registro local inválido foi isolado.");
   const quarantine = await page.evaluate(() => JSON.parse(localStorage.getItem("jarvis.synthetic.missions.quarantine.v1") ?? "null"));
   expect(quarantine.records[0].raw).toContain("mission_tampered");
 

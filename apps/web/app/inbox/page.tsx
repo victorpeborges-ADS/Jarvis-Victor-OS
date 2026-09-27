@@ -57,9 +57,9 @@ export default function InboxPage() {
     <div className="mx-auto max-w-[880px] px-4 py-6 md:px-8">
       <div className="flex items-center justify-between">
         <div>
-          <div className="text-xs font-semibold tracking-widest text-ink-faint">INBOX · CAPTURA RÁPIDA</div>
+          <div className="text-xs font-semibold tracking-widest text-ink-faint">CAPTURA RÁPIDA</div>
           <h1 className="text-lg font-semibold tracking-tight text-ink">Caixa de entrada</h1>
-          <p className="text-sm text-ink-subtle">Capte texto ou link. Classificamos sem criar reunião ou e-mail sem aprovação.</p>
+          <p className="text-sm text-ink-subtle">Registre uma ideia ou referência e associe a uma área.</p>
           <p className="mt-1 max-w-[560px] text-xs leading-relaxed text-ink-faint" data-testid="demo-storage-limits">
             {DEMO_STORAGE_LIMITS}
           </p>
@@ -69,7 +69,7 @@ export default function InboxPage() {
             </p>
           )}
         </div>
-        <Badge tone="amber">DEMO</Badge>
+        <Badge tone="amber">Demonstração</Badge>
       </div>
 
       {feedback && (
@@ -94,7 +94,7 @@ export default function InboxPage() {
 
       <Card className="mt-6 p-5 md:p-6">
         <div className="flex items-center gap-2 text-xs font-semibold tracking-widest text-ink-faint">
-          <span aria-hidden>＋</span> NOVA CAPTURA — JORNADA 3
+          <span aria-hidden>＋</span> NOVA CAPTURA
         </div>
 
         <div className="mt-3">
@@ -106,7 +106,7 @@ export default function InboxPage() {
             data-testid="capture-input"
             value={text}
             onChange={(e) => setText(e.target.value.slice(0, 280))}
-            placeholder="Ex: Ideia CRIVO — triagem por similaridade semântica com embeddings locais..."
+            placeholder="Ex.: Ideia para organizar referências do projeto CRIVO..."
             rows={3}
             className="mt-1 w-full rounded-2xl border border-paper-border bg-paper-muted px-4 py-3 text-sm leading-relaxed text-ink placeholder:text-ink-faint focus:border-ink focus:bg-white "
           />
@@ -158,13 +158,13 @@ export default function InboxPage() {
           </Button>
           <span
             className="inline-flex items-center justify-center rounded-full border border-dashed border-paper-border px-3 py-2 text-xs text-ink-faint"
-            title="Voz virá no Gate 5 — paridade com texto"
+            title="A captura por voz ainda não está disponível"
           >
-            🎙 Voz — em breve (use texto)
+            🎙 Captura por voz — em breve (use texto)
           </span>
         </div>
         <p className="mt-3 text-xs leading-relaxed text-ink-faint">
-          Não cria automaticamente reunião, e-mail nem afeta backlog institucional. Vincula ao domínio escolhido com revisão humana.
+          Nada é enviado para outra conta ou serviço. Você pode revisar cada item antes de usá-lo.
         </p>
       </Card>
 
@@ -237,7 +237,7 @@ export default function InboxPage() {
               <div className="mt-3 flex flex-wrap items-center gap-2 text-xs text-ink-faint">
                 <span>{formatTimeH(it.created_at)} · {new Date(it.created_at).toLocaleDateString("pt-BR", { timeZone: "America/Sao_Paulo" })}</span>
                 <span>·</span>
-                <Link href={`/dominios?dominio=${it.domain_id}`} data-testid="open-domains" className="font-medium text-ink underline decoration-ink/20 underline-offset-4">
+                <Link href={`/dominios?dominio=${it.domain_id}`} data-testid="open-domains" className="inline-flex min-h-11 items-center font-medium text-ink underline decoration-ink/20 underline-offset-4">
                   Ver em Domínios →
                 </Link>
               </div>
@@ -254,7 +254,7 @@ export default function InboxPage() {
           onClose={() => setDrawer(null)}
           title={it.title}
           provenance={{
-            origin: "Inbox local + fixtures",
+            origin: "Captura neste navegador",
             last_checked: it.created_at,
             confidence: "média",
             scope: domainName(it.domain_id),

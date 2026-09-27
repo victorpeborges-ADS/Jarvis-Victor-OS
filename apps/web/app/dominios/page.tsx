@@ -26,13 +26,13 @@ export default function DominiosPage() {
         <div>
           <div className="text-xs font-semibold tracking-widest text-ink-faint">DOMÍNIOS DA VIDA</div>
           <h1 className="text-lg font-semibold tracking-tight text-ink">Domínios</h1>
-          <p className="text-sm text-ink-subtle">Mesma memória, filtros distintos. Não misture escopos.</p>
+          <p className="text-sm text-ink-subtle">Veja compromissos e capturas separados por área.</p>
         </div>
-        <Badge tone="amber">DEMO · 8 domínios</Badge>
+        <Badge tone="amber">Demonstração · 8 áreas</Badge>
       </div>
 
       <div className="mt-4">
-        <div className="mb-1 text-[11px] text-ink-faint">Toque no domínio para isolar o contexto.</div>
+        <div className="mb-1 text-xs text-ink-faint">Escolha uma área para filtrar as informações.</div>
         <div className="flex flex-wrap gap-2" role="tablist" aria-label="Filtrar por domínio">
           <button
             type="button"
@@ -91,9 +91,9 @@ export default function DominiosPage() {
             {filteredEvents.length === 0 ? (
               <EmptyState
                 title="Nada neste domínio hoje"
-                description="Este domínio não tem eventos com este identificador. Capture algo no Inbox se fizer sentido."
+                description="Esta área não tem compromissos. Se fizer sentido, registre uma ideia na Caixa de entrada."
                 action={
-                  <Link href="/inbox" className="inline-flex rounded-full bg-ink px-4 py-2 text-sm font-medium text-white">
+                  <Link href="/inbox" className="inline-flex min-h-11 items-center rounded-full bg-ink px-4 py-2 text-sm font-medium text-white">
                     Capturar ideia
                   </Link>
                 }
@@ -134,10 +134,10 @@ export default function DominiosPage() {
 
         <Card className="p-5">
           <h2 className="text-sm font-semibold text-ink">Capturas vinculadas</h2>
-          <p className="mt-1 text-xs leading-relaxed text-ink-subtle">Mesma lista do Inbox (armazenamento local DEMO). Sem vazamento entre domínios.</p>
-          <p className="mt-1 text-[11px] leading-relaxed text-ink-faint">{DEMO_STORAGE_LIMITS}</p>
+          <p className="mt-1 text-xs leading-relaxed text-ink-subtle">Capturas registradas na Caixa de entrada para esta área.</p>
+          <details className="mt-1 text-xs leading-relaxed text-ink-faint"><summary className="min-h-11 cursor-pointer py-3">Detalhes de armazenamento</summary><p>{DEMO_STORAGE_LIMITS}</p></details>
           {ephemeral && (
-            <p className="mt-1 text-[11px] leading-relaxed text-amber-800" data-testid="ephemeral-warning">
+            <p className="mt-1 text-xs leading-relaxed text-amber-800" data-testid="ephemeral-warning">
               Estas capturas extras estão só nesta sessão e serão perdidas ao recarregar.
             </p>
           )}

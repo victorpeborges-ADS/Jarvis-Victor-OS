@@ -8,23 +8,24 @@ export default function AprovacoesPage() {
   const [selectedAlt, setSelectedAlt] = useState<Record<string, string>>({ appr_001: "alt_a" });
   const [showTech, setShowTech] = useState<Record<string, boolean>>({});
   const [drawer, setDrawer] = useState<string | null>(null);
+  const [reviewRequested, setReviewRequested] = useState<Record<string, boolean>>({});
   const approvals = fixtures.approvals;
   const proposal = fixtures.proposals[0];
+  const pendingCount = approvals.filter((a) => (states[a.id] ?? "pending") === "pending").length;
 
   return (
     <div className="mx-auto max-w-[880px] px-4 py-6 md:px-8">
-      <div className="flex items-center justify-between">
+      <div className="flex flex-wrap items-start justify-between gap-3">
         <div>
-          <div className="text-xs font-semibold tracking-widest text-ink-faint">CENTRAL DE APROVAÇÃO</div>
+          <div className="text-xs font-semibold tracking-widest text-ink-faint">DECISÕES</div>
           <h1 className="text-lg font-semibold tracking-tight text-ink">Aprovações</h1>
-          <p className="text-sm text-ink-subtle">Fila explícita. Toda alteração externa exige seu aceite.</p>
+          <p className="text-sm text-ink-subtle">Revise as sugestões antes de escolher uma opção.</p>
         </div>
-        <Badge tone="violet">{approvals.filter((a) => (states[a.id] ?? "pending") === "pending").length} pendente(s)</Badge>
+        <span className="whitespace-nowrap"><Badge tone="violet">{pendingCount} {pendingCount === 1 ? "pendente" : "pendentes"}</Badge></span>
       </div>
 
       <div className="mt-4 rounded-xl border border-paper-border bg-paper-muted/60 px-4 py-3 text-xs leading-relaxed text-ink-subtle">
-        <span className="font-medium text-ink">Rascunho local</span> = só nesta interface, sem tocar Calendar/Gmail.{" "}
-        <span className="font-medium text-ink">Alteração externa</span> = escrita real (desativada até Gate 3).
+        As escolhas nesta página são demonstrações locais. Nenhuma conta ou agenda é alterada.
       </div>
 
       <div className="mt-6 space-y-4">
@@ -67,19 +68,19 @@ export default function AprovacoesPage() {
                   <button
                     type="button"
                     onClick={() => setDrawer(appr.id)}
-                    className="shrink-0 rounded-full border border-paper-border bg-white px-3 py-1 text-xs font-medium text-ink hover:bg-paper-muted"
+                    className="inline-flex min-h-11 shrink-0 items-center rounded-full border border-paper-border bg-white px-3 py-2 text-xs font-medium text-ink hover:bg-paper-muted"
                   >
-                    ver proveniência
+                    De onde veio esta informação
                   </button>
                 </div>
 
                 <div className="mt-4 rounded-xl border border-paper-border bg-paper-muted p-4">
-                  <div className="text-xs font-semibold tracking-widest text-ink-faint">DIFF EM LINGUAGEM NATURAL</div>
+                  <div className="text-xs font-semibold tracking-widest text-ink-faint">RESUMO DA MUDANÇA</div>
                   <div className="mt-1 text-sm leading-relaxed text-ink">
-                    Antes: <span className="font-medium">18h00–19h00 Academia</span> → Depois (Alt A):{" "}
+                    Antes: <span className="font-medium">18h00–19h00 Academia</span> → Depois (opção A):{" "}
                     <span className="font-medium">17h00–17h30 Academia (leve)</span>
                   </div>
-                  <div className="mt-2 text-xs leading-relaxed text-ink-subtle">{appr.scope}</div>
+                  <div className="mt-2 text-xs leading-relaxed text-ink-subtle">Esta é uma sugestão. Nenhuma agenda ou conta é alterada.</div>
                 </div>
 
                 <fieldset className="mt-4">
@@ -126,20 +127,20 @@ export default function AprovacoesPage() {
                       <Button
                         onClick={() => setStates({ ...states, [appr.id]: "approved" })}
                       >
-                        Aprovar Alt {altId === "alt_a" ? "A" : "B"} — rascunho local
+                        Aprovar sugestão {altId === "alt_a" ? "A" : "B"} — somente nesta tela
                       </Button>
                       <Button variant="outline" onClick={() => setStates({ ...states, [appr.id]: "rejected" })}>
                         Rejeitar
                       </Button>
-                      <Button variant="ghost" type="button" disabled title="Revisão humana — sem efeito externo no Gate 1">
-                        Pedir revisão
+                      <Button variant="ghost" type="button" onClick={() => setReviewRequested({ ...reviewRequested, [appr.id]: true })} aria-describedby={`review-help-${appr.id}`}>
+                        Solicitar revisão
                       </Button>
                     </>
                   ) : (
                     <div className="flex flex-wrap items-center gap-2">
                       <Badge tone={s === "approved" ? "emerald" : "neutral"}>
                         {s === "approved"
-                          ? `Aprovado — rascunho local (Alt ${altId === "alt_a" ? "A" : "B"}); nenhuma escrita externa ainda (Gate 3 exigido)`
+                          ? `Sugestão aprovada nesta demonstração (opção ${altId === "alt_a" ? "A" : "B"}); nenhuma conta foi alterada.`
                           : "Rejeitado — nenhuma alteração foi feita"}
                       </Badge>
                       <Button variant="outline" size="sm" onClick={() => setStates({ ...states, [appr.id]: "pending" })}>
@@ -149,6 +150,12 @@ export default function AprovacoesPage() {
                   )}
                 </div>
 
+                {s === "pending" && (
+                  <p id={`review-help-${appr.id}`} className="mt-2 min-h-6 text-xs text-ink-subtle" role="status" aria-live="polite">
+                    {reviewRequested[appr.id] ? "Pedido de revisão registrado nesta demonstração." : "Solicitar revisão registra apenas um pedido nesta demonstração."}
+                  </p>
+                )}
+
                 {s === "approved" && (
                   <p className="mt-3 text-xs leading-relaxed text-ink-subtle">
                     Escolhida: <span className="font-medium text-ink">{alt.label}</span>. Efeito: apenas registro local neste protótipo.
@@ -157,7 +164,7 @@ export default function AprovacoesPage() {
 
                 <button
                   type="button"
-                  className="mt-4 text-xs font-medium text-ink-faint underline decoration-ink/20 underline-offset-4 hover:decoration-ink"
+                  className="mt-4 inline-flex min-h-11 items-center text-xs font-medium text-ink-faint underline decoration-ink/20 underline-offset-4 hover:decoration-ink"
                   onClick={() => setShowTech({ ...showTech, [appr.id]: !techOpen })}
                   aria-expanded={techOpen}
                 >
@@ -166,13 +173,13 @@ export default function AprovacoesPage() {
                 {techOpen && (
                   <div className="mt-2 rounded-xl border border-dashed border-paper-border bg-paper-muted/50 px-3 py-3 text-xs leading-relaxed text-ink-subtle">
                     ID {appr.id} · chave idempotente <code className="rounded bg-white px-1 py-0.5 ring-1 ring-paper-border">{proposal.actions[0].idempotency_key}</code> ·
-                    auditoria: você · {formatTimeH(DEMO_NOW)} (relógio DEMO) · motivo: conflito Academia×Entrega · resultado:{" "}
+                    registro: você · {formatTimeH(DEMO_NOW)} (horário de referência) · motivo: conflito Academia×Entrega · resultado:{" "}
                     {s === "approved" ? "rascunho gerado" : "sem efeito"} — sem PII.
                   </div>
                 )}
               </div>
               <div className="border-t border-paper-border bg-paper-muted px-5 py-3 text-xs leading-relaxed text-ink-subtle md:px-6">
-                Gate 1: propostas são <span className="font-medium text-ink">só sugestões</span>. Escrita real só após testes de idempotência (Gate 3).
+                Esta é uma sugestão de exemplo. A aprovação nesta página não altera serviços ou contas.
               </div>
             </Card>
           );
@@ -182,9 +189,9 @@ export default function AprovacoesPage() {
       <Card className="mt-6 p-5">
         <h3 className="text-sm font-semibold text-ink">Como funciona a fila</h3>
         <ol className="mt-2 list-decimal space-y-1 pl-5 text-sm leading-relaxed text-ink-subtle">
-          <li>JARVIS propõe com justificativa, fontes e CTA inequívoco.</li>
+          <li>JARVIS apresenta a justificativa, as fontes e uma ação clara.</li>
           <li>Você escolhe a alternativa, aprova ou rejeita — cada ação tem escopo e consequência.</li>
-          <li>Ao aprovar no Gate 1, gera-se só rascunho local; alteração externa permanece bloqueada.</li>
+          <li>A decisão registrada aqui vale apenas para esta demonstração.</li>
         </ol>
       </Card>
 
@@ -195,7 +202,11 @@ export default function AprovacoesPage() {
           onClose={() => setDrawer(null)}
           title={appr.title}
           provenance={{
-            origin: "Regra determinística + fixtures",
+            origin: "Informações de exemplo",
+            id: proposal.id,
+            source_id: proposal.conflicts.join(", "),
+            external_ref: proposal.actions[0]?.id,
+            observed_at: appr.requested_at,
             last_checked: "2026-09-23T08:50:00-03:00",
             confidence: "média",
             scope: "pessoal",

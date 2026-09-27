@@ -113,7 +113,7 @@ test("G5 auditoria independente da UI: grant revogado apresenta 403 e mantém o 
   expect(revoke).toBe(200);
   await page.getByTestId("review-approve-button").click();
   await page.getByTestId("review-confirm-button").click();
-  await expect(page.getByTestId("review-modal-notice")).toContainText("Concessão ausente (403)");
+  await expect(page.getByTestId("review-modal-notice")).toContainText("Esta ação não está liberada para a área selecionada.");
   await page.keyboard.press("Escape");
   await page.getByRole("button", { name: "Atualizar fila de revisão" }).click();
   await expect(card).toContainText("Aguardando revisão");
