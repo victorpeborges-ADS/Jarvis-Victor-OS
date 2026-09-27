@@ -287,7 +287,7 @@ class MissionEngine:
             mission["status"] = "done" if all(item["status"] == "done" for item in mission["tasks"]) else "running"
             mission["updated_at"] = now
             _check_mission(mission)
-            if mission["status"] == "done" and any(item.get("review_state") not in {None, "draft", "not_required", "awaiting_approval"} for item in mission["artifacts"]):
+            if mission["status"] == "done" and artifact.get("review_state") not in {None, "draft", "not_required", "awaiting_approval"}:
                 raise MissionRejected("conclusão não pode aprovar artefato")
             revision = fresh["revision"] + 1
             updated = connection.execute(

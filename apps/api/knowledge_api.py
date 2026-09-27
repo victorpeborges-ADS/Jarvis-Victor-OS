@@ -15,6 +15,7 @@ from local_security import (
     _session_from, mission_domains, mission_read_confirmed, mission_review_confirmed,
 )
 from mission_repository import _now, _sha
+from source_admission import verified_source_for_knowledge
 
 router = APIRouter(prefix="/real/knowledge", tags=["knowledge-synthetic"])
 
@@ -85,20 +86,32 @@ def list_knowledge(request: Request, domain_id: str | None = None) -> dict:
             with request.app.state.memory_store.transaction() as connection:
                 rows = connection.execute(
                     f"""SELECT k.id, k.mission_id, k.domain_id, k.content, k.skill_version,
-                           k.kind,
-                           k.created_at, d.decision, d.decided_at, d.source_review_id
+                           k.kind, k.source_review_id,
+                           k.created_at, d.decision, d.decided_at,
+                           d.source_review_id AS decision_source_review_id
                     FROM mission_knowledge k LEFT JOIN mission_knowledge_decisions d
                       ON d.knowledge_id=k.id AND d.owner=k.owner
                     WHERE k.owner=? AND k.domain_id IN ({placeholders})
                     ORDER BY k.created_at DESC, k.id LIMIT 100""",
                     (session.principal, *domains),
                 ).fetchall()
+                items = []
+                for row in rows:
+                    item = dict(row)
+                    verified = verified_source_for_knowledge(connection, row, session.principal)
+                    if item["kind"] == "selected_original" and not verified:
+                        item["content"] = ""
+                        item["state"] = "quarantined"
+                        item["content_withheld"] = True
+                        item["classification"] = "unverified"
+                    else:
+                        item["state"] = item["decision"] or "staged"
+                        item["content_withheld"] = False
+                    item["content_sha256"] = _content_sha(row["content"])
+                    items.append(item)
     except PermissionError as exc:
         raise HTTPException(status_code=403, detail="concessão de leitura revogada ou expirada") from exc
-    return {"dataset": "api_synthetic", "items": [
-        {**dict(row), "state": row["decision"] or "staged",
-         "content_sha256": _content_sha(row["content"])} for row in rows
-    ]}
+    return {"dataset": "api_synthetic", "items": items}
 
 
 @router.post("/{knowledge_id}/decide")
@@ -124,6 +137,8 @@ def decide_knowledge(knowledge_id: str, body: KnowledgeDecisionIn, request: Requ
                 ).fetchone()
                 if fresh is None or fresh["domain_id"] != row["domain_id"]:
                     raise HTTPException(status_code=409, detail="conhecimento alterado")
+                if fresh["kind"] == "selected_original" and not verified_source_for_knowledge(connection, fresh):
+                    raise HTTPException(status_code=409, detail="fonte em quarentena ou sem proveniência verificável")
                 actual_sha = _content_sha(fresh["content"])
                 if actual_sha != body.expected_content_sha256:
                     raise HTTPException(status_code=409, detail="conteúdo do conhecimento divergente")
@@ -186,6 +201,8 @@ def assemble_context(connection, owner: str, mission_id: str, domain_id: str, ma
             reason = "aguardando_revisao" if row["decision"] is None else "rejeitado"
         elif _content_sha(row["content"]) != row["knowledge_sha256"]:
             reason = "integridade"
+        elif row["kind"] == "selected_original" and not verified_source_for_knowledge(connection, row):
+            reason = "fonte_em_quarentena"
         else:
             source = _source_review(connection, row)
             if (not _valid_source(source) or not _source_content_matches(row, source)

@@ -616,7 +616,14 @@ class MissionRepository:
         limit = max(1, min(limit, 100))
         params.append(limit + 1)
         query = f"""
-            SELECT r.*, m.status as mission_status, m.document_json
+            SELECT r.*, m.status as mission_status, m.document_json,
+                   EXISTS(SELECT 1 FROM selected_synthetic_sources s
+                          JOIN mission_artifact_reviews base ON base.id=s.review_id AND base.owner=s.owner
+                          WHERE s.owner=r.owner AND base.mission_id=r.mission_id
+                            AND base.artifact_id=r.artifact_id
+                            AND (s.classification!='synthetic_verified' OR s.state!='selected'
+                                 OR r.artifact_version!=1))
+                     AS content_withheld
             FROM mission_artifact_reviews r
             JOIN missions m ON m.id = r.mission_id AND m.owner = r.owner
             WHERE {' AND '.join(clauses)}
@@ -645,6 +652,7 @@ class MissionRepository:
                     "artifact_sha256": row["artifact_sha256"],
                     "artifact_title": artifact.get("title", ""),
                     "artifact_kind": artifact.get("kind", "draft"),
+                    "content_withheld": bool(row["content_withheld"]),
                     "domain_id": row["domain_id"],
                     "state": row["state"],
                     "decision_reason": row["decision_reason"],
@@ -683,6 +691,8 @@ class MissionRepository:
                    ORDER BY created_at ASC""",
                 (review_id, owner),
             ).fetchall()
+            from source_admission import review_is_unverified_source
+            quarantined = review_is_unverified_source(connection, owner, review_id)
         return {
             "dataset": "api_synthetic",
             "id": row["id"],
@@ -692,7 +702,9 @@ class MissionRepository:
             "artifact_id": row["artifact_id"],
             "artifact_version": row["artifact_version"],
             "artifact_sha256": row["artifact_sha256"],
-            "artifact": artifact,
+            "artifact": ({**artifact, "content": "", "content_withheld": True}
+                         if quarantined else artifact),
+            "content_withheld": quarantined,
             "domain_id": row["domain_id"],
             "state": row["state"],
             "decision_reason": row["decision_reason"],
@@ -733,6 +745,9 @@ class MissionRepository:
         })
 
         with self.store.transaction() as connection:
+            from source_admission import review_is_unverified_source
+            if review_is_unverified_source(connection, owner, review_id):
+                raise MissionRejected("fonte em quarentena ou sem proveniência verificável não pode ser revisada")
             existing = _find_idempotency(
                 connection, owner, IDEMPOTENCY_REVIEW_DECISION, idempotency_key,
             )
@@ -781,7 +796,10 @@ class MissionRepository:
         body_hash: str,
     ) -> tuple[dict, bool]:
         now = _now()
+        from source_admission import review_is_unverified_source
         with self.store.transaction() as connection:
+            if review_is_unverified_source(connection, owner, review_id):
+                raise MissionRejected("fonte em quarentena não pode ser revisada")
             existing = _find_idempotency(
                 connection, owner, IDEMPOTENCY_REVIEW_DECISION, idempotency_key,
             )
@@ -940,7 +958,12 @@ class MissionRepository:
             "new_content": clean_content,
         })
         now = _now()
+        from source_admission import is_selected_source_artifact, review_is_unverified_source
         with self.store.transaction() as connection:
+            if review_is_unverified_source(connection, owner, review_id):
+                raise MissionRejected("fonte em quarentena não pode ser revisada")
+            if is_selected_source_artifact(connection, owner, review_id):
+                raise MissionRejected("conteúdo de fixture curada não pode ser alterado")
             existing = _find_idempotency(
                 connection, owner, IDEMPOTENCY_REVIEW_REVISION, idempotency_key,
             )

@@ -1,27 +1,23 @@
-"""Explicit, local ingestion of a user-selected synthetic text file."""
+"""Explicit admission of versioned, server-owned synthetic source fixtures."""
 
 from __future__ import annotations
 
-import hashlib
 import json
-import re
 
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, ConfigDict, Field
 
 from local_security import _session_from, mission_read_confirmed, mission_write_confirmed
 from mission_repository import MissionCorrupt, MissionRepository, _now, _record_from_row, _token
+from source_catalog import CATALOG_ID, CATALOG_VERSION, fixture_for, public_fixtures
 
 router = APIRouter(prefix="/real/missions", tags=["selected-synthetic-sources"])
 
 
 class SelectedSourceIn(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    display_name: str = Field(min_length=5, max_length=120)
-    content: str = Field(min_length=1, max_length=50000)
-    expected_content_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    fixture_id: str = Field(min_length=1, max_length=80, pattern=r"^[a-z0-9-]+$")
     idempotency_key: str = Field(min_length=8, max_length=160)
-    confirm_synthetic: bool
 
 
 def _mission(connection, mission_id: str, owner: str):
@@ -49,6 +45,8 @@ def list_selected_sources(mission_id: str, request: Request) -> dict:
                 items = connection.execute(
                     """SELECT s.id, s.mission_id, s.domain_id, s.display_name, s.content_sha256,
                               s.byte_count, s.classification, s.state AS selection_state,
+                              s.fixture_id, s.catalog_id, s.catalog_version, s.fixture_sha256,
+                              s.provenance_json,
                               s.review_id, s.knowledge_id, r.state AS artifact_review_state,
                               COALESCE(d.decision, 'staged') AS knowledge_state, s.selected_at
                        FROM selected_synthetic_sources s
@@ -59,24 +57,35 @@ def list_selected_sources(mission_id: str, request: Request) -> dict:
                        ORDER BY s.selected_at, s.id LIMIT 100""",
                     (mission_id, session.principal),
                 ).fetchall()
-                return {"dataset": "api_synthetic", "items": [dict(item) for item in items]}
+                safe_items = []
+                for item in items:
+                    safe = dict(item)
+                    safe["provenance"] = json.loads(safe.pop("provenance_json")) if safe["provenance_json"] else None
+                    safe_items.append(safe)
+                return {"dataset": "api_synthetic", "items": safe_items}
     except PermissionError as exc:
         raise HTTPException(status_code=403, detail="concessão ou sessão revogada") from exc
+
+
+@router.get("/source-catalog/fixtures")
+def list_source_fixtures(request: Request) -> dict:
+    _session_from(request)
+    return {"dataset": "api_synthetic", "catalog_id": CATALOG_ID,
+            "catalog_version": CATALOG_VERSION, "items": public_fixtures()}
 
 
 @router.post("/{mission_id}/sources", status_code=201)
 def add_selected_source(mission_id: str, body: SelectedSourceIn, request: Request) -> dict:
     session = _session_from(request, mutation=True)
-    if not body.confirm_synthetic:
-        raise HTTPException(status_code=422, detail="confirmação de conteúdo fictício obrigatória")
-    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._ -]{0,115}\.(?:txt|md|json)", body.display_name):
-        raise HTTPException(status_code=422, detail="nome de arquivo inválido")
-    size = len(body.content.encode("utf-8"))
-    if not 1 <= size <= 50000 or "\x00" in body.content:
-        raise HTTPException(status_code=422, detail="arquivo fora do limite")
-    digest = hashlib.sha256(body.content.encode("utf-8")).hexdigest()
-    if digest != body.expected_content_sha256:
-        raise HTTPException(status_code=409, detail="hash do arquivo divergente")
+    fixture = fixture_for(body.fixture_id)
+    if fixture is None:
+        raise HTTPException(status_code=422, detail="fixture sintética indisponível")
+    canonical_name = fixture["display_name"]
+    canonical_content = fixture["content"]
+    digest = fixture["content_sha256"]
+    size = len(canonical_content.encode("utf-8"))
+    provenance_json = json.dumps(fixture["provenance"], ensure_ascii=False,
+                                 sort_keys=True, separators=(",", ":"))
     store = request.app.state.memory_store
     with store.transaction() as connection:
         domain = _mission(connection, mission_id, session.principal)["domain_id"]
@@ -92,10 +101,13 @@ def add_selected_source(mission_id: str, body: SelectedSourceIn, request: Reques
                 ).fetchone()
                 if existing is not None:
                     if (existing["mission_id"] != mission_id or existing["content_sha256"] != digest
-                            or existing["display_name"] != body.display_name):
+                            or existing["fixture_id"] != fixture["id"]
+                            or existing["classification"] != "synthetic_verified"
+                            or existing["state"] != "selected"):
                         raise HTTPException(status_code=409, detail="idempotência reutilizada com corpo diferente")
                     return {"dataset": "api_synthetic", "id": existing["id"],
-                            "mission_id": mission_id, "content_sha256": digest, "replayed": True}
+                            "mission_id": mission_id, "fixture_id": fixture["id"],
+                            "content_sha256": digest, "replayed": True}
                 if row["status"] == "cancelled":
                     raise HTTPException(status_code=409, detail="missão cancelada")
                 if connection.execute(
@@ -112,8 +124,8 @@ def add_selected_source(mission_id: str, body: SelectedSourceIn, request: Reques
                 source_id = _token("source")
                 artifact = {
                     "id": _token("artifact_selected"), "kind": "evidence",
-                    "title": f"Fonte sintética selecionada: {body.display_name}",
-                    "content": body.content, "skill_version": "1.0.0",
+                    "title": f"Fonte sintética selecionada: {canonical_name}",
+                    "content": canonical_content, "skill_version": "1.0.0",
                     "skill_id": "selected-synthetic-file", "input_digest": digest,
                     "review_state": "draft", "reviewed_at": None,
                     "source_refs": [{"source_id": f"synthetic:selected:{source_id}", "uri": None,
@@ -138,18 +150,21 @@ def add_selected_source(mission_id: str, body: SelectedSourceIn, request: Reques
                         created_at, kind, source_review_id)
                        VALUES (?, ?, ?, ?, 'staged', ?, '1.0.0', ?, 'selected_original', ?)""",
                     (knowledge_id, session.principal, mission_id, domain,
-                     body.content, now, review_id),
+                     canonical_content, now, review_id),
                 )
                 connection.execute(
                     """INSERT INTO selected_synthetic_sources
                        (id, owner, mission_id, domain_id, display_name, content_sha256,
                         review_id, knowledge_id, idempotency_key, byte_count,
-                        classification, state, selected_at)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'synthetic_test_only', 'selected', ?)""",
-                    (source_id, session.principal, mission_id, domain, body.display_name, digest,
-                     review_id, knowledge_id, body.idempotency_key, size, now),
+                        classification, state, selected_at, fixture_id, catalog_id,
+                        catalog_version, fixture_sha256, provenance_json)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'synthetic_verified', 'selected', ?, ?, ?, ?, ?, ?)""",
+                    (source_id, session.principal, mission_id, domain, canonical_name, digest,
+                     review_id, knowledge_id, body.idempotency_key, size, now, fixture["id"],
+                     CATALOG_ID, CATALOG_VERSION, digest, provenance_json),
                 )
                 return {"dataset": "api_synthetic", "id": source_id, "mission_id": mission_id,
-                        "content_sha256": digest, "review_id": review_id, "replayed": False}
+                        "fixture_id": fixture["id"], "content_sha256": digest,
+                        "review_id": review_id, "replayed": False}
     except PermissionError as exc:
         raise HTTPException(status_code=403, detail="concessão ou sessão revogada") from exc

@@ -11,6 +11,7 @@ from domain_registry import CANONICAL_DOMAIN_IDS
 from local_security import _session_from, mission_domains, mission_read_scope_confirmed, mission_write_confirmed
 from mission_engine import available_actions
 from mission_repository import MissionConflict, MissionCorrupt, MissionDenied, MissionRejected, MissionRepository
+from source_admission import redact_mission_record
 
 router = APIRouter(prefix="/real/missions", tags=["missions-synthetic"])
 
@@ -41,6 +42,12 @@ def _public(record: dict) -> dict:
         record = dict(record)
         record["available_actions"] = available_actions(record["mission"]["status"])
     return record
+
+
+def _safe_public(request: Request, record: dict) -> dict:
+    with request.app.state.memory_store.transaction() as connection:
+        safe = redact_mission_record(connection, record)
+    return _public(safe)
 
 
 def _repo(request: Request) -> MissionRepository:
@@ -76,7 +83,7 @@ def list_missions(request: Request, domain_id: str | None = None, limit: int = 2
     try:
         with mission_read_scope_confirmed(session.principal, domain_id, session.token) as allowed:
             page = _repo(request).list_page(session.principal, domain_id, limit, cursor, allowed)
-            page["items"] = [_public(item) for item in page["items"]]
+            page["items"] = [_safe_public(request, item) for item in page["items"]]
             return page
     except PermissionError as exc:
         raise HTTPException(status_code=403, detail="concessão de leitura ou sessão revogada ou expirada") from exc
@@ -92,7 +99,7 @@ def read_mission(mission_id: str, request: Request) -> dict:
                 raise HTTPException(status_code=404, detail="registro ausente")
             if record["mission"]["domain_id"] not in allowed:
                 raise HTTPException(status_code=403, detail="concessão de leitura ausente para este domínio")
-            return _public(record)
+            return _safe_public(request, record)
     except MissionCorrupt as exc:
         raise HTTPException(status_code=409, detail="integridade do registro de missão") from exc
     except PermissionError as exc:

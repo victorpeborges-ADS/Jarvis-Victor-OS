@@ -120,6 +120,8 @@ def create_app(config: LocalServerConfig, *, database_path: str | Path | None = 
         # through low-level Python APIs after app construction.
         validate_local_server_config(config)
         store.initialize()
+        from source_admission import reconcile_legacy_selected_sources
+        reconcile_legacy_selected_sources(store)
         recover_interrupted(store)
         yield
 

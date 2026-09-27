@@ -1,0 +1,48 @@
+{
+  "catalog_id": "jarvis.synthetic_sources",
+  "catalog_version": "1.0.0",
+  "items": [
+    {
+      "id": "tarefas-de-exemplo",
+      "display_name": "tarefas-de-exemplo.md",
+      "content": "Tarefas de exemplo\n- Revisar rótulos.\n- Conferir estados.\nPróximo passo: registrar resultado sintético.\n",
+      "content_sha256": "3e55da85bb4581ec96358ee4c0533346dccfaed2dc30674279edf884757cd350",
+      "classification": "synthetic_verified",
+      "provenance": {
+        "kind": "curated_server_fixture",
+        "catalog_id": "jarvis.synthetic_sources",
+        "catalog_version": "1.0.0",
+        "fixture_id": "tarefas-de-exemplo",
+        "note": "Conteúdo de demonstração criado para testes locais; não representa fonte externa."
+      }
+    },
+    {
+      "id": "resumo-de-demonstracao",
+      "display_name": "resumo-de-demonstracao.txt",
+      "content": "Resumo de demonstração\nObjetivo: testar a proveniência de um texto curado.\nResultado esperado: a API usa o conteúdo do catálogo.\n",
+      "content_sha256": "7b150180e8268a48d785117f2643018b13ad9ee3049ef1ae4910615349160c63",
+      "classification": "synthetic_verified",
+      "provenance": {
+        "kind": "curated_server_fixture",
+        "catalog_id": "jarvis.synthetic_sources",
+        "catalog_version": "1.0.0",
+        "fixture_id": "resumo-de-demonstracao",
+        "note": "Conteúdo de demonstração criado para testes locais; não representa fonte externa."
+      }
+    },
+    {
+      "id": "checklist-sintetico",
+      "display_name": "checklist-sintetico.md",
+      "content": "Checklist sintético\n[ ] Confirmar origem local.\n[ ] Verificar hash.\n[ ] Manter conhecimento em revisão.\n",
+      "content_sha256": "92535b5df564205b83283f2b652e1a48e2cac9f9f742c595f9ed45a62791db3a",
+      "classification": "synthetic_verified",
+      "provenance": {
+        "kind": "curated_server_fixture",
+        "catalog_id": "jarvis.synthetic_sources",
+        "catalog_version": "1.0.0",
+        "fixture_id": "checklist-sintetico",
+        "note": "Conteúdo de demonstração criado para testes locais; não representa fonte externa."
+      }
+    }
+  ]
+}
