@@ -1,7 +1,8 @@
 # Relatório da sprint JARVIS R3
 
-**Data:** 26/09/2026  
-**Branch:** `feat/jarvis-unified-r3-2026-09-26`  
+**Data:** 26/09/2026
+
+**Branch:** `feat/jarvis-unified-r3-2026-09-26`
 **Estado de G5:** auditoria independente pendente; este relatório não declara aceite formal.
 
 ## Baseline e preservação
