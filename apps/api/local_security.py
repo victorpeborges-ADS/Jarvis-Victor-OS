@@ -293,13 +293,54 @@ def authorized_calendar_inventory_domains(principal: str) -> frozenset[str]:
 def mission_read_confirmed(principal: str, domain_id: str, session_token: str | None = None):
     """Keep a synthetic mission read grant active while assembling its response."""
     with _grant_lock:
-        if session_token is not None:
-            session = _sessions.get(session_token)
-            if session is None or session.principal != principal or session.expires_at <= _now():
-                raise PermissionError("sessão encerrada ou expirada")
+        _confirm_session_locked(principal, session_token)
         if domain_id not in mission_domains(principal, MISSION_READ_RESOURCE):
             raise PermissionError("concessão de leitura revogada ou expirada")
         yield
+
+
+def _confirm_session_locked(principal: str, session_token: str | None) -> None:
+    if session_token is None:
+        return
+    session = _sessions.get(session_token)
+    if session is None or session.principal != principal or session.expires_at <= _now():
+        raise PermissionError("sessão encerrada ou expirada")
+
+
+@contextmanager
+def mission_read_scope_confirmed(
+    principal: str,
+    domain_id: str | None = None,
+    session_token: str | None = None,
+):
+    """Hold the read grant stable while a mission snapshot is selected and copied.
+
+    Lock order is grant lock, then SQLite reads. The yielded set is the exact
+    authorized scope for this response snapshot.
+    """
+    with _grant_lock:
+        _confirm_session_locked(principal, session_token)
+        granted = mission_domains(principal, MISSION_READ_RESOURCE)
+        allowed = granted if domain_id is None else granted & {domain_id}
+        if not allowed:
+            raise PermissionError("concessão de leitura revogada ou expirada")
+        yield frozenset(allowed)
+
+
+@contextmanager
+def mission_review_read_scope_confirmed(
+    principal: str,
+    domain_id: str | None = None,
+    session_token: str | None = None,
+):
+    """Hold read/review grants stable while review snapshots are assembled."""
+    with _grant_lock:
+        _confirm_session_locked(principal, session_token)
+        granted = mission_domains(principal, MISSION_READ_RESOURCE) | mission_domains(principal, MISSION_REVIEW_RESOURCE)
+        allowed = granted if domain_id is None else granted & {domain_id}
+        if not allowed:
+            raise PermissionError("concessão de leitura ou revisão revogada ou expirada")
+        yield frozenset(allowed)
 
 
 @contextmanager

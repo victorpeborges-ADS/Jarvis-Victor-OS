@@ -8,7 +8,7 @@ from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, ConfigDict, Field
 
 from domain_registry import CANONICAL_DOMAIN_IDS
-from local_security import _session_from, mission_domains
+from local_security import _session_from, mission_domains, mission_review_read_scope_confirmed
 from mission_repository import MissionConflict, MissionCorrupt, MissionDenied, MissionRejected, MissionRepository
 
 router = APIRouter(prefix="/real/reviews", tags=["reviews-synthetic"])
@@ -42,38 +42,28 @@ def list_reviews(
     cursor: str | None = None,
 ) -> dict:
     session = _session_from(request)
-    readable = (
-        mission_domains(session.principal, "mission:read")
-        | mission_domains(session.principal, "mission:review")
-    )
-    if not readable:
-        raise HTTPException(status_code=403, detail="concessão de missão ausente")
-    if domain_id is not None:
-        if domain_id not in readable:
-            raise HTTPException(status_code=403, detail="concessão de missão ausente")
-        allowed = {domain_id}
-    else:
-        allowed = readable
-
-    return _repo(request).list_reviews(session.principal, domain_id, state, limit, cursor, allowed)
+    try:
+        with mission_review_read_scope_confirmed(session.principal, domain_id, session.token) as allowed:
+            return _repo(request).list_reviews(session.principal, domain_id, state, limit, cursor, allowed)
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail="concessão de leitura ou revisão revogada ou expirada") from exc
 
 
 @router.get("/{review_id}")
 def read_review(review_id: str, request: Request) -> dict:
     session = _session_from(request)
     try:
-        record = _repo(request).get_review(session.principal, review_id)
+        with mission_review_read_scope_confirmed(session.principal, session_token=session.token) as allowed:
+            record = _repo(request).get_review(session.principal, review_id)
+            if record is None:
+                raise HTTPException(status_code=404, detail="registro ausente")
+            if record["domain_id"] not in allowed:
+                raise HTTPException(status_code=403, detail="concessão de leitura ou revisão ausente para este domínio")
+            return record
     except MissionCorrupt as exc:
         raise HTTPException(status_code=409, detail="integridade do registro de revisão") from exc
-    if record is None:
-        raise HTTPException(status_code=404, detail="registro ausente")
-    readable = (
-        mission_domains(session.principal, "mission:read")
-        | mission_domains(session.principal, "mission:review")
-    )
-    if record["domain_id"] not in readable:
-        raise HTTPException(status_code=403, detail="concessão de missão ausente")
-    return record
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail="concessão de leitura ou revisão revogada ou expirada") from exc
 
 
 @router.post("/{review_id}/decide")

@@ -406,6 +406,18 @@ def test_changes_requested_and_revised_version_requires_new_review(client):
     assert v2["state"] == "pending"
     assert v2["artifact"]["content"] == "Conteúdo corrigido com sumário executivo."
 
+    stale_decision = client.post(
+        f"/real/reviews/{review_id}/decide",
+        headers={"origin": ORIGIN, "x-csrf-token": csrf},
+        json={
+            "decision": "approved",
+            "expected_revision": 1,
+            "expected_artifact_sha256": detail["artifact_sha256"],
+            "idempotency_key": "stale-review-v1-decision",
+        },
+    )
+    assert stale_decision.status_code == 409, stale_decision.text
+
     # Version 1 remains changes_requested and terminal
     v1 = client.get(f"/real/reviews/{review_id}", headers={"origin": ORIGIN}).json()
     assert v1["state"] == "changes_requested"

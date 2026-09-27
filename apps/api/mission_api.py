@@ -8,7 +8,7 @@ from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, ConfigDict, Field
 
 from domain_registry import CANONICAL_DOMAIN_IDS
-from local_security import _session_from, mission_domains, mission_write_confirmed
+from local_security import _session_from, mission_domains, mission_read_scope_confirmed, mission_write_confirmed
 from mission_engine import available_actions
 from mission_repository import MissionConflict, MissionCorrupt, MissionDenied, MissionRejected, MissionRepository
 
@@ -73,39 +73,48 @@ def create_mission(body: MissionCreateIn, request: Request) -> dict:
 @router.get("")
 def list_missions(request: Request, domain_id: str | None = None, limit: int = 20, cursor: str | None = None) -> dict:
     session = _session_from(request)
-    if domain_id is not None:
-        _require(session.principal, "mission:read", domain_id)
-        allowed = {domain_id}
-    else:
-        allowed = mission_domains(session.principal, "mission:read")
-        if not allowed:
-            raise HTTPException(status_code=403, detail="concessão de missão ausente")
-    page = _repo(request).list_page(session.principal, domain_id, limit, cursor, allowed)
-    page["items"] = [_public(item) for item in page["items"]]
-    return page
+    try:
+        with mission_read_scope_confirmed(session.principal, domain_id, session.token) as allowed:
+            page = _repo(request).list_page(session.principal, domain_id, limit, cursor, allowed)
+            page["items"] = [_public(item) for item in page["items"]]
+            return page
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail="concessão de leitura ou sessão revogada ou expirada") from exc
 
 
 @router.get("/{mission_id}")
 def read_mission(mission_id: str, request: Request) -> dict:
     session = _session_from(request)
     try:
-        record = _repo(request).get(session.principal, mission_id)
+        with mission_read_scope_confirmed(session.principal, session_token=session.token) as allowed:
+            record = _repo(request).get(session.principal, mission_id)
+            if record is None:
+                raise HTTPException(status_code=404, detail="registro ausente")
+            if record["mission"]["domain_id"] not in allowed:
+                raise HTTPException(status_code=403, detail="concessão de leitura ausente para este domínio")
+            return _public(record)
     except MissionCorrupt as exc:
         raise HTTPException(status_code=409, detail="integridade do registro de missão") from exc
-    if record is None:
-        raise HTTPException(status_code=404, detail="registro ausente")
-    _require(session.principal, "mission:read", record["mission"]["domain_id"])
-    return _public(record)
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail="concessão de leitura ou sessão revogada ou expirada") from exc
 
 
 @router.get("/{mission_id}/reviews")
 def list_mission_reviews(mission_id: str, request: Request) -> dict:
     session = _session_from(request)
-    current = _repo(request).get(session.principal, mission_id)
-    if current is None:
-        raise HTTPException(status_code=404, detail="registro ausente")
-    _require(session.principal, "mission:read", current["mission"]["domain_id"])
-    return _repo(request).list_reviews(session.principal, domain_id=current["mission"]["domain_id"])
+    try:
+        with mission_read_scope_confirmed(session.principal, session_token=session.token) as allowed:
+            current = _repo(request).get(session.principal, mission_id)
+            if current is None:
+                raise HTTPException(status_code=404, detail="registro ausente")
+            domain_id = current["mission"]["domain_id"]
+            if domain_id not in allowed:
+                raise HTTPException(status_code=403, detail="concessão de leitura ausente para este domínio")
+            return _repo(request).list_reviews(session.principal, domain_id=domain_id)
+    except MissionCorrupt as exc:
+        raise HTTPException(status_code=409, detail="integridade do registro de missão") from exc
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail="concessão de leitura ou sessão revogada ou expirada") from exc
 
 
 @router.post("/{mission_id}/transition")
