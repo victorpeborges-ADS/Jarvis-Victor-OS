@@ -30,7 +30,7 @@ export function BottomNav() {
         paddingBottom: "env(safe-area-inset-bottom, 0px)"
       }}
     >
-      <div className="grid h-[var(--bottom-nav-height)] grid-cols-5 gap-1 px-1">
+      <div className="grid h-[var(--bottom-nav-height)] grid-cols-[0.95fr_1.1fr_1fr_1.25fr_0.76fr] gap-1 px-1">
         {items.map((it) => {
           const active = pathname === it.href || (it.href !== "/" && pathname.startsWith(it.href));
           return (
@@ -40,14 +40,14 @@ export function BottomNav() {
               aria-label={it.ariaLabel ?? it.label}
               aria-current={active ? "page" : undefined}
               className={[
-                "flex min-h-[44px] w-full min-w-0 flex-col items-center justify-center overflow-hidden rounded-xl px-1 py-1.5 text-xs transition ",
+                "flex min-h-[44px] w-full min-w-0 flex-col items-center justify-center overflow-hidden rounded-xl px-0 py-1.5 text-xs transition ",
                 active ? "bg-ink text-white" : "text-ink-subtle hover:bg-paper-muted"
               ].join(" ")}
             >
               <span aria-hidden className="text-lg leading-none">
                 {it.icon}
               </span>
-              <span className="mt-1 block w-full min-w-0 break-words whitespace-normal text-center text-[11px] font-semibold leading-tight tracking-tight [overflow-wrap:anywhere]">{it.label}</span>
+              <span className="mt-1 block w-full min-w-0 whitespace-nowrap text-center text-xs font-semibold leading-tight tracking-tighter">{it.label}</span>
             </Link>
           );
         })}
