@@ -9,6 +9,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from local_security import _session_from, mission_read_confirmed, mission_write_confirmed
 from mission_repository import MissionCorrupt, MissionRepository, _now, _record_from_row, _token
+from source_admission import canonical_knowledge_decision, canonical_review_state, prove_source
 from source_catalog import CATALOG_ID, CATALOG_VERSION, fixture_for, public_fixtures
 
 router = APIRouter(prefix="/real/missions", tags=["selected-synthetic-sources"])
@@ -43,24 +44,62 @@ def list_selected_sources(mission_id: str, request: Request) -> dict:
             with store.transaction() as connection:
                 _mission(connection, mission_id, session.principal)
                 items = connection.execute(
-                    """SELECT s.id, s.mission_id, s.domain_id, s.display_name, s.content_sha256,
-                              s.byte_count, s.classification, s.state AS selection_state,
-                              s.fixture_id, s.catalog_id, s.catalog_version, s.fixture_sha256,
-                              s.provenance_json,
-                              s.review_id, s.knowledge_id, r.state AS artifact_review_state,
-                              COALESCE(d.decision, 'staged') AS knowledge_state, s.selected_at
+                    """SELECT s.*
                        FROM selected_synthetic_sources s
-                       JOIN mission_artifact_reviews r ON r.id=s.review_id AND r.owner=s.owner
-                       JOIN mission_knowledge k ON k.id=s.knowledge_id AND k.owner=s.owner
-                       LEFT JOIN mission_knowledge_decisions d ON d.knowledge_id=k.id AND d.owner=s.owner
                        WHERE s.mission_id=? AND s.owner=?
                        ORDER BY s.selected_at, s.id LIMIT 100""",
                     (mission_id, session.principal),
                 ).fetchall()
                 safe_items = []
                 for item in items:
-                    safe = dict(item)
-                    safe["provenance"] = json.loads(safe.pop("provenance_json")) if safe["provenance_json"] else None
+                    proof = prove_source(connection, item["id"], session.principal, mission_id)
+                    if not proof.trusted:
+                        safe_items.append({
+                            "id": item["id"], "mission_id": mission_id,
+                            "classification": "unverified", "selection_state": "quarantined",
+                            "artifact_review_state": "pending", "knowledge_state": "quarantined",
+                            "display_name": "Fonte retida para verificação",
+                            "content_withheld": True, "fixture_id": None,
+                            "catalog_id": None, "catalog_version": None,
+                            "content_sha256": None, "fixture_sha256": None,
+                            "byte_count": None, "provenance": None,
+                            "review_id": None, "knowledge_id": None,
+                            "selected_at": item["selected_at"],
+                        })
+                        continue
+                    review_state, review_valid, _ = canonical_review_state(connection, proof.review)
+                    knowledge_state, knowledge_valid, _ = canonical_knowledge_decision(
+                        connection, proof.knowledge
+                    )
+                    if not review_valid or not knowledge_valid:
+                        safe_items.append({
+                            "id": item["id"], "mission_id": mission_id,
+                            "classification": "unverified", "selection_state": "quarantined",
+                            "artifact_review_state": "pending", "knowledge_state": "quarantined",
+                            "display_name": "Fonte retida para verificação",
+                            "content_withheld": True, "fixture_id": None,
+                            "catalog_id": None, "catalog_version": None,
+                            "content_sha256": None, "fixture_sha256": None,
+                            "byte_count": None, "provenance": None,
+                            "review_id": None, "knowledge_id": None,
+                            "selected_at": item["selected_at"],
+                        })
+                        continue
+                    safe = {
+                        "id": item["id"], "mission_id": mission_id,
+                        "domain_id": item["domain_id"], "display_name": proof.fixture["display_name"],
+                        "content_sha256": proof.fixture["content_sha256"],
+                        "byte_count": len(proof.fixture["content"].encode("utf-8")),
+                        "classification": "synthetic_verified", "selection_state": "selected",
+                        "fixture_id": proof.fixture["id"], "catalog_id": CATALOG_ID,
+                        "catalog_version": CATALOG_VERSION,
+                        "fixture_sha256": proof.fixture["content_sha256"],
+                        "provenance": dict(proof.fixture["provenance"]),
+                        "review_id": proof.review["id"], "knowledge_id": proof.knowledge["id"],
+                        "artifact_review_state": review_state,
+                        "knowledge_state": knowledge_state,
+                        "content_withheld": False, "selected_at": item["selected_at"],
+                    }
                     safe_items.append(safe)
                 return {"dataset": "api_synthetic", "items": safe_items}
     except PermissionError as exc:
@@ -103,7 +142,8 @@ def add_selected_source(mission_id: str, body: SelectedSourceIn, request: Reques
                     if (existing["mission_id"] != mission_id or existing["content_sha256"] != digest
                             or existing["fixture_id"] != fixture["id"]
                             or existing["classification"] != "synthetic_verified"
-                            or existing["state"] != "selected"):
+                            or existing["state"] != "selected"
+                            or not prove_source(connection, existing["id"], session.principal, mission_id).trusted):
                         raise HTTPException(status_code=409, detail="idempotência reutilizada com corpo diferente")
                     return {"dataset": "api_synthetic", "id": existing["id"],
                             "mission_id": mission_id, "fixture_id": fixture["id"],
@@ -163,6 +203,8 @@ def add_selected_source(mission_id: str, body: SelectedSourceIn, request: Reques
                      review_id, knowledge_id, body.idempotency_key, size, now, fixture["id"],
                      CATALOG_ID, CATALOG_VERSION, digest, provenance_json),
                 )
+                if not prove_source(connection, source_id, session.principal, mission_id).trusted:
+                    raise HTTPException(status_code=503, detail="não foi possível validar a fonte local")
                 return {"dataset": "api_synthetic", "id": source_id, "mission_id": mission_id,
                         "fixture_id": fixture["id"], "content_sha256": digest,
                         "review_id": review_id, "replayed": False}

@@ -15,7 +15,10 @@ from local_security import (
     _session_from, mission_domains, mission_read_confirmed, mission_review_confirmed,
 )
 from mission_repository import _now, _sha
-from source_admission import verified_source_for_knowledge
+from source_admission import (
+    canonical_knowledge_decision, canonical_review_state, knowledge_source_review,
+    verified_source_for_knowledge,
+)
 
 router = APIRouter(prefix="/real/knowledge", tags=["knowledge-synthetic"])
 
@@ -33,30 +36,7 @@ def _content_sha(content: str) -> str:
 
 
 def _source_review(connection, row):
-    if row["source_review_id"]:
-        return connection.execute(
-            "SELECT * FROM mission_artifact_reviews WHERE id=? AND mission_id=? AND owner=?",
-            (row["source_review_id"], row["mission_id"], row["owner"]),
-        ).fetchone()
-    if not row["id"].startswith("knowledge_capture_"):
-        return None
-    artifact_id = "artifact_capture_" + row["id"].removeprefix("knowledge_capture_")
-    return connection.execute(
-        """SELECT * FROM mission_artifact_reviews
-           WHERE mission_id=? AND owner=? AND artifact_id=?
-           ORDER BY artifact_version DESC LIMIT 1""",
-        (row["mission_id"], row["owner"], artifact_id),
-    ).fetchone()
-
-
-def _valid_source(row) -> bool:
-    if row is None or row["state"] != "approved":
-        return False
-    try:
-        snapshot = json.loads(row["artifact_snapshot_json"])
-        return _sha(snapshot) == row["artifact_sha256"] and snapshot.get("id") == row["artifact_id"]
-    except (TypeError, ValueError, AttributeError):
-        return False
+    return knowledge_source_review(connection, row)
 
 
 def _source_content_matches(row, source) -> bool:
@@ -85,12 +65,9 @@ def list_knowledge(request: Request, domain_id: str | None = None) -> dict:
                 grants.enter_context(mission_read_confirmed(session.principal, domain, session.token))
             with request.app.state.memory_store.transaction() as connection:
                 rows = connection.execute(
-                    f"""SELECT k.id, k.mission_id, k.domain_id, k.content, k.skill_version,
-                           k.kind, k.source_review_id,
-                           k.created_at, d.decision, d.decided_at,
-                           d.source_review_id AS decision_source_review_id
-                    FROM mission_knowledge k LEFT JOIN mission_knowledge_decisions d
-                      ON d.knowledge_id=k.id AND d.owner=k.owner
+                    f"""SELECT k.id, k.owner, k.mission_id, k.domain_id, k.content, k.skill_version,
+                           k.kind, k.source_review_id, k.created_at
+                    FROM mission_knowledge k
                     WHERE k.owner=? AND k.domain_id IN ({placeholders})
                     ORDER BY k.created_at DESC, k.id LIMIT 100""",
                     (session.principal, *domains),
@@ -99,15 +76,26 @@ def list_knowledge(request: Request, domain_id: str | None = None) -> dict:
                 for row in rows:
                     item = dict(row)
                     verified = verified_source_for_knowledge(connection, row, session.principal)
-                    if item["kind"] == "selected_original" and not verified:
+                    state, decision_valid, decision_row = canonical_knowledge_decision(connection, row)
+                    if not decision_valid or (item["kind"] == "selected_original" and not verified):
                         item["content"] = ""
                         item["state"] = "quarantined"
                         item["content_withheld"] = True
-                        item["classification"] = "unverified"
+                        item["decision"] = None
+                        item["decided_at"] = None
+                        item["decision_source_review_id"] = None
+                        item["content_sha256"] = None
+                        item["decision_state_proven"] = False
+                        if item["kind"] == "selected_original":
+                            item["classification"] = "unverified"
                     else:
-                        item["state"] = item["decision"] or "staged"
+                        item["decision"] = state if state in {"approved", "rejected"} else None
+                        item["state"] = state
                         item["content_withheld"] = False
-                    item["content_sha256"] = _content_sha(row["content"])
+                        item["decision_state_proven"] = True
+                        item["decided_at"] = decision_row["decided_at"] if decision_row else None
+                        item["decision_source_review_id"] = decision_row["source_review_id"] if decision_row else None
+                        item["content_sha256"] = _content_sha(row["content"])
                     items.append(item)
     except PermissionError as exc:
         raise HTTPException(status_code=403, detail="concessão de leitura revogada ou expirada") from exc
@@ -158,7 +146,8 @@ def decide_knowledge(knowledge_id: str, body: KnowledgeDecisionIn, request: Requ
                 ).fetchone() is not None:
                     raise HTTPException(status_code=409, detail="conhecimento já decidido")
                 source = _source_review(connection, fresh)
-                if body.decision == "approved" and (not _valid_source(source)
+                source_state, source_valid, _ = canonical_review_state(connection, source) if source else ("pending", False, None)
+                if body.decision == "approved" and (not source_valid or source_state != "approved"
                                                     or not _source_content_matches(fresh, source)):
                     raise HTTPException(status_code=409, detail="artefato de origem ainda não aprovado ou desatualizado")
                 source_id = source["id"] if source is not None else None
@@ -197,17 +186,26 @@ def assemble_context(connection, owner: str, mission_id: str, domain_id: str, ma
     total = 0
     for row in rows:
         reason = None
-        if row["decision"] != "approved":
-            reason = "aguardando_revisao" if row["decision"] is None else "rejeitado"
+        decision_state, decision_valid, decision_row = canonical_knowledge_decision(connection, row)
+        if not decision_valid:
+            if row["kind"] == "selected_original":
+                reason = "fonte_em_quarentena"
+            else:
+                source = _source_review(connection, row)
+                source_state, source_valid, _ = canonical_review_state(connection, source) if source else ("pending", False, None)
+                reason = "fonte_desatualizada" if source and (not source_valid or source_state != "approved") else "integridade"
+        elif decision_state != "approved":
+            reason = "aguardando_revisao" if decision_state == "staged" else "rejeitado"
         elif _content_sha(row["content"]) != row["knowledge_sha256"]:
             reason = "integridade"
         elif row["kind"] == "selected_original" and not verified_source_for_knowledge(connection, row):
             reason = "fonte_em_quarentena"
         else:
             source = _source_review(connection, row)
-            if (not _valid_source(source) or not _source_content_matches(row, source)
-                    or source["id"] != row["decision_source_review_id"]
-                    or source["artifact_sha256"] != row["source_artifact_sha256"]):
+            source_state, source_valid, _ = canonical_review_state(connection, source) if source else ("pending", False, None)
+            if (not source_valid or source_state != "approved" or not _source_content_matches(row, source)
+                    or source["id"] != decision_row["source_review_id"]
+                    or source["artifact_sha256"] != decision_row["source_artifact_sha256"]):
                 reason = "fonte_desatualizada"
             elif total + len(row["content"]) > max_chars:
                 reason = "limite_de_tamanho"
@@ -216,8 +214,8 @@ def assemble_context(connection, owner: str, mission_id: str, domain_id: str, ma
         else:
             included.append({"knowledge_id": row["id"], "content": row["content"],
                              "content_sha256": row["knowledge_sha256"],
-                             "source_review_id": row["decision_source_review_id"],
-                             "source_artifact_sha256": row["source_artifact_sha256"],
+                             "source_review_id": decision_row["source_review_id"],
+                             "source_artifact_sha256": decision_row["source_artifact_sha256"],
                              "domain_id": row["domain_id"], "fetched_at": row["created_at"]})
             total += len(row["content"])
     return {"dataset": "api_synthetic", "mission_id": mission_id,

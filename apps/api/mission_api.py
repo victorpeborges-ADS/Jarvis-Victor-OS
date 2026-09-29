@@ -74,7 +74,7 @@ def create_mission(body: MissionCreateIn, request: Request) -> dict:
         raise HTTPException(status_code=422, detail=exc.detail) from exc
     except PermissionError as exc:
         raise HTTPException(status_code=403, detail="concessão ou sessão revogada ou expirada") from exc
-    return _public({**record, "replayed": replayed})
+    return _safe_public(request, {**record, "replayed": replayed})
 
 
 @router.get("")
@@ -143,7 +143,7 @@ def transition_mission(mission_id: str, body: MissionTransitionIn, request: Requ
                     session.principal, mission_id, body.action, body.expected_revision,
                     body.idempotency_key, session.token,
                 )
-        return _public(updated)
+        return _safe_public(request, updated)
     except MissionConflict as exc:
         raise HTTPException(status_code=409, detail=exc.detail) from exc
     except MissionDenied as exc:

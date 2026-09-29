@@ -1,0 +1,7 @@
+{
+  "fixture_version": 1,
+  "state_name": "pre-g4",
+  "max_migration": "0007_import_idempotency_result",
+  "profile": "mission_and_event",
+  "expected": {"missions": 1, "mission_events": 1, "executions": 0, "reviews": 0, "sources": 0}
+}

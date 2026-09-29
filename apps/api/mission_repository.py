@@ -151,6 +151,20 @@ def _check_mission(document: dict) -> None:
         raise MissionRejected("missão concluída sem etapas concluídas")
 
 
+def _canonical_import_document(document: dict) -> dict:
+    """Remove imported review authority before creating local pending reviews."""
+    clean = json.loads(json.dumps(document, ensure_ascii=False))
+    for artifact in clean.get("artifacts", []):
+        state = artifact.get("review_state")
+        if state in {"approved", "rejected", "changes_requested", "approved_locally", "not_required"}:
+            raise MissionRejected("documento importado declara decisão de revisão sem ledger local")
+        # Pending/draft/review labels are also client claims. Imported artifacts
+        # always enter the local queue as drafts with a fresh pending review row.
+        artifact["review_state"] = "draft"
+        artifact["reviewed_at"] = None
+    return clean
+
+
 def new_mission(title: str, domain_id: str, owner: str) -> dict:
     now = _now()
     mission_id = _token("mission")
@@ -508,6 +522,7 @@ class MissionRepository:
                 _check_mission(document)
                 if document.get("domain_id") is None:
                     raise MissionRejected("domínio ausente")
+                document = _canonical_import_document(document)
             except MissionRejected as exc:
                 quarantined.append({"index": index, "reason": exc.detail})
                 continue
@@ -607,64 +622,69 @@ class MissionRepository:
         if domain_id is not None:
             clauses.append("r.domain_id = ?")
             params.append(domain_id)
-        if state is not None:
-            clauses.append("r.state = ?")
-            params.append(state)
-        if cursor:
-            clauses.append("r.id > ?")
-            params.append(cursor)
         limit = max(1, min(limit, 100))
-        params.append(limit + 1)
         query = f"""
-            SELECT r.*, m.status as mission_status, m.document_json,
-                   EXISTS(SELECT 1 FROM selected_synthetic_sources s
-                          JOIN mission_artifact_reviews base ON base.id=s.review_id AND base.owner=s.owner
-                          WHERE s.owner=r.owner AND base.mission_id=r.mission_id
-                            AND base.artifact_id=r.artifact_id
-                            AND (s.classification!='synthetic_verified' OR s.state!='selected'
-                                 OR r.artifact_version!=1))
-                     AS content_withheld
+            SELECT r.*, m.status as mission_status, m.document_json
             FROM mission_artifact_reviews r
             JOIN missions m ON m.id = r.mission_id AND m.owner = r.owner
-            WHERE {' AND '.join(clauses)}
-            ORDER BY r.id ASC
-            LIMIT ?
+            WHERE {' AND '.join(clauses)} AND r.id > ?
+            ORDER BY r.id ASC LIMIT 250
         """
         with self.store.transaction() as connection:
-            rows = connection.execute(query, params).fetchall()
-        page = rows[:limit]
-        next_cursor = page[-1]["id"] if len(rows) > limit and page else None
-        items = []
-        corrupt = []
-        for row in page:
-            try:
-                mission_doc = json.loads(row["document_json"])
-                artifact = json.loads(row["artifact_snapshot_json"])
-                if _sha(artifact) != row["artifact_sha256"] or artifact.get("id") != row["artifact_id"]:
-                    raise ValueError("snapshot da revisão inválido")
-                items.append({
-                    "id": row["id"],
-                    "mission_id": row["mission_id"],
-                    "mission_title": mission_doc.get("title", ""),
-                    "mission_status": row["mission_status"],
-                    "artifact_id": row["artifact_id"],
-                    "artifact_version": row["artifact_version"],
-                    "artifact_sha256": row["artifact_sha256"],
-                    "artifact_title": artifact.get("title", ""),
-                    "artifact_kind": artifact.get("kind", "draft"),
-                    "content_withheld": bool(row["content_withheld"]),
-                    "domain_id": row["domain_id"],
-                    "state": row["state"],
-                    "decision_reason": row["decision_reason"],
-                    "decision_actor": row["decision_actor"],
-                    "decided_at": row["decided_at"],
-                    "revision": row["revision"],
-                    "created_at": row["created_at"],
-                    "updated_at": row["updated_at"],
-                })
-            except Exception:
-                corrupt.append({"id": row["id"], "domain_id": row["domain_id"], "integrity": "corrupt"})
-        return {"dataset": "api_synthetic", "items": items, "corrupt": corrupt, "next_cursor": next_cursor}
+            from source_admission import canonical_review_state, review_is_unverified_source
+            items = []
+            corrupt = []
+            scan_cursor = cursor or ""
+            has_more = False
+            while len(items) <= limit:
+                rows = connection.execute(query, (*params, scan_cursor)).fetchall()
+                if not rows:
+                    break
+                for row in rows:
+                    scan_cursor = row["id"]
+                    try:
+                        mission_doc = json.loads(row["document_json"])
+                        decision_state, decision_proven, artifact = canonical_review_state(connection, row)
+                        quarantined = review_is_unverified_source(connection, owner, row["id"])
+                        if artifact is None and not quarantined:
+                            raise ValueError("snapshot da revisão inválido")
+                        if quarantined:
+                            decision_state, decision_proven = "pending", False
+                            artifact = artifact or {"title": "Fonte retida para verificação", "kind": "evidence"}
+                        if state is not None and decision_state != state:
+                            continue
+                        items.append({
+                            "id": row["id"],
+                            "mission_id": row["mission_id"],
+                            "mission_title": mission_doc.get("title", "") if not quarantined else "Missão com fonte retida",
+                            "mission_status": row["mission_status"],
+                            "artifact_id": row["artifact_id"],
+                            "artifact_version": row["artifact_version"],
+                            "artifact_sha256": row["artifact_sha256"] if not quarantined else None,
+                            "artifact_title": artifact.get("title", "") if not quarantined else "Fonte retida para verificação",
+                            "artifact_kind": artifact.get("kind", "draft"),
+                            "content_withheld": quarantined,
+                            "classification": "unverified" if quarantined else None,
+                            "decision_state_proven": decision_proven,
+                            "domain_id": row["domain_id"],
+                            "state": decision_state,
+                            "decision_reason": row["decision_reason"] if decision_proven else None,
+                            "decision_actor": row["decision_actor"] if decision_proven else None,
+                            "decided_at": row["decided_at"] if decision_proven else None,
+                            "revision": row["revision"],
+                            "created_at": row["created_at"],
+                            "updated_at": row["updated_at"],
+                        })
+                        if len(items) > limit:
+                            has_more = True
+                            break
+                    except Exception:
+                        corrupt.append({"id": row["id"], "domain_id": row["domain_id"], "integrity": "corrupt"})
+                if has_more or len(rows) < 250:
+                    break
+            next_cursor = items[limit - 1]["id"] if has_more and len(items) > limit else None
+            return {"dataset": "api_synthetic", "items": items[:limit], "corrupt": corrupt,
+                    "next_cursor": next_cursor}
 
     def get_review(self, owner: str, review_id: str) -> dict | None:
         query = """
@@ -677,13 +697,22 @@ class MissionRepository:
             row = connection.execute(query, (owner, review_id)).fetchone()
             if row is None:
                 return None
+            from source_admission import canonical_review_state, review_is_unverified_source
+            quarantined = review_is_unverified_source(connection, owner, review_id)
             try:
                 mission_doc = json.loads(row["document_json"])
-                artifact = json.loads(row["artifact_snapshot_json"])
-                if _sha(artifact) != row["artifact_sha256"] or artifact.get("id") != row["artifact_id"]:
+                artifact = json.loads(row["artifact_snapshot_json"]) if row["artifact_snapshot_json"] else None
+                if artifact is not None and (_sha(artifact) != row["artifact_sha256"] or artifact.get("id") != row["artifact_id"]):
+                    artifact = None
+                if artifact is None and not quarantined:
                     raise ValueError("snapshot da revisão inválido")
             except Exception as exc:
                 raise MissionCorrupt(review_id) from exc
+            state, state_proven, _ = canonical_review_state(connection, row)
+            if quarantined:
+                state, state_proven = "pending", False
+                artifact = artifact or {"id": row["artifact_id"], "kind": "evidence",
+                                        "title": "Fonte retida para verificação", "content": ""}
             decisions = connection.execute(
                 """SELECT id, decision, decision_reason, actor, idempotency_key, created_at
                    FROM mission_review_decisions
@@ -691,8 +720,7 @@ class MissionRepository:
                    ORDER BY created_at ASC""",
                 (review_id, owner),
             ).fetchall()
-            from source_admission import review_is_unverified_source
-            quarantined = review_is_unverified_source(connection, owner, review_id)
+            history = [dict(d) for d in decisions] if state_proven else []
         return {
             "dataset": "api_synthetic",
             "id": row["id"],
@@ -701,19 +729,22 @@ class MissionRepository:
             "mission_status": row["mission_status"],
             "artifact_id": row["artifact_id"],
             "artifact_version": row["artifact_version"],
-            "artifact_sha256": row["artifact_sha256"],
+            "artifact_sha256": row["artifact_sha256"] if not quarantined else None,
             "artifact": ({**artifact, "content": "", "content_withheld": True}
                          if quarantined else artifact),
             "content_withheld": quarantined,
+            "classification": "unverified" if quarantined else None,
+            "decision_state_proven": state_proven,
             "domain_id": row["domain_id"],
-            "state": row["state"],
-            "decision_reason": row["decision_reason"],
-            "decision_actor": row["decision_actor"],
-            "decided_at": row["decided_at"],
+            "state": state,
+            "decision_reason": row["decision_reason"] if state_proven else None,
+            "decision_actor": row["decision_actor"] if state_proven else None,
+            "decided_at": row["decided_at"] if state_proven else None,
             "revision": row["revision"],
             "created_at": row["created_at"],
             "updated_at": row["updated_at"],
-            "history": [dict(d) for d in decisions],
+            "history": history,
+            "history_withheld": quarantined or not state_proven,
         }
 
     def decide_review(

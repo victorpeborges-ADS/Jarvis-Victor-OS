@@ -1,0 +1,7 @@
+{
+  "fixture_version": 1,
+  "state_name": "g4",
+  "max_migration": "0008_mission_executions",
+  "profile": "mission_execution",
+  "expected": {"missions": 1, "mission_events": 1, "executions": 1, "reviews": 0, "sources": 0}
+}

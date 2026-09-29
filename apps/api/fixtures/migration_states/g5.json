@@ -1,0 +1,7 @@
+{
+  "fixture_version": 1,
+  "state_name": "g5",
+  "max_migration": "0011_knowledge_decisions",
+  "profile": "local_approval_ledger",
+  "expected": {"missions": 1, "mission_events": 1, "executions": 1, "reviews": 1, "sources": 0}
+}

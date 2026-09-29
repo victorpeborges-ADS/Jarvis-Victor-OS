@@ -1,0 +1,7 @@
+{
+  "fixture_version": 1,
+  "state_name": "r3-pre-0014",
+  "max_migration": "0013_mission_idempotency_scopes",
+  "profile": "legacy_adulterated_source",
+  "expected": {"missions": 1, "mission_events": 1, "executions": 1, "reviews": 1, "sources": 1}
+}

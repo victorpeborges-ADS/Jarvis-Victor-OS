@@ -1,3 +1,4 @@
+import json
 import sqlite3
 import stat
 import subprocess
@@ -31,6 +32,9 @@ from memory_store import (
     _normalize_schema_sql,
     default_database_path,
 )
+from mission_repository import _sha
+from source_admission import canonical_review_state, reconcile_legacy_selected_sources
+from source_catalog import fixture_for
 from server_config import LocalServerConfig
 
 
@@ -116,8 +120,9 @@ def test_empty_database_migrates_once_uses_wal_and_private_permissions(tmp_path)
             ("0012_selected_synthetic_sources",),
             ("0013_mission_idempotency_scopes",),
             ("0014_curated_source_admission",),
+            ("0015_selected_source_reconciliation",),
         ]
-        for table in ("sources", "events", "event_provenance", "entities", "relations", "relation_evidence", "audit_entries", "calendar_sync_states", "calendar_sync_seen_events", "missions", "mission_events", "mission_idempotency", "mission_knowledge", "mission_artifact_reviews", "mission_review_decisions", "selected_synthetic_sources"):
+        for table in ("sources", "events", "event_provenance", "entities", "relations", "relation_evidence", "audit_entries", "calendar_sync_states", "calendar_sync_seen_events", "missions", "mission_events", "mission_idempotency", "mission_knowledge", "mission_artifact_reviews", "mission_review_decisions", "selected_synthetic_sources", "selected_source_reconciliation"):
             assert connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] == 0
 
 
@@ -160,6 +165,7 @@ def test_database_from_previous_migration_version_upgrades_without_replaying_ddl
             ("0012_selected_synthetic_sources",),
             ("0013_mission_idempotency_scopes",),
             ("0014_curated_source_admission",),
+            ("0015_selected_source_reconciliation",),
     ]
     assert "domain_id" in columns
     assert "audit_entries" in tables
@@ -700,3 +706,153 @@ def test_concurrent_same_external_identity_remains_idempotent(tmp_path):
             "SELECT COUNT(*) FROM event_provenance WHERE source_id=? AND external_ref=?",
             (source.id, "external-concurrent-singleton"),
         ).fetchone()[0] == 1
+
+
+@pytest.mark.parametrize("fixture_name", ["pre-g4", "g4", "g5", "r2-0013", "r3-pre-0014"])
+def test_r5_migration_state_fixtures_upgrade_preserving_local_records(tmp_path, fixture_name):
+    fixture_path = Path(__file__).parent / "fixtures" / "migration_states" / f"{fixture_name}.json"
+    profile = json.loads(fixture_path.read_text(encoding="utf-8"))
+    assert profile["fixture_version"] == 1
+    full_migrations = sorted(MIGRATIONS_DIR.glob("[0-9][0-9][0-9][0-9]_*.sql"))
+    previous_migrations = tmp_path / f"migrations-{fixture_name}"
+    previous_migrations.mkdir()
+    for migration in full_migrations:
+        copyfile(migration, previous_migrations / migration.name)
+        if migration.stem == profile["max_migration"]:
+            break
+    else:
+        raise AssertionError(f"fixture refers to missing migration {profile['max_migration']}")
+
+    database_path = tmp_path / fixture_name / "memory.sqlite3"
+    SQLiteMemoryStore(database_path, migrations_dir=previous_migrations).initialize()
+    owner = "owner-r5-migration-fixture"
+    mission_id = f"mission_r5_{fixture_name.replace('-', '_')}"
+    review_id = f"review_r5_{fixture_name.replace('-', '_')}"
+    artifact_id = f"artifact_r5_{fixture_name.replace('-', '_')}"
+    source_id = f"source_r5_{fixture_name.replace('-', '_')}"
+    created_at = "2026-09-27T00:00:00+00:00"
+    fixture = fixture_for("tarefas-de-exemplo")
+    assert fixture is not None
+    if profile["profile"] == "legacy_unknown_source":
+        content = "Texto local antigo sem entrada no catálogo.\n"
+        display_name = "nota-antiga.md"
+    else:
+        content = fixture["content"]
+        display_name = fixture["display_name"]
+    artifact_content = content + "prova alterada\n" if profile["profile"] == "legacy_adulterated_source" else content
+    artifact_source_id = "synthetic:selected:source-inexistente" if profile["profile"] == "legacy_adulterated_source" else f"synthetic:selected:{source_id}"
+    artifact = {
+        "id": artifact_id,
+        "kind": "evidence",
+        "title": f"Fonte sintética selecionada: {display_name}",
+        "content": artifact_content,
+        "skill_id": "selected-synthetic-file",
+        "skill_version": "1.0.0",
+        "input_digest": fixture["content_sha256"] if profile["profile"] == "legacy_adulterated_source" else _sha(artifact_content),
+        "review_state": "approved",
+        "reviewed_at": created_at,
+        "source_refs": [{"source_id": artifact_source_id, "domain_id": "dom_synthetic_a"}],
+        "created_at": created_at,
+    }
+    mission_document = {"id": mission_id, "domain_id": "dom_synthetic_a", "artifacts": [artifact]}
+
+    with sqlite3.connect(database_path) as connection:
+        connection.execute("PRAGMA foreign_keys=ON")
+        connection.execute(
+            """INSERT INTO missions(id, owner, domain_id, status, revision, document_json, dataset, created_at, updated_at)
+               VALUES (?, ?, 'dom_synthetic_a', 'pending', 2, ?, 'api_synthetic', ?, ?)""",
+            (mission_id, owner, json.dumps(mission_document, ensure_ascii=False), created_at, created_at),
+        )
+        connection.execute(
+            """INSERT INTO mission_events(id, mission_id, owner, event_type, actor, correlation_id, idempotency_key, created_at)
+               VALUES (?, ?, ?, 'mission_created', ?, ?, ?, ?)""",
+            (f"event_{fixture_name}", mission_id, owner, owner, f"corr_{fixture_name}", f"create_{fixture_name}", created_at),
+        )
+        if profile["expected"]["executions"]:
+            connection.execute(
+                """INSERT INTO mission_executions(id, mission_id, owner, task_id, phase, attempt,
+                       revision_at_start, created_at) VALUES (?, ?, ?, 'task_r5', 'committed', 1, 1, ?)""",
+                (f"execution_{fixture_name}", mission_id, owner, created_at),
+            )
+        if profile["expected"]["reviews"]:
+            snapshot = json.dumps(artifact, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+            artifact_sha = _sha(artifact)
+            connection.execute(
+                """INSERT INTO mission_artifact_reviews(id, mission_id, owner, artifact_id, artifact_version,
+                       artifact_sha256, domain_id, state, decision_actor, decided_at, revision, created_at,
+                       updated_at, artifact_snapshot_json)
+                   VALUES (?, ?, ?, ?, 1, ?, 'dom_synthetic_a', 'approved', ?, ?, 2, ?, ?, ?)""",
+                (review_id, mission_id, owner, artifact_id, artifact_sha, owner, created_at, created_at, created_at, snapshot),
+            )
+            connection.execute(
+                """INSERT INTO mission_review_decisions(id, review_id, mission_id, owner, artifact_id,
+                       artifact_version, artifact_sha256, decision, actor, idempotency_key, snapshot_json, created_at)
+                   VALUES (?, ?, ?, ?, ?, 1, ?, 'approved', ?, ?, ?, ?)""",
+                (f"decision_{fixture_name}", review_id, mission_id, owner, artifact_id, artifact_sha,
+                 owner, f"decision_{fixture_name}", snapshot, created_at),
+            )
+            knowledge_columns = {row[1] for row in connection.execute("PRAGMA table_info(mission_knowledge)")}
+            if "kind" in knowledge_columns:
+                connection.execute(
+                    """INSERT INTO mission_knowledge(id, owner, mission_id, domain_id, state, content,
+                           skill_version, created_at, kind, source_review_id)
+                       VALUES (?, ?, ?, 'dom_synthetic_a', 'staged', ?, '1.0.0', ?, 'selected_original', ?)""",
+                    (f"knowledge_{fixture_name}", owner, mission_id, content, created_at, review_id),
+                )
+            else:
+                connection.execute(
+                    """INSERT INTO mission_knowledge(id, owner, mission_id, domain_id, state, content, skill_version, created_at)
+                       VALUES (?, ?, ?, 'dom_synthetic_a', 'staged', ?, '1.0.0', ?)""",
+                    (f"knowledge_{fixture_name}", owner, mission_id, content, created_at),
+                )
+            if profile["expected"]["sources"]:
+                connection.execute(
+                    """INSERT INTO selected_synthetic_sources(id, owner, mission_id, domain_id, display_name,
+                           content_sha256, review_id, knowledge_id, idempotency_key, byte_count,
+                           classification, state, selected_at)
+                       VALUES (?, ?, ?, 'dom_synthetic_a', ?, ?, ?, ?, ?, ?, 'synthetic_test_only', 'selected', ?)""",
+                    (source_id, owner, mission_id, display_name, _sha(content), review_id,
+                     f"knowledge_{fixture_name}", f"source-key_{fixture_name}", len(content.encode("utf-8")), created_at),
+                )
+
+    with sqlite3.connect(database_path) as connection:
+        before = {
+            "missions": connection.execute("SELECT COUNT(*) FROM missions").fetchone()[0],
+            "mission_events": connection.execute("SELECT COUNT(*) FROM mission_events").fetchone()[0],
+            "executions": connection.execute("SELECT COUNT(*) FROM mission_executions").fetchone()[0]
+            if profile["expected"]["executions"] else 0,
+            "reviews": connection.execute("SELECT COUNT(*) FROM mission_artifact_reviews").fetchone()[0]
+            if profile["expected"]["reviews"] else 0,
+            "sources": connection.execute("SELECT COUNT(*) FROM selected_synthetic_sources").fetchone()[0]
+            if profile["expected"]["sources"] else 0,
+        }
+    assert before == profile["expected"]
+
+    store = SQLiteMemoryStore(database_path)
+    store.initialize()
+    assert reconcile_legacy_selected_sources(store) == 0
+    with store.transaction() as connection:
+        after = {
+            "missions": connection.execute("SELECT COUNT(*) FROM missions").fetchone()[0],
+            "mission_events": connection.execute("SELECT COUNT(*) FROM mission_events").fetchone()[0],
+            "executions": connection.execute("SELECT COUNT(*) FROM mission_executions").fetchone()[0],
+            "reviews": connection.execute("SELECT COUNT(*) FROM mission_artifact_reviews").fetchone()[0],
+            "sources": connection.execute("SELECT COUNT(*) FROM selected_synthetic_sources").fetchone()[0],
+        }
+        versions = connection.execute("SELECT version FROM schema_migrations ORDER BY version").fetchall()
+        assert [row[0] for row in versions] == [migration.stem for migration in full_migrations]
+        assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
+        assert connection.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+        if profile["expected"]["sources"]:
+            source = connection.execute("SELECT classification, state, fixture_id FROM selected_synthetic_sources WHERE id=?", (source_id,)).fetchone()
+            assert tuple(source) == ("unverified", "quarantined", None)
+        review = connection.execute("SELECT * FROM mission_artifact_reviews WHERE id=?", (review_id,)).fetchone() if profile["expected"]["reviews"] else None
+        if review is not None:
+            connection.row_factory = sqlite3.Row
+            review = connection.execute("SELECT * FROM mission_artifact_reviews WHERE id=?", (review_id,)).fetchone()
+            state, valid, _ = canonical_review_state(connection, review)
+            assert (state, valid) == ("approved", True)
+    assert after == {key: value for key, value in profile["expected"].items()}
+
+    store.initialize()
+    assert reconcile_legacy_selected_sources(store) == 0

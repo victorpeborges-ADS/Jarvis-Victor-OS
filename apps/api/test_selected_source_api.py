@@ -188,7 +188,7 @@ def test_selected_original_cannot_diverge_from_approved_artifact_snapshot(client
         con.execute("UPDATE mission_knowledge SET content='texto divergente' WHERE id=?", (knowledge["id"],))
     bundle = client.get(f"/real/knowledge/context/{mission_id}", headers={"origin": ORIGIN}).json()
     assert bundle["included"] == []
-    assert bundle["omitted"][0]["reason"] == "integridade"
+    assert bundle["omitted"][0]["reason"] == "fonte_em_quarentena"
 
 
 def test_selected_fixture_review_cannot_be_revised_into_unverified_content(client):
@@ -279,7 +279,7 @@ def test_migration_preserves_unknown_sources_and_reconciles_only_byte_exact_fixt
     old_dir = tmp_path / "migrations-0013"
     old_dir.mkdir()
     for migration in sorted(MIGRATIONS_DIR.glob("[0-9][0-9][0-9][0-9]_*.sql")):
-        if migration.stem != "0014_curated_source_admission":
+        if migration.stem not in {"0014_curated_source_admission", "0015_selected_source_reconciliation"}:
             copyfile(migration, old_dir / migration.name)
     db_path = tmp_path / "private" / "legacy.sqlite3"
     old_store = SQLiteMemoryStore(db_path, migrations_dir=old_dir)
@@ -298,15 +298,17 @@ def test_migration_preserves_unknown_sources_and_reconciles_only_byte_exact_fixt
     with sqlite3.connect(db_path) as con:
         con.execute("PRAGMA foreign_keys=ON")
         con.execute("""INSERT INTO missions(id, owner, domain_id, status, revision, document_json, dataset, created_at, updated_at)
-                       VALUES (?, ?, 'dom_synthetic_a', 'pending', 1, '{}', 'api_synthetic', ?, ?)""",
-                    (mission_id, owner, now, now))
+                       VALUES (?, ?, 'dom_synthetic_a', 'pending', 1, ?, 'api_synthetic', ?, ?)""",
+                    (mission_id, owner, json.dumps({"id": mission_id, "domain_id": "dom_synthetic_a", "artifacts": []}), now, now))
         for source_id, knowledge_id, review_id, artifact_id, display_name, content in records:
             digest = hashlib.sha256(content.encode()).hexdigest()
             artifact = {
-                "id": artifact_id, "kind": "evidence", "title": f"Fonte: {display_name}",
+                "id": artifact_id, "kind": "evidence",
+                "title": f"Fonte sintética selecionada: {display_name}" if display_name == fixture["display_name"] else f"Fonte: {display_name}",
                 "content": content, "skill_id": "selected-synthetic-file", "skill_version": "1.0.0",
                 "input_digest": digest, "review_state": "draft", "reviewed_at": None,
-                "source_refs": [{"source_id": f"synthetic:selected:{source_id}"}], "created_at": now,
+                "source_refs": [{"source_id": f"synthetic:selected:{source_id}", "domain_id": "dom_synthetic_a"}],
+                "created_at": now,
             }
             artifact_json = json.dumps(artifact, ensure_ascii=False)
             artifact_sha = _sha(artifact)
@@ -325,6 +327,10 @@ def test_migration_preserves_unknown_sources_and_reconciles_only_byte_exact_fixt
                            VALUES (?, ?, ?, 'dom_synthetic_a', ?, ?, ?, ?, ?, ?, 'synthetic_test_only', 'selected', ?)""",
                         (source_id, owner, mission_id, display_name, digest, review_id, knowledge_id,
                          f"legacy-{source_id}", len(content.encode()), now))
+            current = json.loads(con.execute("SELECT document_json FROM missions WHERE id=?", (mission_id,)).fetchone()[0])
+            current.setdefault("artifacts", []).append(artifact)
+            con.execute("UPDATE missions SET document_json=? WHERE id=? AND owner=?",
+                        (json.dumps(current, ensure_ascii=False), mission_id, owner))
     store = SQLiteMemoryStore(db_path)
     store.initialize()
     with store.transaction() as connection:
@@ -370,7 +376,7 @@ def test_unverified_legacy_source_is_quarantined_from_reads_reviews_and_context(
     assert review["artifact"]["content"] == ""
     mission = client.get(f"/real/missions/{mission_id}", headers={"origin": ORIGIN}).json()["mission"]
     assert next(item for item in mission["artifacts"] if item["id"] == review["artifact_id"])["content"] == ""
-    decision = {"decision": "approved", "expected_content_sha256": knowledge["content_sha256"],
+    decision = {"decision": "approved", "expected_content_sha256": hashlib.sha256(_fixture_content().encode()).hexdigest(),
                 "idempotency_key": "quarantined-knowledge-approval"}
     assert client.post(f"/real/knowledge/{knowledge['id']}/decide", headers=_headers(csrf), json=decision).status_code == 409
     decision_review = client.post(f"/real/reviews/{source['review_id']}/decide", headers=_headers(csrf), json={
