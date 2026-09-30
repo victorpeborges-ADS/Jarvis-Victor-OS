@@ -28,6 +28,9 @@ describe("Agora — jornada 1: entender o dia em 5s", () => {
   it("exibe alerta de fonte desatualizada e sinalização de demonstração", () => {
     render(<AgoraPage />);
     expect(screen.getAllByText(/Demonstração/i).length).toBeGreaterThan(0);
+    expect(screen.getByText(/Demonstração · São Paulo/i)).toBeInTheDocument();
+    expect(screen.getByText(/Horário de Brasília/i)).toBeInTheDocument();
+    expect(document.body.textContent).not.toContain("America/Sao_Paulo");
     expect(screen.getByText(/Dados possivelmente desatualizados/i)).toBeInTheDocument();
   });
 

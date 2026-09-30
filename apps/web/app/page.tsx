@@ -40,7 +40,7 @@ export default function AgoraPage() {
           </p>
         </div>
         <div className="flex flex-col items-end gap-1.5">
-          <Badge tone="amber">Demonstração · {fixtures.meta.timezone}</Badge>
+          <Badge tone="amber">Demonstração · São Paulo</Badge>
           <span className="text-xs text-ink-faint" title="Horário de referência dos dados de exemplo">
             Horário de referência: {formatTimeH(DEMO_NOW)}
           </span>
@@ -183,7 +183,7 @@ export default function AgoraPage() {
         </div>
 
         <div className="mt-4 rounded-xl bg-paper-muted px-3 py-2 text-xs text-ink-subtle">
-          Fuso America/Sao_Paulo · {commitments.length} compromissos · {messages.length} mensagens · exemplo {formatTimeH(DEMO_NOW)}
+          Horário de Brasília · {commitments.length} compromissos · {messages.length} mensagens · exemplo {formatTimeH(DEMO_NOW)}
         </div>
       </Card>
 
