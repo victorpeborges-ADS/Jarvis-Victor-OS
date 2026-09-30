@@ -1,4 +1,6 @@
 import { expect, test, type Page } from "@playwright/test";
+import { mkdirSync } from "node:fs";
+import { resolve } from "node:path";
 
 const passphrase = process.env.JARVIS_E2E_PASSPHRASE;
 const apiOrigin = process.env.JARVIS_E2E_API_ORIGIN ?? "http://127.0.0.1:8000";
@@ -187,4 +189,58 @@ test("G6 UI: fixture curada entra somente após duas aprovações", async ({ pag
   await expect(knowledge).toContainText("Aprovado para contexto");
   await mission.getByRole("button", { name: "Ver contexto autorizado" }).click();
   await expect(page.getByTestId("context-bundle")).toContainText(fixtureContent);
+});
+
+test("R6.1 UI: kind sem proveniência confirmada fica retido", async ({ page }, testInfo) => {
+  const title = `Origem retida R6.1 ${Date.now()}`;
+  const { missionId } = await setupReview(page, title);
+  const untrustedBytes = "UNTRUSTED_R6_AUDIT_KNOWLEDGE_BYTES";
+  const api = new URL(apiOrigin);
+  await page.route(
+    (url) => url.origin === api.origin && url.pathname === "/real/knowledge",
+    async (route) => route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({
+        dataset: "api_synthetic",
+        items: [{
+          id: "knowledge-unverified-r61-ui",
+          mission_id: missionId,
+          domain_id: "dom_synthetic_a",
+          content: untrustedBytes,
+          kind: "skill_derived",
+          origin_type: null,
+          origin_verified: false,
+          content_sha256: null,
+          state: "quarantined",
+          content_withheld: true,
+          classification: "unverified",
+          can_approve: false,
+          can_use_context: false,
+          can_feed_skill: false,
+          source_review_id: null,
+          created_at: new Date().toISOString(),
+        }],
+      }),
+    }),
+  );
+  await page.goto("/missoes");
+  await page.getByTestId("mission-api-open").click();
+  await page.getByRole("button", { name: "Ler missões da API" }).click();
+  const card = page.getByTestId("knowledge-card").filter({ hasText: missionId });
+  await expect(card).toContainText("Origem não verificada");
+  await expect(card).toContainText("Conteúdo retido");
+  await expect(card).not.toContainText(untrustedBytes);
+  await expect(card).not.toContainText("Derivação sintética");
+  await expect(card.getByRole("button", { name: "Aprovar conhecimento" })).toHaveCount(0);
+
+  const evidenceDir = process.env.JARVIS_E2E_SCREENSHOT_DIR;
+  if (evidenceDir) {
+    mkdirSync(evidenceDir, { recursive: true });
+    await page.screenshot({
+      path: resolve(evidenceDir, `R6_1_KNOWLEDGE_QUARANTINED_${testInfo.project.name}.png`),
+      fullPage: true,
+      animations: "disabled",
+    });
+  }
 });

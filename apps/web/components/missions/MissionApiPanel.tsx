@@ -5,15 +5,17 @@ import { Dialog } from "@/components/ui/Dialog";
 import { Badge, Button, Card } from "@/components/ui/primitives";
 import { LocalApiError, localApiRequest, type LocalGrant, type LocalSession } from "@/lib/local-api";
 import type { Artifact, Mission, MissionRecord } from "@/lib/mission-contracts";
+import { knowledgeOriginLabel, type KnowledgeOriginType } from "@/lib/knowledge-origin";
 import { planMissionImport } from "@/lib/mission-import";
 import { loadMissions, MISSION_STORAGE_KEY } from "@/lib/mission-store";
 
 type Listed = { dataset: "api_synthetic"; items: Array<MissionRecord & { available_actions?: string[] }>; next_cursor: string | null };
 type KnowledgeItem = {
   id: string; mission_id: string; domain_id: string; content: string;
-  kind: "skill_derived" | "selected_original";
-  content_sha256: string; state: "staged" | "approved" | "rejected" | "quarantined";
+  kind: string | null; origin_type: KnowledgeOriginType; origin_verified: boolean;
+  content_sha256: string | null; state: "staged" | "approved" | "rejected" | "quarantined";
   content_withheld?: boolean; classification?: string;
+  can_approve: boolean; can_use_context: boolean; can_feed_skill: boolean;
   source_review_id: string | null; created_at: string;
 };
 type SourceFixture = {
@@ -87,7 +89,7 @@ export function MissionApiPanel() {
   const decisionAttempts = useRef(new Map<string, string>());
   const knowledgeAttempts = useRef(new Map<string, string>());
   const [knowledge, setKnowledge] = useState<KnowledgeItem[]>([]);
-  const [knowledgeNotice, setKnowledgeNotice] = useState("Conhecimento derivado permanece em preparação até revisão humana separada.");
+  const [knowledgeNotice, setKnowledgeNotice] = useState("Registros de conhecimento só entram no contexto após verificação e aprovação próprias.");
   const [contextBundle, setContextBundle] = useState<ContextBundle | null>(null);
   const [sourceFixtures, setSourceFixtures] = useState<SourceFixture[]>([]);
   const [selectedFixtureId, setSelectedFixtureId] = useState("");
@@ -171,6 +173,7 @@ export function MissionApiPanel() {
   }
 
   async function decideKnowledge(item: KnowledgeItem) {
+    if (!item.can_approve || !item.origin_verified || !item.content_sha256) return;
     setBusy(true);
     try {
       const session = await localApiRequest<LocalSession>("/real/session");
@@ -543,16 +546,19 @@ export function MissionApiPanel() {
           <Button type="button" variant="outline" disabled={busy} onClick={() => void loadKnowledge()}>Atualizar conhecimento</Button>
         </div>
         <p className="mt-2 text-sm text-ink-subtle" role="status">{knowledgeNotice}</p>
-        {knowledge.length === 0 ? <p className="mt-2 text-sm text-ink-faint">Nenhum conhecimento derivado disponível neste escopo.</p> : (
+        {knowledge.length === 0 ? <p className="mt-2 text-sm text-ink-faint">Nenhum conhecimento disponível neste escopo.</p> : (
           <ul className="mt-3 space-y-2">
             {knowledge.map((item) => (
               <li key={item.id} className="rounded-xl border border-paper-border p-3 text-sm" data-testid="knowledge-card">
                 <div className="flex flex-wrap items-center justify-between gap-2">
-                  <strong>{item.state === "staged" ? "Aguardando revisão" : item.state === "approved" ? "Aprovado para contexto" : item.state === "quarantined" ? "Fonte em quarentena" : "Rejeitado"}</strong>
-                  {item.state === "staged" && <Button type="button" size="sm" disabled={busy} onClick={() => void decideKnowledge(item)}>Aprovar conhecimento</Button>}
+                  <strong>{item.state === "staged" ? "Aguardando revisão" : item.state === "approved" ? "Aprovado para contexto" : item.state === "quarantined" ? "Origem não verificada" : "Rejeitado"}</strong>
+                  {item.can_approve && <Button type="button" size="sm" disabled={busy} onClick={() => void decideKnowledge(item)}>Aprovar conhecimento</Button>}
                 </div>
-                {item.content_withheld ? <p className="mt-1 text-sm text-ink-subtle">Conteúdo retido enquanto a proveniência permanece sem verificação.</p> : <p className="mt-1 whitespace-pre-wrap text-ink">{item.content}</p>}
-                <p className="mt-1 text-xs text-ink-faint">{item.kind === "selected_original" ? "Fixture sintética selecionada" : "Derivação sintética"} · Missão {item.mission_id} · Domínio {item.domain_id} · SHA-256 {item.content_sha256.slice(0, 16)}…</p>
+                {item.content_withheld ? <p className="mt-1 text-sm text-ink-subtle">Conteúdo retido enquanto a origem não puder ser verificada.</p> : <p className="mt-1 whitespace-pre-wrap text-ink">{item.content}</p>}
+                <p className="mt-1 text-xs text-ink-faint">
+                  {knowledgeOriginLabel(item.origin_verified, item.origin_type)} · Missão {item.mission_id} · Domínio {item.domain_id}
+                  {item.origin_verified && item.content_sha256 ? ` · SHA-256 ${item.content_sha256.slice(0, 16)}…` : ""}
+                </p>
               </li>
             ))}
           </ul>
