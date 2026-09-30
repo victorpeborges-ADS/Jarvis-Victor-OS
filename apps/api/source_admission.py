@@ -61,6 +61,20 @@ class SourceProof:
     artifact: dict | None = None
 
 
+@dataclass(frozen=True)
+class TrustedSourceProjection:
+    """One projection for selected-source trust across every read surface.
+
+    ``applicable`` distinguishes ordinary artifacts from records that claim or
+    are relationally connected to a selected source. A connected-but-invalid
+    source is applicable and untrusted, so callers must withhold its content.
+    """
+
+    applicable: bool
+    trusted: bool
+    proof: SourceProof | None = None
+
+
 def _source_rows(connection, source_id: str, owner: str):
     source = connection.execute(
         "SELECT * FROM selected_synthetic_sources WHERE id=? AND owner=?",
@@ -130,11 +144,11 @@ def _linked_snapshot_proof(connection, source, owner: str, fixture: dict):
         return None
     expected_ref = f"synthetic:selected:{source['id']}"
     refs = snapshot.get("source_refs")
-    if not isinstance(refs, list) or not any(
-        isinstance(ref, dict) and ref.get("source_id") == expected_ref
-        and ref.get("domain_id") == source["domain_id"]
-        for ref in refs
-    ):
+    selected_refs = [ref for ref in refs if isinstance(ref, dict)
+                     and isinstance(ref.get("source_id"), str)
+                     and ref["source_id"].startswith("synthetic:selected:")] if isinstance(refs, list) else []
+    if (len(selected_refs) != 1 or selected_refs[0].get("source_id") != expected_ref
+            or selected_refs[0].get("domain_id") != source["domain_id"]):
         return None
     if (
         snapshot.get("id") != review["artifact_id"]
@@ -178,6 +192,191 @@ def prove_source(connection, source_or_id, owner: str, mission_id: str | None = 
     mission, knowledge, review, snapshot, artifact = links
     return SourceProof(True, source=source, fixture=fixture, knowledge=knowledge,
                        review=review, mission=mission, artifact=artifact)
+
+
+def _selected_source_ref_ids(artifact: dict | None) -> list[str]:
+    if not isinstance(artifact, dict):
+        return []
+    refs = artifact.get("source_refs")
+    if not isinstance(refs, list):
+        return []
+    prefix = "synthetic:selected:"
+    return [ref["source_id"][len(prefix):] for ref in refs
+            if isinstance(ref, dict) and isinstance(ref.get("source_id"), str)
+            and ref["source_id"].startswith(prefix)]
+
+
+def resolve_trusted_source_projection(
+    connection,
+    owner: str,
+    mission_id: str | None = None,
+    *,
+    source_id: str | None = None,
+    artifact: dict | None = None,
+    knowledge=None,
+    review_id: str | None = None,
+) -> TrustedSourceProjection:
+    """Resolve a single source identity and the full canonical relation chain.
+
+    Candidate discovery is deliberately owner-unscoped: a mismatched owner or
+    relation must be detected and withheld, not disappear from the query and
+    leave a source-backed artifact looking ordinary. Values discovered here
+    are never returned by the public projection unless every edge is proved.
+    """
+    candidates: dict[str, object] = {}
+    evidence_artifacts: list[dict] = [artifact] if isinstance(artifact, dict) else []
+    applicable = source_id is not None
+
+    def add_rows(rows) -> None:
+        nonlocal applicable
+        for row in rows:
+            candidates[row["id"]] = row
+            applicable = True
+
+    def add_by_id(candidate_id: str) -> None:
+        row = connection.execute(
+            "SELECT * FROM selected_synthetic_sources WHERE id=?", (candidate_id,),
+        ).fetchone()
+        if row is not None:
+            candidates[row["id"]] = row
+
+    def add_artifact_relations(item: dict, item_mission_id: str | None) -> None:
+        nonlocal applicable
+        ref_ids = _selected_source_ref_ids(item)
+        if item.get("skill_id") == "selected-synthetic-file" or ref_ids:
+            applicable = True
+        for ref_id in ref_ids:
+            add_by_id(ref_id)
+        item_id = item.get("id")
+        if item_mission_id and isinstance(item_id, str):
+            add_rows(connection.execute(
+                """SELECT DISTINCT s.* FROM selected_synthetic_sources s
+                   JOIN mission_artifact_reviews r ON r.id=s.review_id
+                   WHERE r.mission_id=? AND r.artifact_id=?""",
+                (item_mission_id, item_id),
+            ).fetchall())
+
+    if source_id is not None:
+        add_by_id(source_id)
+    for item in evidence_artifacts:
+        add_artifact_relations(item, mission_id)
+
+    if knowledge is not None:
+        if _value(knowledge, "kind") == "selected_original":
+            applicable = True
+        knowledge_id = _value(knowledge, "id")
+        if isinstance(knowledge_id, str):
+            add_rows(connection.execute(
+                "SELECT * FROM selected_synthetic_sources WHERE knowledge_id=?",
+                (knowledge_id,),
+            ).fetchall())
+            decision_links = connection.execute(
+                "SELECT source_review_id FROM mission_knowledge_decisions WHERE knowledge_id=?",
+                (knowledge_id,),
+            ).fetchall()
+            for link in decision_links:
+                linked_review_id = link["source_review_id"]
+                if linked_review_id:
+                    add_rows(connection.execute(
+                        "SELECT * FROM selected_synthetic_sources WHERE review_id=?",
+                        (linked_review_id,),
+                    ).fetchall())
+        linked_review_id = _value(knowledge, "source_review_id")
+        if isinstance(linked_review_id, str):
+            add_rows(connection.execute(
+                "SELECT * FROM selected_synthetic_sources WHERE review_id=?",
+                (linked_review_id,),
+            ).fetchall())
+        knowledge_content = _value(knowledge, "content")
+        knowledge_mission = _value(knowledge, "mission_id")
+        if isinstance(knowledge_content, str) and isinstance(knowledge_mission, str):
+            add_rows(connection.execute(
+                "SELECT * FROM selected_synthetic_sources WHERE mission_id=? AND content_sha256=?",
+                (knowledge_mission, _sha_text(knowledge_content)),
+            ).fetchall())
+
+    target_review = None
+    if review_id is not None:
+        target_review = connection.execute(
+            "SELECT * FROM mission_artifact_reviews WHERE id=?", (review_id,),
+        ).fetchone()
+        add_rows(connection.execute(
+            "SELECT * FROM selected_synthetic_sources WHERE review_id=?", (review_id,),
+        ).fetchall())
+        if target_review is not None:
+            mission_id = mission_id or target_review["mission_id"]
+            snapshot = _json_object(target_review["artifact_snapshot_json"])
+            if snapshot is not None:
+                evidence_artifacts.append(snapshot)
+                add_artifact_relations(snapshot, target_review["mission_id"])
+            base_sources = connection.execute(
+                """SELECT DISTINCT s.* FROM selected_synthetic_sources s
+                   JOIN mission_artifact_reviews base ON base.id=s.review_id
+                   WHERE base.mission_id=? AND base.artifact_id=?""",
+                (target_review["mission_id"], target_review["artifact_id"]),
+            ).fetchall()
+            add_rows(base_sources)
+            mission_row = connection.execute(
+                "SELECT document_json FROM missions WHERE id=?",
+                (target_review["mission_id"],),
+            ).fetchone()
+            mission_doc = _json_object(mission_row["document_json"]) if mission_row else None
+            artifacts = mission_doc.get("artifacts", []) if mission_doc else []
+            current = next((item for item in artifacts if isinstance(item, dict)
+                            and item.get("id") == target_review["artifact_id"]), None)
+            if current is not None:
+                evidence_artifacts.append(current)
+                add_artifact_relations(current, target_review["mission_id"])
+
+    if not applicable:
+        return TrustedSourceProjection(applicable=False, trusted=False)
+    if len(candidates) != 1:
+        return TrustedSourceProjection(applicable=True, trusted=False)
+
+    selected_id, selected_row = next(iter(candidates.items()))
+    if source_id is not None and selected_id != source_id:
+        return TrustedSourceProjection(applicable=True, trusted=False)
+    mission_id = mission_id or _value(selected_row, "mission_id")
+    proof = prove_source(connection, selected_id, owner, mission_id)
+    if not proof.trusted or proof.review is None:
+        return TrustedSourceProjection(applicable=True, trusted=False, proof=proof)
+
+    # Every selected-source marker in every observed copy must identify the
+    # same row. This catches a stale snapshot/current document split as well
+    # as the combined owner + artifact-ref corruption from the R5 audit.
+    for item in evidence_artifacts:
+        refs = _selected_source_ref_ids(item)
+        if item.get("skill_id") == "selected-synthetic-file" or refs:
+            if refs != [selected_id]:
+                return TrustedSourceProjection(applicable=True, trusted=False, proof=proof)
+            if (proof.artifact is None or item.get("id") != proof.artifact.get("id")
+                    or _artifact_payload(item) != _artifact_payload(proof.artifact)):
+                return TrustedSourceProjection(applicable=True, trusted=False, proof=proof)
+
+    _, review_valid, _ = canonical_review_state(connection, proof.review)
+    if not review_valid:
+        return TrustedSourceProjection(applicable=True, trusted=False, proof=proof)
+    if knowledge is not None and (
+        proof.knowledge is None
+        or _value(knowledge, "id") != proof.knowledge["id"]
+        or _value(knowledge, "owner") != owner
+        or _value(knowledge, "mission_id") != mission_id
+        or _value(knowledge, "domain_id") != proof.knowledge["domain_id"]
+        or _value(knowledge, "source_review_id") != proof.review["id"]
+        or _value(knowledge, "content") != proof.fixture["content"]
+    ):
+        return TrustedSourceProjection(applicable=True, trusted=False, proof=proof)
+    if target_review is not None and (
+        proof.review["id"] != target_review["id"]
+        or proof.review["owner"] != owner
+        or proof.review["mission_id"] != target_review["mission_id"]
+        or proof.review["domain_id"] != target_review["domain_id"]
+        or proof.review["artifact_id"] != target_review["artifact_id"]
+        or proof.review["artifact_version"] != target_review["artifact_version"]
+        or proof.review["artifact_sha256"] != target_review["artifact_sha256"]
+    ):
+        return TrustedSourceProjection(applicable=True, trusted=False, proof=proof)
+    return TrustedSourceProjection(applicable=True, trusted=True, proof=proof)
 
 
 def source_matches_fixture(source, fixture: dict, content: str) -> bool:
@@ -324,6 +523,14 @@ def knowledge_source_review(connection, knowledge):
 
 def canonical_knowledge_decision(connection, knowledge, decision=None) -> tuple[str, bool, object | None]:
     """Check knowledge ledger bindings and the approved artifact version before use."""
+    projection = resolve_trusted_source_projection(
+        connection, _value(knowledge, "owner", ""), _value(knowledge, "mission_id"),
+        knowledge=knowledge,
+    )
+    if projection.applicable and not projection.trusted:
+        return "quarantined", False, None
+    if _value(knowledge, "kind") == "selected_original" and not projection.trusted:
+        return "quarantined", False, None
     if decision is None:
         decision = connection.execute(
             "SELECT * FROM mission_knowledge_decisions WHERE knowledge_id=? AND owner=?",
@@ -342,15 +549,6 @@ def canonical_knowledge_decision(connection, knowledge, decision=None) -> tuple[
             or not decision["idempotency_key"]
         ):
             return "quarantined", False, decision
-        if knowledge["kind"] == "selected_original":
-            source = connection.execute(
-                "SELECT id FROM selected_synthetic_sources WHERE owner=? AND mission_id=? AND knowledge_id=?",
-                (knowledge["owner"], knowledge["mission_id"], knowledge["id"]),
-            ).fetchone()
-            if source is None or not prove_source(
-                connection, source["id"], knowledge["owner"], knowledge["mission_id"]
-            ).trusted:
-                return "quarantined", False, decision
         review = knowledge_source_review(connection, knowledge)
         if review is None:
             if decision["source_review_id"] is not None or decision["source_artifact_sha256"] is not None:
@@ -370,78 +568,43 @@ def canonical_knowledge_decision(connection, knowledge, decision=None) -> tuple[
 
 
 def verified_source_for_knowledge(connection, knowledge, owner: str | None = None) -> bool:
-    if _value(knowledge, "kind") != "selected_original":
-        return True
     owner = owner or _value(knowledge, "owner")
     if not owner:
         return False
-    source = connection.execute(
-        "SELECT id FROM selected_synthetic_sources WHERE owner=? AND mission_id=? AND knowledge_id=?",
-        (owner, _value(knowledge, "mission_id"), _value(knowledge, "id")),
-    ).fetchone()
-    return bool(source and prove_source(connection, source["id"], owner,
-                                        _value(knowledge, "mission_id")).trusted)
+    projection = resolve_trusted_source_projection(
+        connection, owner, _value(knowledge, "mission_id"), knowledge=knowledge,
+    )
+    if projection.applicable:
+        return projection.trusted
+    return _value(knowledge, "kind") != "selected_original"
 
 
 def review_is_unverified_source(connection, owner: str, review_id: str) -> bool:
-    target = connection.execute(
-        "SELECT * FROM mission_artifact_reviews WHERE owner=? AND id=?",
-        (owner, review_id),
-    ).fetchone()
-    if target is None:
-        return False
-    sources = connection.execute(
-        """SELECT s.* FROM selected_synthetic_sources s
-           JOIN mission_artifact_reviews base ON base.id=s.review_id AND base.owner=s.owner
-           WHERE s.owner=? AND base.mission_id=? AND base.artifact_id=?""",
-        (owner, target["mission_id"], target["artifact_id"]),
-    ).fetchall()
-    if sources and (target["artifact_version"] != 1 or any(
-        not prove_source(connection, source["id"], owner, target["mission_id"]).trusted
-        for source in sources
-    )):
-        return True
-    snapshot = _json_object(target["artifact_snapshot_json"])
-    refs = snapshot.get("source_refs", []) if snapshot else []
-    for ref in refs if isinstance(refs, list) else []:
-        if isinstance(ref, dict) and isinstance(ref.get("source_id"), str):
-            prefix = "synthetic:selected:"
-            if ref["source_id"].startswith(prefix) and not prove_source(
-                connection, ref["source_id"][len(prefix):], owner, target["mission_id"]
-            ).trusted:
-                return True
-    return False
+    projection = resolve_trusted_source_projection(connection, owner, review_id=review_id)
+    return projection.applicable and not projection.trusted
 
 
 def is_selected_source_artifact(connection, owner: str, review_id: str) -> bool:
-    linked = connection.execute(
-        """SELECT 1 FROM mission_artifact_reviews target
-           JOIN mission_artifact_reviews base ON base.mission_id=target.mission_id
-             AND base.artifact_id=target.artifact_id AND base.artifact_version=1
-           JOIN selected_synthetic_sources s ON s.review_id=base.id AND s.owner=base.owner
-           WHERE target.owner=? AND target.id=? LIMIT 1""",
-        (owner, review_id),
-    ).fetchone() is not None
-    if linked:
-        return True
-    review = connection.execute(
-        "SELECT artifact_snapshot_json FROM mission_artifact_reviews WHERE owner=? AND id=?",
-        (owner, review_id),
-    ).fetchone()
-    snapshot = _json_object(review["artifact_snapshot_json"]) if review else None
-    return _source_id_from_artifact(snapshot or {}) is not None
+    return resolve_trusted_source_projection(
+        connection, owner, review_id=review_id,
+    ).applicable
 
 
-def _source_id_from_artifact(artifact: dict) -> str | None:
-    refs = artifact.get("source_refs")
-    if not isinstance(refs, list):
-        return None
-    for ref in refs:
-        if isinstance(ref, dict) and isinstance(ref.get("source_id"), str):
-            prefix = "synthetic:selected:"
-            if ref["source_id"].startswith(prefix):
-                return ref["source_id"][len(prefix):]
-    return None
+def redact_untrusted_source_artifact(artifact: dict) -> dict:
+    """Keep only a safe placeholder when a selected-source chain is incomplete."""
+    safe = dict(artifact)
+    safe["content"] = ""
+    safe["content_withheld"] = True
+    safe["title"] = "Fonte retida para verificação"
+    safe["source_refs"] = []
+    safe["review_state"] = "draft"
+    safe["reviewed_at"] = None
+    safe["source_state"] = "quarantined"
+    for key in ("input_digest", "fixture_id", "catalog_id", "catalog_version",
+                "fixture_sha256", "content_sha256", "provenance", "classification",
+                "selection_state", "skill_id"):
+        safe.pop(key, None)
+    return safe
 
 
 def redact_mission_record(connection, record: dict) -> dict:
@@ -453,17 +616,6 @@ def redact_mission_record(connection, record: dict) -> dict:
     mission_id = mission.get("id")
     safe_mission = dict(mission)
     safe_artifacts = []
-    quarantined_artifact_ids = set()
-    if owner and mission_id:
-        linked_sources = connection.execute(
-            """SELECT s.id, r.artifact_id FROM selected_synthetic_sources s
-               LEFT JOIN mission_artifact_reviews r ON r.id=s.review_id AND r.owner=s.owner
-               WHERE s.owner=? AND s.mission_id=?""",
-            (owner, mission_id),
-        ).fetchall()
-        for linked in linked_sources:
-            if not prove_source(connection, linked["id"], owner, mission_id).trusted and linked["artifact_id"]:
-                quarantined_artifact_ids.add(linked["artifact_id"])
     for artifact in mission.get("artifacts", []):
         if not isinstance(artifact, dict):
             continue
@@ -474,16 +626,11 @@ def redact_mission_record(connection, record: dict) -> dict:
         safe["review_state"] = state
         if not state_proven or state == "draft":
             safe["reviewed_at"] = None
-        source_id = _source_id_from_artifact(artifact)
-        source_untrusted = bool(source_id and (
-            not owner or not prove_source(connection, source_id, owner, mission_id).trusted
-        ))
-        if safe.get("id") in quarantined_artifact_ids or source_untrusted:
-            safe["content"] = ""
-            safe["content_withheld"] = True
-            safe["source_state"] = "quarantined"
-            safe["review_state"] = "draft"
-            safe["reviewed_at"] = None
+        projection = resolve_trusted_source_projection(
+            connection, owner or "", mission_id, artifact=artifact,
+        )
+        if projection.applicable and not projection.trusted:
+            safe = redact_untrusted_source_artifact(safe)
         safe_artifacts.append(safe)
     safe_mission["artifacts"] = safe_artifacts
     result["mission"] = safe_mission

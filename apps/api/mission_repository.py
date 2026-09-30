@@ -631,7 +631,10 @@ class MissionRepository:
             ORDER BY r.id ASC LIMIT 250
         """
         with self.store.transaction() as connection:
-            from source_admission import canonical_review_state, review_is_unverified_source
+            from source_admission import (
+                canonical_review_state, redact_untrusted_source_artifact,
+                review_is_unverified_source,
+            )
             items = []
             corrupt = []
             scan_cursor = cursor or ""
@@ -697,7 +700,10 @@ class MissionRepository:
             row = connection.execute(query, (owner, review_id)).fetchone()
             if row is None:
                 return None
-            from source_admission import canonical_review_state, review_is_unverified_source
+            from source_admission import (
+                canonical_review_state, redact_untrusted_source_artifact,
+                review_is_unverified_source,
+            )
             quarantined = review_is_unverified_source(connection, owner, review_id)
             try:
                 mission_doc = json.loads(row["document_json"])
@@ -730,7 +736,7 @@ class MissionRepository:
             "artifact_id": row["artifact_id"],
             "artifact_version": row["artifact_version"],
             "artifact_sha256": row["artifact_sha256"] if not quarantined else None,
-            "artifact": ({**artifact, "content": "", "content_withheld": True}
+            "artifact": (redact_untrusted_source_artifact(artifact)
                          if quarantined else artifact),
             "content_withheld": quarantined,
             "classification": "unverified" if quarantined else None,

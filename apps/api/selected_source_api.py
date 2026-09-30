@@ -9,7 +9,10 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from local_security import _session_from, mission_read_confirmed, mission_write_confirmed
 from mission_repository import MissionCorrupt, MissionRepository, _now, _record_from_row, _token
-from source_admission import canonical_knowledge_decision, canonical_review_state, prove_source
+from source_admission import (
+    canonical_knowledge_decision, canonical_review_state,
+    resolve_trusted_source_projection, prove_source,
+)
 from source_catalog import CATALOG_ID, CATALOG_VERSION, fixture_for, public_fixtures
 
 router = APIRouter(prefix="/real/missions", tags=["selected-synthetic-sources"])
@@ -52,8 +55,11 @@ def list_selected_sources(mission_id: str, request: Request) -> dict:
                 ).fetchall()
                 safe_items = []
                 for item in items:
-                    proof = prove_source(connection, item["id"], session.principal, mission_id)
-                    if not proof.trusted:
+                    projection = resolve_trusted_source_projection(
+                        connection, session.principal, mission_id, source_id=item["id"],
+                    )
+                    proof = projection.proof
+                    if not projection.trusted or proof is None:
                         safe_items.append({
                             "id": item["id"], "mission_id": mission_id,
                             "classification": "unverified", "selection_state": "quarantined",
@@ -143,7 +149,10 @@ def add_selected_source(mission_id: str, body: SelectedSourceIn, request: Reques
                             or existing["fixture_id"] != fixture["id"]
                             or existing["classification"] != "synthetic_verified"
                             or existing["state"] != "selected"
-                            or not prove_source(connection, existing["id"], session.principal, mission_id).trusted):
+                            or not resolve_trusted_source_projection(
+                                connection, session.principal, mission_id,
+                                source_id=existing["id"],
+                            ).trusted):
                         raise HTTPException(status_code=409, detail="idempotência reutilizada com corpo diferente")
                     return {"dataset": "api_synthetic", "id": existing["id"],
                             "mission_id": mission_id, "fixture_id": fixture["id"],

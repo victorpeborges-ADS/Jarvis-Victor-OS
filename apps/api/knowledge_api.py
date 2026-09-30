@@ -77,7 +77,7 @@ def list_knowledge(request: Request, domain_id: str | None = None) -> dict:
                     item = dict(row)
                     verified = verified_source_for_knowledge(connection, row, session.principal)
                     state, decision_valid, decision_row = canonical_knowledge_decision(connection, row)
-                    if not decision_valid or (item["kind"] == "selected_original" and not verified):
+                    if not decision_valid or not verified:
                         item["content"] = ""
                         item["state"] = "quarantined"
                         item["content_withheld"] = True
@@ -125,7 +125,7 @@ def decide_knowledge(knowledge_id: str, body: KnowledgeDecisionIn, request: Requ
                 ).fetchone()
                 if fresh is None or fresh["domain_id"] != row["domain_id"]:
                     raise HTTPException(status_code=409, detail="conhecimento alterado")
-                if fresh["kind"] == "selected_original" and not verified_source_for_knowledge(connection, fresh):
+                if not verified_source_for_knowledge(connection, fresh):
                     raise HTTPException(status_code=409, detail="fonte em quarentena ou sem proveniência verificável")
                 actual_sha = _content_sha(fresh["content"])
                 if actual_sha != body.expected_content_sha256:
@@ -198,7 +198,7 @@ def assemble_context(connection, owner: str, mission_id: str, domain_id: str, ma
             reason = "aguardando_revisao" if decision_state == "staged" else "rejeitado"
         elif _content_sha(row["content"]) != row["knowledge_sha256"]:
             reason = "integridade"
-        elif row["kind"] == "selected_original" and not verified_source_for_knowledge(connection, row):
+        elif not verified_source_for_knowledge(connection, row):
             reason = "fonte_em_quarentena"
         else:
             source = _source_review(connection, row)

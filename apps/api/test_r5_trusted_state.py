@@ -233,8 +233,10 @@ def test_read_and_reconcile_lock_orders_complete_without_deadlock(client, monkey
         return wrapped
 
     if first_order == "read_then_reconcile":
-        monkeypatch.setattr(selected_source_module, "prove_source",
-                            pause_first_proof(selected_source_module.prove_source))
+        monkeypatch.setattr(
+            selected_source_module, "resolve_trusted_source_projection",
+            pause_first_proof(selected_source_module.resolve_trusted_source_projection),
+        )
     else:
         monkeypatch.setattr(source_admission_module, "prove_source",
                             pause_first_proof(source_admission_module.prove_source))
