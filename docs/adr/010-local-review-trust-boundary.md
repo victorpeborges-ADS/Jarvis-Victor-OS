@@ -18,6 +18,8 @@ The supported guarantee is:
 
 > Any database tampering that is inconsistent with the existing canonical chain fails closed.
 
+Knowledge kind is a stored claim, not provenance proof. Every supported knowledge origin requires positive canonical lineage; unrecognized or unverifiable lineage fails closed. The detached-knowledge R6.1 finding was an inconsistent edit within this existing guarantee and does not change the TCB or ADR-010 trust boundary.
+
 G5 does not guarantee cryptographic authenticity against an administrator who can fabricate all coherent rows in SQLite, alter the executable, or control both code and database. Such a writer is outside this gate's authenticity guarantee. Stronger authenticity requires a future identity/secure-storage gate with a trust root outside SQLite.
 
 | Threat | Inside G5? | Control or boundary |

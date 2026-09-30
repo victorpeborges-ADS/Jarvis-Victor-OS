@@ -19,9 +19,21 @@
 | Estado exibido de quarentena | Display-only | Resultado fail-closed da projeção | Placeholders sem conteúdo, hash ou proveniência de confiança |
 | Estado de migração/reconciliação | Migration | Fixtures históricas e `legacy_source_fixture` byte-exato | Sem inferência; fonte antiga permanece quarantined |
 
+## Knowledge: origem e capacidades
+
+`mission_knowledge.kind` é uma claim persistida, não evidência de proveniência. A única enumeração admitida pelo schema atual é `selected_original` e `skill_derived`; o campo é `NOT NULL` e tem `CHECK`. `origin` e `source_type` não existem nessa tabela. O `state` armazenado historicamente admite `staged` e `review`; a API calcula o estado público a partir da prova e de `mission_knowledge_decisions`, usando também `quarantined` quando a prova falha. Os valores `approved` e `rejected` vêm do ledger, não do campo armazenado.
+
+| Stored claim (`kind`) | Evidência canônica positiva | Projeção pública | Expor bytes? | Aprovar? | Contexto? | Alimentar skill? |
+|---|---|---|---:|---:|---:|---:|
+| `selected_original` | Uma cadeia única e coincidente: owner → missão/documento → domínio → artefato e referência → selected source → catálogo/versão → bytes e SHA-256 da fixture → knowledge e conteúdo → revisão, snapshot e decisão canônica quando existente. `resolve_trusted_source_projection`/`prove_source` validam os vínculos. | `origin_type=selected_original`, `origin_verified=true`, `classification=synthetic_verified`; divergência produz `quarantined`, `unverified`, sem conteúdo nem SHA confiável. | Sim, apenas depois da prova positiva; a aprovação do artefato não aprova o knowledge. | Sim, depois de revisão do artefato aprovada e prova atual válida. | Apenas com revisão do artefato e decisão do knowledge aprovadas, hashes atuais e concessão de leitura. | Sim, exclusivamente pelo contexto aprovado acima. |
+| `skill_derived` | Missão/documento e owner/domain; tarefa única `task_capture` concluída; execução `committed` de `capture-and-classify@1.0.0` com tentativa e input digest determinísticos; knowledge ID e bytes reproduzidos pelo produtor; artefato determinístico e snapshot/revisão da versão 1; eventos de conclusão e criação correlacionados na missão e em `mission_events`. Não pode existir elo de selected source conflitante. | `origin_type=skill_derived`, `origin_verified=true`, `classification=synthetic_verified`; prova incompleta, origem ambígua ou claim divergente produz `quarantined`, `unverified`, sem conteúdo nem SHA confiável. | Sim, depois da prova positiva, inclusive enquanto aguarda a revisão humana sintética; bytes permanecem retidos se a prova deixar de fechar. | Sim, somente com revisão do artefato aprovada e prova atual válida. | Apenas com revisão do artefato e decisão do knowledge aprovadas, hashes atuais e concessão de leitura. | Sim, exclusivamente pelo contexto aprovado acima. |
+| Qualquer kind desconhecido/inválido ou knowledge órfão | Nenhuma prova suportada; não há inferência de tipo pela ausência de vínculo com selected source. | `quarantined`, `origin_verified=false`, `origin_type=null`, `content_withheld=true`. | Não. | Não. | Não. | Não. |
+
+O endpoint não fornece detalhe individual de knowledge; `GET /real/knowledge` é a superfície de listagem. O conteúdo do contexto é criado apenas por `assemble_context`, que exige prova da origem, decisão canônica aprovada e revisão atual aprovada. A UI consome os campos da projeção da API e nunca promove `kind` localmente.
+
 ## Ponto canônico de código
 
-- `apps/api/source_admission.py`: `resolve_trusted_source_projection` descobre candidatos por relações de artefato, conhecimento e revisão e entrega a prova somente se a cadeia inteira apontar ao mesmo registro.
+- `apps/api/source_admission.py`: `resolve_trusted_source_projection` descobre candidatos por relações de artefato, conhecimento e revisão e entrega a prova somente se a cadeia inteira apontar ao mesmo registro. `resolve_trusted_knowledge_projection` despacha explicitamente para prova positiva de cada origem suportada e falha fechada para qualquer claim sem prova.
 - `redact_mission_record`, `review_is_unverified_source`, `verified_source_for_knowledge` e `canonical_knowledge_decision` derivam projeções desse verificador; revisões e lista de fontes usam o mesmo resolver.
 - `canonical_review_state` valida as decisões de revisão, snapshot e hash. Não declara que o ledger autentica o administrador do próprio banco.
 - `mission_api.py`, `selected_source_api.py`, `review_api.py`, `knowledge_api.py` e execução de contexto continuam impondo seus grants existentes.
@@ -30,12 +42,12 @@
 
 | Grupo encontrado | Classificação | Regra de leitura |
 |---|---|---|
-| `source_admission.py` (`synthetic_verified`, `selected`, `approved`, `quarantined`, `unverified`) | Canonical projection + stored claim comparison | Claims são comparadas ao catálogo/prova; apenas projeção abre conteúdo |
+| `source_admission.py` (`skill_derived`, `selected_original`, `synthetic_verified`, `selected`, `approved`, `quarantined`, `unverified`) | Stored claim + canonical evidence + projection | Cada tipo exige sua prova explícita; kind sem prova resulta em quarentena |
 | `selected_source_api.py` | Authorization + canonical projection + display-only | Grant local primeiro; campos publicáveis vêm da prova |
 | `mission_repository.py` | Canonical review projection + authorization + writes | Decisão passa pelo ledger; revisão de fixture não aceita conteúdo arbitrário |
-| `knowledge_api.py` | Authorization + canonical knowledge projection | Lista, decisão, contexto e skill consultam a prova e a decisão canônicas |
+| `knowledge_api.py` | Authorization + canonical knowledge projection + capability projection | Lista e decisão consultam a prova positiva; contexto/skill também exige aprovação do artefato e do knowledge |
 | `memory_store.py`/migrations | Migration + armazenamento | DDL, triggers e normalização preservam dados; não são identidade criptográfica |
 | `test_*.py`, `e2e/*.spec.ts` | Testes/probes | Claims aparecem como dados de ataque e asserções, não como prova produtiva |
-| UI (`apps/web`) | Display-only | Rótulos visíveis não autorizam leitura ou decisão |
+| UI (`apps/web`) | Display-only | Rótulo de origem é escolhido apenas por `origin_verified` retornado pela API; unverified aparece como “Origem não verificada” e bytes retidos |
 
 Nenhum endpoint deve usar `classification`, `state`, `review_state`, `approved`, `selection_state` ou uma string importada como prova isolada. A exceção de autenticidade do escritor SQLite está declarada na [ADR-010](../adr/010-local-review-trust-boundary.md).
