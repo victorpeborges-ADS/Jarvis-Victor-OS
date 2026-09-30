@@ -75,6 +75,23 @@ class TrustedSourceProjection:
     proof: SourceProof | None = None
 
 
+@dataclass(frozen=True)
+class TrustedKnowledgeProjection:
+    """Positive proof for one persisted knowledge origin.
+
+    ``kind`` is only a stored claim. ``trusted`` is true only when either the
+    selected-source chain or the deterministic skill execution, artifact,
+    event, and review chain is reconstructed in full.
+    """
+
+    trusted: bool
+    origin_type: str | None = None
+    source_review: object | None = None
+    source_review_state: str | None = None
+    artifact: dict | None = None
+    execution: object | None = None
+
+
 def _source_rows(connection, source_id: str, owner: str):
     source = connection.execute(
         "SELECT * FROM selected_synthetic_sources WHERE id=? AND owner=?",
@@ -521,15 +538,213 @@ def knowledge_source_review(connection, knowledge):
     ).fetchone()
 
 
-def canonical_knowledge_decision(connection, knowledge, decision=None) -> tuple[str, bool, object | None]:
-    """Check knowledge ledger bindings and the approved artifact version before use."""
-    projection = resolve_trusted_source_projection(
-        connection, _value(knowledge, "owner", ""), _value(knowledge, "mission_id"),
-        knowledge=knowledge,
+def _skill_execution_digest(title: str, task_id: str) -> str:
+    return hashlib.sha256(f"{task_id}:{title}".encode("utf-8")).hexdigest()
+
+
+def _positive_skill_derived_knowledge(connection, knowledge, owner: str) -> TrustedKnowledgeProjection:
+    """Reconstruct the only current server flow that creates skill-derived knowledge.
+
+    The knowledge table has no direct execution foreign key. The application
+    already records enough canonical evidence to prove its origin: deterministic
+    knowledge/artifact IDs and bytes, the committed capture execution, the exact
+    artifact snapshot, and the two execution-correlated server events. Legacy
+    rows missing any of these links remain stored but are not exposed as trusted.
+    """
+    from synthetic_skill import capture_and_classify
+
+    knowledge_id = _value(knowledge, "id")
+    mission_id = _value(knowledge, "mission_id")
+    domain_id = _value(knowledge, "domain_id")
+    created_at = _value(knowledge, "created_at")
+    if (
+        _value(knowledge, "owner") != owner
+        or _value(knowledge, "kind") != "skill_derived"
+        or _value(knowledge, "source_review_id") is not None
+        or not isinstance(knowledge_id, str)
+        or not isinstance(mission_id, str)
+        or not isinstance(domain_id, str)
+        or not isinstance(_value(knowledge, "content"), str)
+        or not isinstance(created_at, str)
+    ):
+        return TrustedKnowledgeProjection(trusted=False)
+
+    # Any discovered selected-source edge makes this a conflicting lineage;
+    # a skill-derived claim cannot erase a selected-source proof.
+    source_projection = resolve_trusted_source_projection(
+        connection, owner, mission_id, knowledge=knowledge,
     )
-    if projection.applicable and not projection.trusted:
-        return "quarantined", False, None
-    if _value(knowledge, "kind") == "selected_original" and not projection.trusted:
+    if source_projection.applicable:
+        return TrustedKnowledgeProjection(trusted=False)
+
+    mission_row = connection.execute(
+        "SELECT id, owner, domain_id, document_json FROM missions WHERE id=?",
+        (mission_id,),
+    ).fetchone()
+    mission = _json_object(mission_row["document_json"]) if mission_row is not None else None
+    if (
+        mission_row is None
+        or mission is None
+        or mission_row["id"] != mission_id
+        or mission_row["owner"] != owner
+        or mission_row["domain_id"] != domain_id
+        or mission.get("id") != mission_id
+        or mission.get("domain_id") != domain_id
+        or not isinstance(mission.get("title"), str)
+    ):
+        return TrustedKnowledgeProjection(trusted=False)
+
+    tasks = mission.get("tasks")
+    if not isinstance(tasks, list):
+        return TrustedKnowledgeProjection(trusted=False)
+    capture_tasks = [task for task in tasks if isinstance(task, dict) and task.get("id") == "task_capture"]
+    if len(capture_tasks) != 1:
+        return TrustedKnowledgeProjection(trusted=False)
+    task = capture_tasks[0]
+    attempt = task.get("attempt")
+    if task.get("status") != "done" or not isinstance(attempt, int) or attempt < 1:
+        return TrustedKnowledgeProjection(trusted=False)
+
+    input_digest = _skill_execution_digest(mission["title"], "task_capture")
+    expected_execution_id = f"exec_{mission_id[-12:]}_task_capture_{attempt}"
+    executions = connection.execute(
+        """SELECT * FROM mission_executions
+           WHERE id=? AND mission_id=? AND owner=? AND task_id=? AND phase='committed'
+             AND attempt=? AND skill_id=? AND skill_version=? AND input_digest=?
+             AND committed_at=?""",
+        (expected_execution_id, mission_id, owner, "task_capture", attempt,
+         "capture-and-classify", "1.0.0", input_digest, created_at),
+    ).fetchall()
+    if len(executions) != 1:
+        return TrustedKnowledgeProjection(trusted=False)
+    execution = executions[0]
+
+    expected_artifact, expected_knowledge = capture_and_classify(
+        mission["title"], domain_id, created_at, mission_id,
+    )
+    expected_artifact["skill_id"] = "capture-and-classify"
+    expected_artifact["input_digest"] = input_digest
+    if (
+        knowledge_id != expected_knowledge.get("id")
+        or _value(knowledge, "content") != expected_knowledge.get("content")
+        or domain_id != expected_knowledge.get("domain_id")
+        or _value(knowledge, "skill_version") != expected_knowledge.get("skill_version")
+    ):
+        return TrustedKnowledgeProjection(trusted=False)
+
+    artifacts = mission.get("artifacts")
+    if not isinstance(artifacts, list):
+        return TrustedKnowledgeProjection(trusted=False)
+    matching_artifacts = [
+        artifact for artifact in artifacts
+        if isinstance(artifact, dict) and artifact.get("id") == expected_artifact.get("id")
+    ]
+    if len(matching_artifacts) != 1 or _artifact_payload(matching_artifacts[0]) != _artifact_payload(expected_artifact):
+        return TrustedKnowledgeProjection(trusted=False)
+    artifact = matching_artifacts[0]
+
+    events = mission.get("events")
+    if not isinstance(events, list):
+        return TrustedKnowledgeProjection(trusted=False)
+    for event_type, stable_suffix in (("task_completed", "completed"), ("artifact_created", "artifact")):
+        stable_key = f"{expected_execution_id}:{stable_suffix}"
+        document_events = [
+            event for event in events
+            if isinstance(event, dict) and event.get("idempotency_key") == stable_key
+        ]
+        database_events = connection.execute(
+            """SELECT * FROM mission_events
+               WHERE idempotency_key=? AND mission_id=? AND owner=?""",
+            (stable_key, mission_id, owner),
+        ).fetchall()
+        if len(document_events) != 1 or len(database_events) != 1:
+            return TrustedKnowledgeProjection(trusted=False)
+        document_event = document_events[0]
+        database_event = database_events[0]
+        if (
+            document_event.get("type") != event_type
+            or document_event.get("task_id") != "task_capture"
+            or document_event.get("created_at") != created_at
+            or database_event["id"] != document_event.get("id")
+            or database_event["event_type"] != event_type
+            or database_event["actor"] != owner
+            or database_event["correlation_id"] != stable_key
+            or database_event["created_at"] != created_at
+        ):
+            return TrustedKnowledgeProjection(trusted=False)
+
+    review = knowledge_source_review(connection, knowledge)
+    if (
+        review is None
+        or review["id"] != f"rev_{expected_artifact['id']}_1"
+        or review["owner"] != owner
+        or review["mission_id"] != mission_id
+        or review["artifact_id"] != expected_artifact["id"]
+        or review["artifact_version"] != 1
+    ):
+        return TrustedKnowledgeProjection(trusted=False)
+    review_state, review_valid, _ = canonical_review_state(connection, review)
+    artifact_state, artifact_valid = canonical_artifact_state(
+        connection, owner, mission_id, artifact,
+    )
+    projected_review_state = "draft" if review_state == "pending" else review_state
+    if not review_valid or not artifact_valid or projected_review_state != artifact_state:
+        return TrustedKnowledgeProjection(trusted=False)
+    return TrustedKnowledgeProjection(
+        trusted=True,
+        origin_type="skill_derived",
+        source_review=review,
+        source_review_state=review_state,
+        artifact=artifact,
+        execution=execution,
+    )
+
+
+def resolve_trusted_knowledge_projection(
+    connection, knowledge, owner: str | None = None,
+) -> TrustedKnowledgeProjection:
+    """Project positive provenance for every persisted knowledge row.
+
+    Unknown kinds and disconnected rows are untrusted. A stored ``kind`` only
+    selects which proof to attempt; it never grants trust itself.
+    """
+    owner = owner or _value(knowledge, "owner")
+    if not isinstance(owner, str) or _value(knowledge, "owner") != owner:
+        return TrustedKnowledgeProjection(trusted=False)
+    kind = _value(knowledge, "kind")
+    if kind == "selected_original":
+        projection = resolve_trusted_source_projection(
+            connection, owner, _value(knowledge, "mission_id"), knowledge=knowledge,
+        )
+        proof = projection.proof
+        if (
+            not projection.applicable
+            or not projection.trusted
+            or proof is None
+            or proof.knowledge is None
+            or proof.review is None
+            or proof.artifact is None
+        ):
+            return TrustedKnowledgeProjection(trusted=False)
+        state, valid, _ = canonical_review_state(connection, proof.review)
+        if not valid:
+            return TrustedKnowledgeProjection(trusted=False)
+        return TrustedKnowledgeProjection(
+            trusted=True,
+            origin_type="selected_original",
+            source_review=proof.review,
+            source_review_state=state,
+            artifact=proof.artifact,
+        )
+    if kind == "skill_derived":
+        return _positive_skill_derived_knowledge(connection, knowledge, owner)
+    return TrustedKnowledgeProjection(trusted=False)
+
+
+def canonical_knowledge_decision(connection, knowledge, decision=None) -> tuple[str, bool, object | None]:
+    """Check positive origin proof and the ledger before use or display."""
+    projection = resolve_trusted_knowledge_projection(connection, knowledge)
+    if not projection.trusted or projection.source_review is None:
         return "quarantined", False, None
     if decision is None:
         decision = connection.execute(
@@ -549,16 +764,13 @@ def canonical_knowledge_decision(connection, knowledge, decision=None) -> tuple[
             or not decision["idempotency_key"]
         ):
             return "quarantined", False, decision
-        review = knowledge_source_review(connection, knowledge)
-        if review is None:
-            if decision["source_review_id"] is not None or decision["source_artifact_sha256"] is not None:
-                return "quarantined", False, decision
-        elif (
+        review = projection.source_review
+        if (
             decision["source_review_id"] != review["id"]
             or decision["source_artifact_sha256"] != review["artifact_sha256"]
         ):
             return "quarantined", False, decision
-        elif decision["decision"] == "approved":
+        if decision["decision"] == "approved":
             state, valid, _ = canonical_review_state(connection, review)
             if not valid or state != "approved":
                 return "quarantined", False, decision
@@ -568,15 +780,8 @@ def canonical_knowledge_decision(connection, knowledge, decision=None) -> tuple[
 
 
 def verified_source_for_knowledge(connection, knowledge, owner: str | None = None) -> bool:
-    owner = owner or _value(knowledge, "owner")
-    if not owner:
-        return False
-    projection = resolve_trusted_source_projection(
-        connection, owner, _value(knowledge, "mission_id"), knowledge=knowledge,
-    )
-    if projection.applicable:
-        return projection.trusted
-    return _value(knowledge, "kind") != "selected_original"
+    """Compatibility predicate backed only by positive origin evidence."""
+    return resolve_trusted_knowledge_projection(connection, knowledge, owner).trusted
 
 
 def review_is_unverified_source(connection, owner: str, review_id: str) -> bool:

@@ -17,7 +17,7 @@ from local_security import (
 from mission_repository import _now, _sha
 from source_admission import (
     canonical_knowledge_decision, canonical_review_state, knowledge_source_review,
-    verified_source_for_knowledge,
+    resolve_trusted_knowledge_projection, verified_source_for_knowledge,
 )
 
 router = APIRouter(prefix="/real/knowledge", tags=["knowledge-synthetic"])
@@ -39,16 +39,26 @@ def _source_review(connection, row):
     return knowledge_source_review(connection, row)
 
 
-def _source_content_matches(row, source) -> bool:
-    if row["kind"] != "selected_original":
-        return True
+def _source_content_matches(connection, row, source) -> bool:
     if source is None:
         return False
-    try:
-        snapshot = json.loads(source["artifact_snapshot_json"])
-        return snapshot.get("content") == row["content"]
-    except (TypeError, ValueError, AttributeError):
+    provenance = resolve_trusted_knowledge_projection(connection, row)
+    if (
+        not provenance.trusted
+        or provenance.source_review is None
+        or provenance.source_review["id"] != source["id"]
+    ):
         return False
+    if provenance.origin_type == "skill_derived":
+        # The resolver has reproduced the producer's exact knowledge bytes.
+        return provenance.artifact is not None
+    if provenance.origin_type == "selected_original":
+        try:
+            snapshot = json.loads(source["artifact_snapshot_json"])
+            return snapshot.get("content") == row["content"]
+        except (TypeError, ValueError, AttributeError):
+            return False
+    return False
 
 
 @router.get("")
@@ -75,23 +85,41 @@ def list_knowledge(request: Request, domain_id: str | None = None) -> dict:
                 items = []
                 for row in rows:
                     item = dict(row)
-                    verified = verified_source_for_knowledge(connection, row, session.principal)
+                    provenance = resolve_trusted_knowledge_projection(connection, row, session.principal)
                     state, decision_valid, decision_row = canonical_knowledge_decision(connection, row)
-                    if not decision_valid or not verified:
+                    if not decision_valid or not provenance.trusted:
                         item["content"] = ""
                         item["state"] = "quarantined"
                         item["content_withheld"] = True
+                        item["origin_verified"] = False
+                        item["origin_type"] = None
+                        item["classification"] = "unverified"
+                        item["can_approve"] = False
+                        item["can_use_context"] = False
+                        item["can_feed_skill"] = False
+                        item["source_review_id"] = None
+                        item["source_artifact_sha256"] = None
                         item["decision"] = None
                         item["decided_at"] = None
                         item["decision_source_review_id"] = None
                         item["content_sha256"] = None
                         item["decision_state_proven"] = False
-                        if item["kind"] == "selected_original":
-                            item["classification"] = "unverified"
                     else:
                         item["decision"] = state if state in {"approved", "rejected"} else None
                         item["state"] = state
                         item["content_withheld"] = False
+                        item["origin_verified"] = True
+                        item["origin_type"] = provenance.origin_type
+                        item["classification"] = "synthetic_verified"
+                        item["can_approve"] = (
+                            state == "staged"
+                            and decision_row is None
+                            and provenance.source_review_state == "approved"
+                        )
+                        item["can_use_context"] = state == "approved" and decision_row is not None
+                        item["can_feed_skill"] = item["can_use_context"]
+                        item["source_review_id"] = provenance.source_review["id"]
+                        item["source_artifact_sha256"] = provenance.source_review["artifact_sha256"]
                         item["decision_state_proven"] = True
                         item["decided_at"] = decision_row["decided_at"] if decision_row else None
                         item["decision_source_review_id"] = decision_row["source_review_id"] if decision_row else None
@@ -148,7 +176,7 @@ def decide_knowledge(knowledge_id: str, body: KnowledgeDecisionIn, request: Requ
                 source = _source_review(connection, fresh)
                 source_state, source_valid, _ = canonical_review_state(connection, source) if source else ("pending", False, None)
                 if body.decision == "approved" and (not source_valid or source_state != "approved"
-                                                    or not _source_content_matches(fresh, source)):
+                                                    or not _source_content_matches(connection, fresh, source)):
                     raise HTTPException(status_code=409, detail="artefato de origem ainda não aprovado ou desatualizado")
                 source_id = source["id"] if source is not None else None
                 source_sha = source["artifact_sha256"] if source is not None else None
@@ -203,7 +231,7 @@ def assemble_context(connection, owner: str, mission_id: str, domain_id: str, ma
         else:
             source = _source_review(connection, row)
             source_state, source_valid, _ = canonical_review_state(connection, source) if source else ("pending", False, None)
-            if (not source_valid or source_state != "approved" or not _source_content_matches(row, source)
+            if (not source_valid or source_state != "approved" or not _source_content_matches(connection, row, source)
                     or source["id"] != decision_row["source_review_id"]
                     or source["artifact_sha256"] != decision_row["source_artifact_sha256"]):
                 reason = "fonte_desatualizada"
