@@ -1,3 +1,5 @@
+#[cfg(test)]
+use std::path::{Path, PathBuf};
 use std::{
     env,
     io::{self, BufRead, BufReader, Write},
@@ -217,6 +219,8 @@ enum SupervisorMessage {
 
 pub struct RuntimeManager {
     shared: Arc<Shared>,
+    #[cfg(test)]
+    helper_executable: Option<PathBuf>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -263,7 +267,16 @@ impl RuntimeManager {
                 changed: Condvar::new(),
                 options,
             }),
+            #[cfg(test)]
+            helper_executable: None,
         }
+    }
+
+    #[cfg(test)]
+    fn with_test_helper_executable(executable: PathBuf) -> Self {
+        let mut manager = Self::with_options(RuntimeOptions::production());
+        manager.helper_executable = Some(executable);
+        manager
     }
 
     fn snapshot(&self) -> RuntimeSnapshot {
@@ -308,8 +321,14 @@ impl RuntimeManager {
         }
 
         let instance_id = new_instance_id();
-        let mut command = helper_command(&instance_id, mode, stale_instance_id)
-            .map_err(|_| ManagerError::SpawnFailed)?;
+        let mut command = helper_command(
+            &instance_id,
+            mode,
+            stale_instance_id,
+            #[cfg(test)]
+            self.helper_executable.as_deref(),
+        )
+        .map_err(|_| ManagerError::SpawnFailed)?;
         transition_log(previous, RuntimeState::Starting, &instance_id);
         inner.snapshot = RuntimeSnapshot {
             state: RuntimeState::Starting,
@@ -869,9 +888,17 @@ fn helper_command(
     instance_id: &str,
     mode: HelperMode,
     stale_instance_id: Option<&str>,
+    #[cfg(test)] test_executable: Option<&Path>,
 ) -> io::Result<Command> {
     #[cfg(test)]
     {
+        if let Some(executable) = test_executable {
+            let mut command = Command::new(executable);
+            command.env_clear();
+            command.args(helper_arguments(instance_id, mode));
+            return Ok(command);
+        }
+
         let executable = env::current_exe()?;
         let mut command = Command::new(executable);
         command.env_clear();
@@ -1144,6 +1171,7 @@ mod tests {
     use super::*;
     use std::{
         io::Write,
+        path::Path,
         process::ChildStdin,
         sync::{Barrier, Mutex as TestMutex},
     };
@@ -1410,6 +1438,27 @@ mod tests {
         let manager = manager();
         manager.start_test().unwrap();
         manager.wait_for_state(RuntimeState::Ready, Duration::from_secs(2));
+        assert_eq!(
+            manager.stop_and_wait().unwrap().state,
+            RuntimeState::Stopped
+        );
+        assert_clean(&manager);
+    }
+
+    #[test]
+    #[ignore = "requires npm run tauri -- build --no-bundle"]
+    fn release_tauri_binary_is_spawned_and_reaped() {
+        let executable = Path::new(env!("CARGO_MANIFEST_DIR")).join("target/release/desktop");
+        assert!(
+            executable.is_file(),
+            "release binary missing: {executable:?}"
+        );
+
+        let manager = RuntimeManager::with_test_helper_executable(executable);
+        let started = manager.start_test().unwrap();
+        assert_eq!(started.state, RuntimeState::Starting);
+        let ready = manager.wait_for_state(RuntimeState::Ready, Duration::from_secs(8));
+        assert_eq!(ready.runtime_instance_id, started.runtime_instance_id);
         assert_eq!(
             manager.stop_and_wait().unwrap().state,
             RuntimeState::Stopped
