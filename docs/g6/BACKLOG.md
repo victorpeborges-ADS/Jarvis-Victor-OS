@@ -7,12 +7,12 @@ Prioridades indicam precedência, não estimativa de duração. “Arquivos prov
 ### G6-MAC-001 — Runtime Manager e child de prova
 
 - **Subgate:** G6.1
-- **Objetivo:** iniciar, observar readiness e finalizar somente um processo auxiliar iniciado pelo app.
-- **Arquivos prováveis:** apps/desktop/src-tauri/Cargo.toml, tauri.conf.json, capabilities/default.json, src/lib.rs, novo src/runtime_manager.rs, fixture de sidecar e testes.
-- **Dependências:** toolchain macOS local; DEC-01/02; revisão de capability Tauri.
-- **Risco:** prova de fixture não refletir binário Python final; capability excessiva.
-- **Testes:** iniciar/encerrar; startup timeout; child falso; crash; segunda instância; não encerrar PID alheio; bundle real local.
-- **Pronto quando:** logs e evidência provam um child próprio, handshake validado, shutdown limpo e zero acesso a API/banco de produto.
+- **Status:** implementação local sintética concluída; evidências e limites em [`g6-1/G6_MAC_001_REPORT.md`](g6-1/G6_MAC_001_REPORT.md).
+- **Objetivo executado:** iniciar, validar readiness por ID da instância, observar e finalizar um helper child iniciado pelo app.
+- **Arquivos alterados:** `apps/desktop/src-tauri/src/{lib.rs,main.rs,runtime_manager.rs}`, `apps/desktop/src/App.tsx`, `apps/desktop/src/App.css`, `apps/desktop/README.md` e documentação `docs/g6/g6-1/`.
+- **Testes:** ciclo completo, startup timeout, readiness errada/antiga, crash antes/depois de readiness, chamadas concorrentes, restart explícito, shutdown timeout, processo independente preservado e spawn/reap do executável Tauri release.
+- **Limite do status:** não integra a API Python, SQLite, endpoint, sessão, grant ou dados de produto; não gera `.app` nem aceita os itens restantes de G6.1.
+- **Próxima dependência:** G6-MAC-002 deve decidir e testar endpoint, porta e origin; este subgate não autoriza conexão.
 
 ### G6-MAC-002 — Endpoint, porta e origin do WebView
 
