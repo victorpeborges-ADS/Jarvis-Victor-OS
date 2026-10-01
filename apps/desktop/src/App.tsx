@@ -1,10 +1,43 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
+import { invoke, isTauri } from "@tauri-apps/api/core";
 import "./App.css";
 
 const STORAGE_KEY = "jarvis-desktop-demo-captures-v1";
-const sections = ["Agora", "Inbox", "Missões", "Aprovações", "Configurações"] as const;
+const sections = ["Agora", "Inbox", "Missões", "Aprovações", "Runtime local", "Configurações"] as const;
 type Section = (typeof sections)[number];
 type Capture = { id: string; text: string; created_at: string };
+type RuntimeState = "STOPPED" | "STARTING" | "READY" | "STOPPING" | "FAILED" | "CRASHED";
+type RuntimeSnapshot = {
+  state: RuntimeState;
+  runtime_instance_id: string | null;
+  pid: number | null;
+  started_at_unix_ms: number | null;
+  ready_at_unix_ms: number | null;
+  exit_code: number | null;
+  failure_category: string | null;
+};
+type RuntimeEnvelope = { ok: boolean; snapshot: RuntimeSnapshot; error: string | null };
+
+const runtimeStateLabels: Record<RuntimeState, string> = {
+  STOPPED: "Parado",
+  STARTING: "Iniciando",
+  READY: "Pronto",
+  STOPPING: "Encerrando",
+  FAILED: "Falhou",
+  CRASHED: "Interrompido",
+};
+
+function parseRuntimeEnvelope(value: string): RuntimeEnvelope {
+  const parsed: unknown = JSON.parse(value);
+  if (typeof parsed !== "object" || parsed === null || !("snapshot" in parsed)) {
+    throw new Error("Resposta de runtime inválida.");
+  }
+  const envelope = parsed as RuntimeEnvelope;
+  if (typeof envelope.snapshot?.state !== "string" || !(envelope.snapshot.state in runtimeStateLabels)) {
+    throw new Error("Estado de runtime desconhecido.");
+  }
+  return envelope;
+}
 
 function readCaptures(): Capture[] {
   try {
@@ -23,6 +56,48 @@ function App() {
   const [text, setText] = useState("");
   const [syntheticConfirmed, setSyntheticConfirmed] = useState(false);
   const [notice, setNotice] = useState("");
+  const [runtime, setRuntime] = useState<RuntimeEnvelope | null>(null);
+  const [runtimeError, setRuntimeError] = useState("");
+  const [runtimeBusy, setRuntimeBusy] = useState(false);
+  const runtimeAvailable = isTauri();
+
+  useEffect(() => {
+    if (section !== "Runtime local" || !runtimeAvailable) return;
+    let cancelled = false;
+    const refresh = async () => {
+      try {
+        const response = await invoke<string>("runtime_status");
+        const next = parseRuntimeEnvelope(response);
+        if (!cancelled) {
+          setRuntime(next);
+          setRuntimeError("");
+        }
+      } catch {
+        if (!cancelled) setRuntimeError("Não foi possível consultar o supervisor local.");
+      }
+    };
+    void refresh();
+    const timer = window.setInterval(() => void refresh(), 350);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [section, runtimeAvailable]);
+
+  async function runRuntimeCommand(command: "runtime_start_test" | "runtime_stop" | "runtime_restart_test") {
+    setRuntimeBusy(true);
+    setRuntimeError("");
+    try {
+      const response = await invoke<string>(command);
+      const next = parseRuntimeEnvelope(response);
+      setRuntime(next);
+      if (!next.ok) setRuntimeError(next.error ?? "A ação não foi concluída.");
+    } catch {
+      setRuntimeError("Não foi possível chamar o supervisor local.");
+    } finally {
+      setRuntimeBusy(false);
+    }
+  }
 
   function saveCapture(event: React.FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -50,7 +125,7 @@ function App() {
       <p className="rail-note">macOS local · dados fictícios · sem conexão externa</p>
     </aside>
     <main className="content" id="conteudo">
-      <p className="eyebrow">VICTOR OS · CLIENTE MACOS · DEMO OFFLINE</p>
+      <p className="eyebrow">VICTOR OS · CLIENTE MACOS · {section === "Runtime local" ? "VALIDAÇÃO LOCAL" : "DEMO OFFLINE"}</p>
       <h1>{section}</h1>
       {notice && <p className="notice" role="status">{notice}</p>}
       {section === "Agora" && <article className="card"><p className="badge">DEMO LOCAL</p>
@@ -76,6 +151,25 @@ function App() {
       </article>}
       {section === "Aprovações" && <article className="card"><p className="badge">SEM CONCESSÃO ATIVA</p>
         <h2>Nenhuma decisão neste cliente</h2><p>A fila persistente depende de sessão, concessão e API local. Este aplicativo não simula decisões nem aprova conteúdo automaticamente.</p>
+      </article>}
+      {section === "Runtime local" && <article className="card runtime-card">
+        <p className="badge">RUNTIME DE TESTE</p>
+        <h2>Processo local supervisionado</h2>
+        <p>Este helper sintético valida início, prontidão, encerramento e recuperação. Ele não acessa a API G5, SQLite, rede ou dados do produto.</p>
+        <dl className="runtime-status" aria-live="polite">
+          <div><dt>Estado</dt><dd>{runtime ? runtimeStateLabels[runtime.snapshot.state] : runtimeAvailable ? "Consultando" : "Indisponível neste preview"}</dd></div>
+          {runtime?.snapshot.pid !== null && runtime?.snapshot.pid !== undefined && <div><dt>PID informativo</dt><dd>{runtime.snapshot.pid}</dd></div>}
+          {runtime?.snapshot.runtime_instance_id && <div><dt>Instância</dt><dd><code>{runtime.snapshot.runtime_instance_id}</code></dd></div>}
+          {runtime?.snapshot.failure_category && <div><dt>Categoria</dt><dd>{runtime.snapshot.failure_category}</dd></div>}
+          {runtime?.snapshot.exit_code !== null && runtime?.snapshot.exit_code !== undefined && <div><dt>Código de saída</dt><dd>{runtime.snapshot.exit_code}</dd></div>}
+        </dl>
+        <div className="runtime-actions">
+          <button className="action" type="button" disabled={!runtimeAvailable || runtimeBusy || runtime?.snapshot.state !== "STOPPED"} onClick={() => void runRuntimeCommand("runtime_start_test")}>Iniciar</button>
+          <button className="action secondary" type="button" disabled={!runtimeAvailable || runtimeBusy || !["STARTING", "READY", "STOPPING"].includes(runtime?.snapshot.state ?? "")} onClick={() => void runRuntimeCommand("runtime_stop")}>Parar</button>
+          <button className="action secondary" type="button" disabled={!runtimeAvailable || runtimeBusy || !["FAILED", "CRASHED"].includes(runtime?.snapshot.state ?? "")} onClick={() => void runRuntimeCommand("runtime_restart_test")}>Reiniciar</button>
+        </div>
+        {!runtimeAvailable && <p className="runtime-hint">Os comandos de processo ficam disponíveis somente no aplicativo macOS. Este preview web não inicia processos.</p>}
+        {runtimeError && <p className="notice" role="alert">{runtimeError}</p>}
       </article>}
       {section === "Configurações" && <article className="card"><p className="badge">PRIVACIDADE LOCAL</p>
         <h2>Estado deste aplicativo</h2><p>Modo DEMO offline. Sem OAuth, sincronização, serviço em segundo plano ou conexão com dados pessoais. As capturas fictícias ficam no armazenamento local da WebView.</p>
