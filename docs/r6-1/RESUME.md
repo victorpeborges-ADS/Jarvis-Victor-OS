@@ -9,4 +9,4 @@
 - UI: proveniência vem somente da projeção positiva da API; itens sem prova são rotulados “Origem não verificada” e têm conteúdo retido.
 - Evidência: veja `RELATORIO_R6_1.md`, `KNOWLEDGE_PROVENANCE.md`, `KNOWLEDGE_TAMPERING_MATRIX.md` e `TEST_MATRIX.md`.
 
-> G5 permanece sem aceite formal. R6.1 fecha exclusivamente a proveniência positiva de knowledge e não altera a fronteira de confiança ADR-010.
+> Atualização posterior à candidata congelada: o proprietário aceitou formalmente o G5 em 2026-10-01 para o SHA `ab7f856ee834b7f9923d914639e0e345dbf57322`, no escopo local, sintético e monoprocesso do ADR-010. Registro: [ACEITE_G5.md](ACEITE_G5.md). A fronteira de confiança não mudou.
