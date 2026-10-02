@@ -1,22 +1,13 @@
 import { useEffect, useState } from "react";
 import { invoke, isTauri } from "@tauri-apps/api/core";
 import "./App.css";
+import { executeRuntimeCommand, parseRuntimeEnvelope } from "./runtimeCommand";
+import type { RuntimeEnvelope, RuntimeState, RuntimeCommand } from "./runtimeCommand";
 
 const STORAGE_KEY = "jarvis-desktop-demo-captures-v1";
 const sections = ["Agora", "Inbox", "Missões", "Aprovações", "Runtime local", "Configurações"] as const;
 type Section = (typeof sections)[number];
 type Capture = { id: string; text: string; created_at: string };
-type RuntimeState = "STOPPED" | "STARTING" | "READY" | "STOPPING" | "FAILED" | "CRASHED";
-type RuntimeSnapshot = {
-  state: RuntimeState;
-  runtime_instance_id: string | null;
-  pid: number | null;
-  started_at_unix_ms: number | null;
-  ready_at_unix_ms: number | null;
-  exit_code: number | null;
-  failure_category: string | null;
-};
-type RuntimeEnvelope = { ok: boolean; snapshot: RuntimeSnapshot; error: string | null };
 
 const runtimeStateLabels: Record<RuntimeState, string> = {
   STOPPED: "Parado",
@@ -26,18 +17,6 @@ const runtimeStateLabels: Record<RuntimeState, string> = {
   FAILED: "Falhou",
   CRASHED: "Interrompido",
 };
-
-function parseRuntimeEnvelope(value: string): RuntimeEnvelope {
-  const parsed: unknown = JSON.parse(value);
-  if (typeof parsed !== "object" || parsed === null || !("snapshot" in parsed)) {
-    throw new Error("Resposta de runtime inválida.");
-  }
-  const envelope = parsed as RuntimeEnvelope;
-  if (typeof envelope.snapshot?.state !== "string" || !(envelope.snapshot.state in runtimeStateLabels)) {
-    throw new Error("Estado de runtime desconhecido.");
-  }
-  return envelope;
-}
 
 function readCaptures(): Capture[] {
   try {
@@ -84,14 +63,13 @@ function App() {
     };
   }, [section, runtimeAvailable]);
 
-  async function runRuntimeCommand(command: "runtime_start_test" | "runtime_stop" | "runtime_restart_test") {
+  async function runRuntimeCommand(command: RuntimeCommand) {
     setRuntimeBusy(true);
     setRuntimeError("");
     try {
-      const response = await invoke<string>(command);
-      const next = parseRuntimeEnvelope(response);
-      setRuntime(next);
-      if (!next.ok) setRuntimeError(next.error ?? "A ação não foi concluída.");
+      const { operation, current } = await executeRuntimeCommand(command, invoke<string>);
+      setRuntime(current);
+      if (!operation.ok) setRuntimeError(operation.error ?? "A ação não foi concluída.");
     } catch {
       setRuntimeError("Não foi possível chamar o supervisor local.");
     } finally {

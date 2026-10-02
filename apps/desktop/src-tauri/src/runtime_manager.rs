@@ -107,6 +107,10 @@ enum HelperMode {
     #[cfg(test)]
     CrashBeforeReady,
     #[cfg(test)]
+    ExitZeroBeforeReady,
+    #[cfg(test)]
+    CloseStdoutThenExit,
+    #[cfg(test)]
     CrashAfterReady,
     #[cfg(test)]
     HangOnShutdown,
@@ -131,6 +135,10 @@ impl HelperMode {
             #[cfg(test)]
             Self::CrashBeforeReady => "crash-before-ready",
             #[cfg(test)]
+            Self::ExitZeroBeforeReady => "exit-zero-before-ready",
+            #[cfg(test)]
+            Self::CloseStdoutThenExit => "close-stdout-then-exit",
+            #[cfg(test)]
             Self::CrashAfterReady => "crash-after-ready",
             #[cfg(test)]
             Self::HangOnShutdown => "hang-on-shutdown",
@@ -154,6 +162,10 @@ impl HelperMode {
             "slow-ready" => Self::SlowReady,
             #[cfg(test)]
             "crash-before-ready" => Self::CrashBeforeReady,
+            #[cfg(test)]
+            "exit-zero-before-ready" => Self::ExitZeroBeforeReady,
+            #[cfg(test)]
+            "close-stdout-then-exit" => Self::CloseStdoutThenExit,
             #[cfg(test)]
             "crash-after-ready" => Self::CrashAfterReady,
             #[cfg(test)]
@@ -208,6 +220,33 @@ struct Shared {
 struct Inner {
     snapshot: RuntimeSnapshot,
     supervisor: Option<Sender<SupervisorMessage>>,
+    completion: Option<Arc<GenerationCompletion>>,
+}
+
+/// Kept alive by stop waiters after a later generation replaces `Inner.snapshot`.
+struct GenerationCompletion {
+    result: Mutex<Option<RuntimeSnapshot>>,
+    changed: Condvar,
+}
+
+impl GenerationCompletion {
+    fn new() -> Self {
+        Self {
+            result: Mutex::new(None),
+            changed: Condvar::new(),
+        }
+    }
+
+    fn finish(&self, snapshot: &RuntimeSnapshot) {
+        let mut result = self
+            .result
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if result.is_none() {
+            *result = Some(snapshot.clone());
+            self.changed.notify_all();
+        }
+    }
 }
 
 enum SupervisorMessage {
@@ -222,6 +261,7 @@ enum StopDecision {
     WaitForGeneration {
         runtime_instance_id: String,
         snapshot: RuntimeSnapshot,
+        completion: Arc<GenerationCompletion>,
     },
 }
 
@@ -280,6 +320,7 @@ impl RuntimeManager {
                 inner: Mutex::new(Inner {
                     snapshot: RuntimeSnapshot::stopped(),
                     supervisor: None,
+                    completion: None,
                 }),
                 changed: Condvar::new(),
                 options,
@@ -359,6 +400,7 @@ impl RuntimeManager {
             failure_category: None,
         };
         inner.supervisor = None;
+        inner.completion = Some(Arc::new(GenerationCompletion::new()));
 
         command
             .stdin(Stdio::piped())
@@ -371,6 +413,7 @@ impl RuntimeManager {
                 inner.snapshot.state = RuntimeState::Failed;
                 inner.snapshot.failure_category = Some("spawn_failed");
                 transition_log(RuntimeState::Starting, RuntimeState::Failed, &instance_id);
+                complete_current_generation(&inner);
                 self.shared.changed.notify_all();
                 return Err(ManagerError::SpawnFailed);
             }
@@ -420,6 +463,10 @@ impl RuntimeManager {
                     .clone()
                     .ok_or(ManagerError::SupervisorUnavailable)?,
                 snapshot,
+                completion: inner
+                    .completion
+                    .clone()
+                    .ok_or(ManagerError::SupervisorUnavailable)?,
             }),
             RuntimeState::Starting | RuntimeState::Ready => {
                 let runtime_instance_id = snapshot
@@ -440,6 +487,10 @@ impl RuntimeManager {
                 Ok(StopDecision::WaitForGeneration {
                     runtime_instance_id,
                     snapshot,
+                    completion: inner
+                        .completion
+                        .clone()
+                        .ok_or(ManagerError::SupervisorUnavailable)?,
                 })
             }
         }
@@ -464,38 +515,42 @@ impl RuntimeManager {
             StopDecision::Complete(snapshot) => Ok(snapshot),
             StopDecision::WaitForGeneration {
                 runtime_instance_id,
+                completion,
                 ..
-            } => self.wait_for_generation(&runtime_instance_id),
+            } => self.wait_for_generation(&runtime_instance_id, &completion),
         }
     }
 
     fn wait_for_generation(
         &self,
         runtime_instance_id: &str,
+        completion: &GenerationCompletion,
     ) -> Result<RuntimeSnapshot, ManagerError> {
         let deadline = Instant::now() + self.shared.options.command_timeout;
-        let mut inner = lock_inner(&self.shared);
+        let mut result = completion
+            .result
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         loop {
-            if inner.snapshot.runtime_instance_id.as_deref() != Some(runtime_instance_id)
-                || !inner.snapshot.state.is_active()
-            {
-                return Ok(inner.snapshot.clone());
+            if let Some(snapshot) = result.as_ref() {
+                debug_assert_eq!(
+                    snapshot.runtime_instance_id.as_deref(),
+                    Some(runtime_instance_id)
+                );
+                return Ok(snapshot.clone());
             }
             let now = Instant::now();
             if now >= deadline {
                 return Err(ManagerError::CommandTimeout);
             }
             let remaining = deadline.saturating_duration_since(now);
-            let (guard, result) = self
-                .shared
+            let (guard, wait_result) = completion
                 .changed
-                .wait_timeout(inner, remaining)
+                .wait_timeout(result, remaining)
                 .unwrap_or_else(|error| error.into_inner());
-            inner = guard;
-            if result.timed_out()
-                && inner.snapshot.runtime_instance_id.as_deref() == Some(runtime_instance_id)
-                && inner.snapshot.state.is_active()
-            {
+            let timed_out = wait_result.timed_out();
+            result = guard;
+            if timed_out && result.is_none() {
                 return Err(ManagerError::CommandTimeout);
             }
         }
@@ -588,6 +643,13 @@ fn lock_inner(shared: &Shared) -> MutexGuard<'_, Inner> {
         .unwrap_or_else(|error| error.into_inner())
 }
 
+// Called with `Inner` locked, before a newer generation can replace its snapshot.
+fn complete_current_generation(inner: &Inner) {
+    if let Some(completion) = &inner.completion {
+        completion.finish(&inner.snapshot);
+    }
+}
+
 fn transition_allowed(from: RuntimeState, to: RuntimeState) -> bool {
     matches!(
         (from, to),
@@ -664,6 +726,7 @@ fn finish_child_exit(shared: &Shared, instance_id: &str, status: ExitStatus) {
     inner.snapshot.exit_code = status.code();
     transition_locked(&mut inner, target, instance_id);
     inner.supervisor = None;
+    complete_current_generation(&inner);
     eprintln!(
         "runtime child exited instance_id={instance_id} exit_code={:?} state={}",
         inner.snapshot.exit_code,
@@ -688,6 +751,7 @@ fn finish_start_failure(
     inner.snapshot.exit_code = status.and_then(|value| value.code());
     transition_locked(&mut inner, RuntimeState::Failed, instance_id);
     inner.supervisor = None;
+    complete_current_generation(&inner);
     eprintln!("runtime failed instance_id={instance_id} category={category}");
     shared.changed.notify_all();
 }
@@ -708,6 +772,7 @@ fn finish_after_ready_failure(
     inner.snapshot.exit_code = status.and_then(|value| value.code());
     transition_locked(&mut inner, RuntimeState::Crashed, instance_id);
     inner.supervisor = None;
+    complete_current_generation(&inner);
     eprintln!("runtime crashed instance_id={instance_id} category={category}");
     shared.changed.notify_all();
 }
@@ -726,6 +791,7 @@ fn finish_stopped(
         inner.snapshot.failure_category = failure_category;
         transition_locked(&mut inner, RuntimeState::Stopped, instance_id);
         inner.supervisor = None;
+        complete_current_generation(&inner);
         eprintln!(
             "runtime stopped instance_id={instance_id} exit_code={:?} failure_category={:?}",
             inner.snapshot.exit_code, inner.snapshot.failure_category
@@ -744,13 +810,29 @@ fn supervise_child(
     options: RuntimeOptions,
 ) {
     let startup_deadline = Instant::now() + options.startup_timeout;
+    let mut readiness_channel_closed = false;
     loop {
         let state = lock_inner(&shared).snapshot.state;
-        if state == RuntimeState::Starting && Instant::now() >= startup_deadline {
-            let _ = child.kill();
-            let status = child.wait().ok();
-            finish_start_failure(&shared, &instance_id, "startup_timeout", status);
-            return;
+        if state == RuntimeState::Starting {
+            // EOF can precede process exit. Resolve the process outcome before
+            // classifying the closed readiness channel at the startup deadline.
+            if readiness_channel_closed {
+                if let Ok(Some(status)) = child.try_wait() {
+                    finish_child_exit(&shared, &instance_id, status);
+                    return;
+                }
+            }
+            if Instant::now() >= startup_deadline {
+                let _ = child.kill();
+                let status = child.wait().ok();
+                let category = if readiness_channel_closed {
+                    "readiness_channel_closed"
+                } else {
+                    "startup_timeout"
+                };
+                finish_start_failure(&shared, &instance_id, category, status);
+                return;
+            }
         }
 
         let timeout = if state == RuntimeState::Starting {
@@ -828,14 +910,8 @@ fn supervise_child(
             SupervisorMessage::StdoutClosed => {
                 let state = lock_inner(&shared).snapshot.state;
                 if state == RuntimeState::Starting {
-                    if let Ok(Some(status)) = child.try_wait() {
-                        finish_child_exit(&shared, &instance_id, status);
-                        return;
-                    }
-                    let _ = child.kill();
-                    let status = child.wait().ok();
-                    finish_start_failure(&shared, &instance_id, "readiness_channel_closed", status);
-                    return;
+                    readiness_channel_closed = true;
+                    // Keep accepting STOP while process exit and EOF are aggregated.
                 }
             }
             SupervisorMessage::StdoutFailed => {
@@ -1094,6 +1170,12 @@ fn run_helper(mode: HelperMode, instance_id: &str, stale_instance_id: Option<&st
 
     match mode {
         HelperMode::CrashBeforeReady => return 41,
+        HelperMode::ExitZeroBeforeReady => return 0,
+        HelperMode::CloseStdoutThenExit => {
+            drop(output);
+            close_stdout_for_helper();
+            return 47;
+        }
         HelperMode::SlowReady => thread::sleep(Duration::from_millis(900)),
         HelperMode::CloseStdoutBeforeReady => {
             drop(output);
@@ -1251,6 +1333,8 @@ fn command_result(
 mod tests {
     #[path = "runtime_manager_linearization_tests.rs"]
     mod linearization_tests;
+    #[path = "runtime_manager_preready_tests.rs"]
+    mod preready_tests;
 
     use super::*;
     use std::{
