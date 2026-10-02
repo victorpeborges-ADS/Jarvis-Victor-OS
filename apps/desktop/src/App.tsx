@@ -1,8 +1,8 @@
 import { useEffect, useState } from "react";
 import { invoke, isTauri } from "@tauri-apps/api/core";
 import "./App.css";
-import { executeRuntimeCommand, parseRuntimeEnvelope } from "./runtimeCommand";
-import type { RuntimeEnvelope, RuntimeState, RuntimeCommand } from "./runtimeCommand";
+import { executeRuntimeCommand, parseRuntimeEnvelope, parseTransportSnapshot } from "./runtimeCommand";
+import type { RuntimeEnvelope, RuntimeState, RuntimeCommand, TransportSnapshot, TransportState } from "./runtimeCommand";
 
 const STORAGE_KEY = "jarvis-desktop-demo-captures-v1";
 const sections = ["Agora", "Inbox", "Missões", "Aprovações", "Runtime local", "Configurações"] as const;
@@ -16,6 +16,15 @@ const runtimeStateLabels: Record<RuntimeState, string> = {
   STOPPING: "Encerrando",
   FAILED: "Falhou",
   CRASHED: "Interrompido",
+};
+
+const transportStateLabels: Record<TransportState, string> = {
+  DISCONNECTED: "Desconectado",
+  DISCOVERING: "Localizando canal",
+  PROVING_INSTANCE: "Validando instância",
+  READY: "Autenticado",
+  INCOMPATIBLE: "Versão incompatível",
+  FAILED: "Falhou",
 };
 
 function readCaptures(): Capture[] {
@@ -36,6 +45,7 @@ function App() {
   const [syntheticConfirmed, setSyntheticConfirmed] = useState(false);
   const [notice, setNotice] = useState("");
   const [runtime, setRuntime] = useState<RuntimeEnvelope | null>(null);
+  const [transport, setTransport] = useState<TransportSnapshot | null>(null);
   const [runtimeError, setRuntimeError] = useState("");
   const [runtimeBusy, setRuntimeBusy] = useState(false);
   const runtimeAvailable = isTauri();
@@ -45,10 +55,15 @@ function App() {
     let cancelled = false;
     const refresh = async () => {
       try {
-        const response = await invoke<string>("runtime_status");
+        const [response, transportResponse] = await Promise.all([
+          invoke<string>("runtime_status"),
+          invoke<string>("runtime_transport_status"),
+        ]);
         const next = parseRuntimeEnvelope(response);
+        const nextTransport = parseTransportSnapshot(transportResponse);
         if (!cancelled) {
           setRuntime(next);
+          setTransport(nextTransport);
           setRuntimeError("");
         }
       } catch {
@@ -72,6 +87,18 @@ function App() {
       if (!operation.ok) setRuntimeError(operation.error ?? "A ação não foi concluída.");
     } catch {
       setRuntimeError("Não foi possível chamar o supervisor local.");
+    } finally {
+      setRuntimeBusy(false);
+    }
+  }
+
+  async function probeRuntimeTransport() {
+    setRuntimeBusy(true);
+    setRuntimeError("");
+    try {
+      setTransport(parseTransportSnapshot(await invoke<string>("runtime_transport_probe")));
+    } catch {
+      setRuntimeError("Não foi possível validar o canal local supervisionado.");
     } finally {
       setRuntimeBusy(false);
     }
@@ -136,6 +163,9 @@ function App() {
         <p>Este helper sintético valida início, prontidão, encerramento e recuperação. Ele não acessa a API G5, SQLite, rede ou dados do produto.</p>
         <dl className="runtime-status" aria-live="polite">
           <div><dt>Estado</dt><dd>{runtime ? runtimeStateLabels[runtime.snapshot.state] : runtimeAvailable ? "Consultando" : "Indisponível neste preview"}</dd></div>
+          <div><dt>Canal autenticado</dt><dd>{transport ? transportStateLabels[transport.state] : runtimeAvailable ? "Consultando" : "Indisponível neste preview"}</dd></div>
+          {transport?.state === "READY" && <div><dt>Transporte</dt><dd>Socket Unix · protocolo {transport.protocol_version}</dd></div>}
+          {transport?.error_category && <div><dt>Falha do canal</dt><dd>{transport.error_category}</dd></div>}
           {runtime?.snapshot.pid !== null && runtime?.snapshot.pid !== undefined && <div><dt>PID informativo</dt><dd>{runtime.snapshot.pid}</dd></div>}
           {runtime?.snapshot.runtime_instance_id && <div><dt>Instância</dt><dd><code>{runtime.snapshot.runtime_instance_id}</code></dd></div>}
           {runtime?.snapshot.failure_category && <div><dt>Categoria</dt><dd>{runtime.snapshot.failure_category}</dd></div>}
@@ -145,6 +175,7 @@ function App() {
           <button className="action" type="button" disabled={!runtimeAvailable || runtimeBusy || runtime?.snapshot.state !== "STOPPED"} onClick={() => void runRuntimeCommand("runtime_start_test")}>Iniciar</button>
           <button className="action secondary" type="button" disabled={!runtimeAvailable || runtimeBusy || !["STARTING", "READY", "STOPPING"].includes(runtime?.snapshot.state ?? "")} onClick={() => void runRuntimeCommand("runtime_stop")}>Parar</button>
           <button className="action secondary" type="button" disabled={!runtimeAvailable || runtimeBusy || !["FAILED", "CRASHED"].includes(runtime?.snapshot.state ?? "")} onClick={() => void runRuntimeCommand("runtime_restart_test")}>Reiniciar</button>
+          <button className="action secondary" type="button" disabled={!runtimeAvailable || runtimeBusy || runtime?.snapshot.state !== "READY" || transport?.state === "READY"} onClick={() => void probeRuntimeTransport()}>Verificar canal local</button>
         </div>
         {!runtimeAvailable && <p className="runtime-hint">Os comandos de processo ficam disponíveis somente no aplicativo macOS. Este preview web não inicia processos.</p>}
         {runtimeError && <p className="notice" role="alert">{runtimeError}</p>}

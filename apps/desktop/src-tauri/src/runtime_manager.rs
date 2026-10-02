@@ -1,3 +1,4 @@
+use crate::transport::{ChildTransportConfig, TransportSession, TransportSnapshot, TransportState};
 #[cfg(test)]
 use std::path::{Path, PathBuf};
 use std::{
@@ -124,6 +125,8 @@ enum HelperMode {
     DuplicateReadiness,
     #[cfg(test)]
     CloseStdoutBeforeReady,
+    #[cfg(test)]
+    MissingTransport,
 }
 
 impl HelperMode {
@@ -152,6 +155,8 @@ impl HelperMode {
             Self::DuplicateReadiness => "duplicate-readiness",
             #[cfg(test)]
             Self::CloseStdoutBeforeReady => "close-stdout-before-ready",
+            #[cfg(test)]
+            Self::MissingTransport => "missing-transport",
         }
     }
 
@@ -180,6 +185,8 @@ impl HelperMode {
             "duplicate-readiness" => Self::DuplicateReadiness,
             #[cfg(test)]
             "close-stdout-before-ready" => Self::CloseStdoutBeforeReady,
+            #[cfg(test)]
+            "missing-transport" => Self::MissingTransport,
             _ => return None,
         })
     }
@@ -219,6 +226,8 @@ struct Shared {
 
 struct Inner {
     snapshot: RuntimeSnapshot,
+    transport_snapshot: TransportSnapshot,
+    transport_session: Option<Arc<TransportSession>>,
     supervisor: Option<Sender<SupervisorMessage>>,
     completion: Option<Arc<GenerationCompletion>>,
 }
@@ -286,6 +295,7 @@ pub(crate) enum ManagerError {
     SupervisorUnavailable,
     CommandTimeout,
     SpawnFailed,
+    TransportSetupFailed,
 }
 
 impl ManagerError {
@@ -305,6 +315,7 @@ impl ManagerError {
             Self::SupervisorUnavailable => "O supervisor local não está disponível.",
             Self::CommandTimeout => "O runtime não confirmou o encerramento dentro do prazo.",
             Self::SpawnFailed => "Não foi possível iniciar o processo de teste.",
+            Self::TransportSetupFailed => "Não foi possível preparar o canal local autenticado.",
         }
     }
 }
@@ -319,6 +330,8 @@ impl RuntimeManager {
             shared: Arc::new(Shared {
                 inner: Mutex::new(Inner {
                     snapshot: RuntimeSnapshot::stopped(),
+                    transport_snapshot: TransportSnapshot::disconnected(),
+                    transport_session: None,
                     supervisor: None,
                     completion: None,
                 }),
@@ -345,6 +358,52 @@ impl RuntimeManager {
 
     fn status_json(&self) -> String {
         json_envelope(true, &self.snapshot(), None)
+    }
+
+    fn transport_status_json(&self) -> String {
+        lock_inner(&self.shared).transport_snapshot.json()
+    }
+
+    fn probe_transport_now(&self) -> TransportSnapshot {
+        let (instance_id, session) = {
+            let mut inner = lock_inner(&self.shared);
+            if inner.snapshot.state != RuntimeState::Ready {
+                let instance_id = inner.snapshot.runtime_instance_id.clone();
+                inner.transport_snapshot = TransportSnapshot {
+                    state: TransportState::Failed,
+                    runtime_instance_id: instance_id,
+                    endpoint_type: Some("uds"),
+                    protocol_version: None,
+                    error_category: Some("runtime_not_ready"),
+                };
+                return inner.transport_snapshot.clone();
+            }
+            let Some(session) = inner.transport_session.clone() else {
+                inner.transport_snapshot = TransportSnapshot {
+                    state: TransportState::Failed,
+                    runtime_instance_id: inner.snapshot.runtime_instance_id.clone(),
+                    endpoint_type: Some("uds"),
+                    protocol_version: None,
+                    error_category: Some("endpoint_unavailable"),
+                };
+                return inner.transport_snapshot.clone();
+            };
+            let instance_id = inner
+                .snapshot
+                .runtime_instance_id
+                .clone()
+                .expect("ready runtime has an instance ID");
+            inner.transport_snapshot = TransportSnapshot {
+                state: TransportState::ProvingInstance,
+                runtime_instance_id: Some(instance_id.clone()),
+                endpoint_type: Some("uds"),
+                protocol_version: None,
+                error_category: None,
+            };
+            (instance_id, session)
+        };
+        complete_transport_probe(&self.shared, &instance_id, session);
+        lock_inner(&self.shared).transport_snapshot.clone()
     }
 
     fn start_test(&self) -> Result<RuntimeSnapshot, ManagerError> {
@@ -381,6 +440,8 @@ impl RuntimeManager {
         }
 
         let instance_id = new_instance_id();
+        let transport_session = TransportSession::create(&instance_id)
+            .map_err(|_| ManagerError::TransportSetupFailed)?;
         let mut command = helper_command(
             &instance_id,
             mode,
@@ -399,6 +460,8 @@ impl RuntimeManager {
             exit_code: None,
             failure_category: None,
         };
+        inner.transport_snapshot = TransportSnapshot::discovering(&instance_id);
+        inner.transport_session = Some(Arc::clone(&transport_session));
         inner.supervisor = None;
         inner.completion = Some(Arc::new(GenerationCompletion::new()));
 
@@ -412,6 +475,12 @@ impl RuntimeManager {
             Err(_) => {
                 inner.snapshot.state = RuntimeState::Failed;
                 inner.snapshot.failure_category = Some("spawn_failed");
+                revoke_transport_locked(
+                    &mut inner,
+                    &instance_id,
+                    TransportState::Failed,
+                    Some("spawn_failed"),
+                );
                 transition_log(RuntimeState::Starting, RuntimeState::Failed, &instance_id);
                 complete_current_generation(&inner);
                 self.shared.changed.notify_all();
@@ -426,7 +495,17 @@ impl RuntimeManager {
             .stdout
             .take()
             .expect("stdout is piped for runtime helper");
-        let stdin = child.stdin.take();
+        let mut stdin = child.stdin.take();
+        let init_written = stdin
+            .as_mut()
+            .is_some_and(|pipe| transport_session.write_child_init(pipe).is_ok());
+        if !init_written {
+            drop(inner);
+            let _ = child.kill();
+            let status = child.wait().ok();
+            finish_start_failure(&self.shared, &instance_id, "transport_init_failed", status);
+            return Err(ManagerError::TransportSetupFailed);
+        }
         let (sender, receiver) = mpsc::channel();
         inner.supervisor = Some(sender.clone());
         let reader_sender = sender.clone();
@@ -436,7 +515,15 @@ impl RuntimeManager {
         let options = self.shared.options;
         let worker_instance_id = instance_id.clone();
         thread::spawn(move || {
-            supervise_child(shared, worker_instance_id, child, stdin, receiver, options)
+            supervise_child(
+                shared,
+                worker_instance_id,
+                child,
+                stdin,
+                receiver,
+                options,
+                transport_session,
+            )
         });
 
         self.shared.changed.notify_all();
@@ -453,6 +540,12 @@ impl RuntimeManager {
                 let instance_id = snapshot.runtime_instance_id.as_deref().unwrap_or_default();
                 if transition_locked(&mut inner, RuntimeState::Stopped, instance_id) {
                     inner.supervisor = None;
+                    revoke_transport_locked(
+                        &mut inner,
+                        instance_id,
+                        TransportState::Disconnected,
+                        None,
+                    );
                 }
                 self.shared.changed.notify_all();
                 Ok(StopDecision::Complete(inner.snapshot.clone()))
@@ -483,6 +576,25 @@ impl RuntimeManager {
                         return Ok(StopDecision::Complete(inner.snapshot.clone()));
                     }
                     return Err(ManagerError::SupervisorUnavailable);
+                }
+                if snapshot.state == RuntimeState::Starting {
+                    if let Some(session) = inner.transport_session.as_ref() {
+                        session.deactivate();
+                    }
+                    inner.transport_snapshot = TransportSnapshot {
+                        state: TransportState::Disconnected,
+                        runtime_instance_id: Some(runtime_instance_id.clone()),
+                        endpoint_type: Some("uds"),
+                        protocol_version: None,
+                        error_category: None,
+                    };
+                } else {
+                    revoke_transport_locked(
+                        &mut inner,
+                        &runtime_instance_id,
+                        TransportState::Disconnected,
+                        None,
+                    );
                 }
                 Ok(StopDecision::WaitForGeneration {
                     runtime_instance_id,
@@ -619,6 +731,46 @@ impl RuntimeManager {
     }
 
     #[cfg(test)]
+    fn wait_for_transport_state(
+        &self,
+        target: TransportState,
+        timeout: Duration,
+    ) -> TransportSnapshot {
+        let deadline = Instant::now() + timeout;
+        let mut inner = lock_inner(&self.shared);
+        loop {
+            if inner.transport_snapshot.state == target {
+                return inner.transport_snapshot.clone();
+            }
+            let now = Instant::now();
+            assert!(
+                now < deadline,
+                "timeout waiting for {target:?}; current={:?}",
+                inner.transport_snapshot
+            );
+            let (guard, result) = self
+                .shared
+                .changed
+                .wait_timeout(inner, deadline.saturating_duration_since(now))
+                .unwrap_or_else(|error| error.into_inner());
+            inner = guard;
+            assert!(
+                !result.timed_out() || inner.transport_snapshot.state == target,
+                "timeout waiting for {target:?}; current={:?}",
+                inner.transport_snapshot
+            );
+        }
+    }
+
+    #[cfg(test)]
+    fn transport_session_for_test(&self) -> Arc<TransportSession> {
+        lock_inner(&self.shared)
+            .transport_session
+            .clone()
+            .expect("active generation has a transport session")
+    }
+
+    #[cfg(test)]
     fn has_supervisor(&self) -> bool {
         lock_inner(&self.shared).supervisor.is_some()
     }
@@ -706,6 +858,73 @@ fn mark_ready(shared: &Shared, instance_id: &str) -> bool {
     true
 }
 
+fn complete_transport_probe(shared: &Shared, instance_id: &str, session: Arc<TransportSession>) {
+    let result = session.probe();
+    let mut inner = lock_inner(shared);
+    if inner.snapshot.runtime_instance_id.as_deref() != Some(instance_id)
+        || inner.snapshot.state != RuntimeState::Ready
+        || !inner
+            .transport_session
+            .as_ref()
+            .is_some_and(|current| Arc::ptr_eq(current, &session))
+    {
+        return;
+    }
+    match result {
+        Ok(()) => {
+            inner.transport_snapshot = TransportSnapshot {
+                state: TransportState::Ready,
+                runtime_instance_id: Some(instance_id.to_owned()),
+                endpoint_type: Some("uds"),
+                protocol_version: Some("1".to_owned()),
+                error_category: None,
+            };
+            eprintln!(
+                "transport ready instance_id={instance_id} endpoint_type=uds protocol_version=1"
+            );
+        }
+        Err(error) => {
+            inner.transport_snapshot = TransportSnapshot {
+                state: if error.incompatible() {
+                    TransportState::Incompatible
+                } else {
+                    TransportState::Failed
+                },
+                runtime_instance_id: Some(instance_id.to_owned()),
+                endpoint_type: Some("uds"),
+                protocol_version: None,
+                error_category: Some(error.category()),
+            };
+            eprintln!(
+                "transport failed instance_id={instance_id} endpoint_type=uds category={}",
+                error.category()
+            );
+        }
+    }
+    shared.changed.notify_all();
+}
+
+fn revoke_transport_locked(
+    inner: &mut Inner,
+    instance_id: &str,
+    state: TransportState,
+    error_category: Option<&'static str>,
+) {
+    if inner.snapshot.runtime_instance_id.as_deref() != Some(instance_id) {
+        return;
+    }
+    if let Some(session) = inner.transport_session.take() {
+        session.revoke();
+    }
+    inner.transport_snapshot = TransportSnapshot {
+        state,
+        runtime_instance_id: Some(instance_id.to_owned()),
+        endpoint_type: Some("uds"),
+        protocol_version: None,
+        error_category,
+    };
+}
+
 fn finish_child_exit(shared: &Shared, instance_id: &str, status: ExitStatus) {
     let mut inner = lock_inner(shared);
     if inner.snapshot.runtime_instance_id.as_deref() != Some(instance_id) {
@@ -725,6 +944,16 @@ fn finish_child_exit(shared: &Shared, instance_id: &str, status: ExitStatus) {
     };
     inner.snapshot.exit_code = status.code();
     transition_locked(&mut inner, target, instance_id);
+    revoke_transport_locked(
+        &mut inner,
+        instance_id,
+        if target == RuntimeState::Stopped {
+            TransportState::Disconnected
+        } else {
+            TransportState::Failed
+        },
+        Some("runtime_exited"),
+    );
     inner.supervisor = None;
     complete_current_generation(&inner);
     eprintln!(
@@ -750,6 +979,12 @@ fn finish_start_failure(
     inner.snapshot.failure_category = Some(category);
     inner.snapshot.exit_code = status.and_then(|value| value.code());
     transition_locked(&mut inner, RuntimeState::Failed, instance_id);
+    revoke_transport_locked(
+        &mut inner,
+        instance_id,
+        TransportState::Failed,
+        Some(category),
+    );
     inner.supervisor = None;
     complete_current_generation(&inner);
     eprintln!("runtime failed instance_id={instance_id} category={category}");
@@ -771,6 +1006,12 @@ fn finish_after_ready_failure(
     inner.snapshot.failure_category = Some(category);
     inner.snapshot.exit_code = status.and_then(|value| value.code());
     transition_locked(&mut inner, RuntimeState::Crashed, instance_id);
+    revoke_transport_locked(
+        &mut inner,
+        instance_id,
+        TransportState::Failed,
+        Some(category),
+    );
     inner.supervisor = None;
     complete_current_generation(&inner);
     eprintln!("runtime crashed instance_id={instance_id} category={category}");
@@ -790,6 +1031,7 @@ fn finish_stopped(
         inner.snapshot.exit_code = status.and_then(|value| value.code());
         inner.snapshot.failure_category = failure_category;
         transition_locked(&mut inner, RuntimeState::Stopped, instance_id);
+        revoke_transport_locked(&mut inner, instance_id, TransportState::Disconnected, None);
         inner.supervisor = None;
         complete_current_generation(&inner);
         eprintln!(
@@ -808,6 +1050,7 @@ fn supervise_child(
     mut stdin: Option<std::process::ChildStdin>,
     receiver: Receiver<SupervisorMessage>,
     options: RuntimeOptions,
+    transport_session: Arc<TransportSession>,
 ) {
     let startup_deadline = Instant::now() + options.startup_timeout;
     let mut readiness_channel_closed = false;
@@ -905,6 +1148,27 @@ fn supervise_child(
                         );
                         return;
                     }
+                    {
+                        let mut inner = lock_inner(&shared);
+                        if inner.snapshot.runtime_instance_id.as_deref()
+                            == Some(instance_id.as_str())
+                            && inner.snapshot.state == RuntimeState::Ready
+                        {
+                            inner.transport_snapshot = TransportSnapshot {
+                                state: TransportState::ProvingInstance,
+                                runtime_instance_id: Some(instance_id.clone()),
+                                endpoint_type: Some("uds"),
+                                protocol_version: None,
+                                error_category: None,
+                            };
+                        }
+                    }
+                    let probe_shared = Arc::clone(&shared);
+                    let probe_instance = instance_id.clone();
+                    let probe_session = Arc::clone(&transport_session);
+                    thread::spawn(move || {
+                        complete_transport_probe(&probe_shared, &probe_instance, probe_session)
+                    });
                 }
             }
             SupervisorMessage::StdoutClosed => {
@@ -1167,6 +1431,18 @@ fn run_helper(mode: HelperMode, instance_id: &str, stale_instance_id: Option<&st
     let stdout = io::stdout();
     let mut output = stdout.lock();
     let mut input = BufReader::new(io::stdin());
+    let transport = match crate::transport::read_child_init(&mut input, instance_id) {
+        Ok(config) => config,
+        Err(_) => return 44,
+    };
+    let listener = if mode == HelperMode::Normal {
+        match transport.bind() {
+            Ok(listener) => Some(listener),
+            Err(_) => return 45,
+        }
+    } else {
+        None
+    };
 
     match mode {
         HelperMode::CrashBeforeReady => return 41,
@@ -1232,6 +1508,10 @@ fn run_helper(mode: HelperMode, instance_id: &str, stale_instance_id: Option<&st
         }
     }
 
+    if let Some(listener) = listener {
+        return serve_transport_until_stop(transport, listener, input, instance_id);
+    }
+
     loop {
         let mut line = String::new();
         if input.read_line(&mut line).unwrap_or(0) == 0 {
@@ -1247,6 +1527,15 @@ fn run_helper(mode: HelperMode, instance_id: &str, stale_instance_id: Option<&st
 fn run_helper(_mode: HelperMode, instance_id: &str, _stale_instance_id: Option<&str>) -> i32 {
     let stdout = io::stdout();
     let mut output = stdout.lock();
+    let mut input = BufReader::new(io::stdin());
+    let transport = match crate::transport::read_child_init(&mut input, instance_id) {
+        Ok(config) => config,
+        Err(_) => return 44,
+    };
+    let listener = match transport.bind() {
+        Ok(listener) => listener,
+        Err(_) => return 45,
+    };
     if writeln!(output, "{READY_PREFIX}{instance_id}")
         .and_then(|_| output.flush())
         .is_err()
@@ -1255,17 +1544,38 @@ fn run_helper(_mode: HelperMode, instance_id: &str, _stale_instance_id: Option<&
     }
     drop(output);
 
-    let mut input = BufReader::new(io::stdin());
     if !wait_for_ack(&mut input, instance_id) {
         return 0;
     }
-    loop {
+    serve_transport_until_stop(transport, listener, input, instance_id)
+}
+
+fn serve_transport_until_stop(
+    transport: ChildTransportConfig,
+    listener: std::os::unix::net::UnixListener,
+    input: BufReader<io::Stdin>,
+    instance_id: &str,
+) -> i32 {
+    let (stop_sender, stop_receiver) = mpsc::channel();
+    let expected_stop = format!("{STOP_PREFIX}{instance_id}");
+    thread::spawn(move || {
+        let mut input = input;
         let mut line = String::new();
-        if input.read_line(&mut line).unwrap_or(0) == 0 {
+        while input.read_line(&mut line).unwrap_or(0) > 0 {
+            if line.trim_end_matches(['\r', '\n']) == expected_stop {
+                let _ = stop_sender.send(());
+                return;
+            }
+            line.clear();
+        }
+    });
+    loop {
+        if stop_receiver.try_recv().is_ok() {
             return 0;
         }
-        if line.trim_end_matches(['\r', '\n']) == format!("{STOP_PREFIX}{instance_id}") {
-            return 0;
+        match transport.serve_one(&listener, Duration::from_millis(10)) {
+            Ok(_) => {}
+            Err(_) => return 46,
         }
     }
 }
@@ -1291,6 +1601,16 @@ pub fn run_test_helper_from_args() -> bool {
 #[tauri::command]
 pub fn runtime_status(manager: tauri::State<'_, RuntimeManager>) -> String {
     manager.status_json()
+}
+
+#[tauri::command]
+pub fn runtime_transport_status(manager: tauri::State<'_, RuntimeManager>) -> String {
+    manager.transport_status_json()
+}
+
+#[tauri::command]
+pub fn runtime_transport_probe(manager: tauri::State<'_, RuntimeManager>) -> String {
+    manager.probe_transport_now().json()
 }
 
 #[tauri::command]
@@ -1358,6 +1678,10 @@ mod tests {
             !manager.has_supervisor(),
             "supervisor still owns a child: {snapshot:?}"
         );
+        assert!(
+            lock_inner(&manager.shared).transport_session.is_none(),
+            "transport session still belongs to a terminal runtime: {snapshot:?}"
+        );
     }
 
     #[test]
@@ -1382,8 +1706,91 @@ mod tests {
         assert_eq!(ready.runtime_instance_id, started.runtime_instance_id);
         assert!(ready.pid.is_some());
         assert!(ready.ready_at_unix_ms.is_some());
+        let transport =
+            manager.wait_for_transport_state(TransportState::Ready, Duration::from_secs(2));
+        assert_eq!(transport.runtime_instance_id, ready.runtime_instance_id);
+        assert_eq!(transport.endpoint_type, Some("uds"));
+        assert_eq!(transport.protocol_version.as_deref(), Some("1"));
+        let transport_session = manager.transport_session_for_test();
         let stopped = manager.stop_and_wait().unwrap();
         assert_eq!(stopped.state, RuntimeState::Stopped);
+        assert_eq!(
+            manager.transport_status_json().contains("DISCONNECTED"),
+            true
+        );
+        assert!(transport_session.is_clean_for_test());
+        assert_clean(&manager);
+    }
+
+    #[test]
+    fn separate_managers_and_stale_generations_cannot_cross_authenticate() {
+        let manager_a = manager();
+        let manager_b = manager();
+        manager_a.start_test().unwrap();
+        manager_b.start_test().unwrap();
+        manager_a.wait_for_state(RuntimeState::Ready, Duration::from_secs(2));
+        manager_b.wait_for_state(RuntimeState::Ready, Duration::from_secs(2));
+        manager_a.wait_for_transport_state(TransportState::Ready, Duration::from_secs(2));
+        manager_b.wait_for_transport_state(TransportState::Ready, Duration::from_secs(2));
+
+        let session_a = manager_a.transport_session_for_test();
+        let session_b = manager_b.transport_session_for_test();
+        assert_eq!(
+            session_a.probe_other_session_for_test(&session_b),
+            Err(crate::transport::TransportError::ProofRejected)
+        );
+        assert_eq!(
+            session_b.probe_other_session_for_test(&session_a),
+            Err(crate::transport::TransportError::ProofRejected)
+        );
+
+        manager_a.stop_and_wait().unwrap();
+        assert_eq!(
+            session_a.probe(),
+            Err(crate::transport::TransportError::Inactive)
+        );
+        assert!(session_a.is_clean_for_test());
+        assert_eq!(manager_b.transport_status_json().contains("READY"), true);
+
+        let generation_b = manager_a.start_test().unwrap();
+        manager_a.wait_for_state(RuntimeState::Ready, Duration::from_secs(2));
+        manager_a.wait_for_transport_state(TransportState::Ready, Duration::from_secs(2));
+        let session_generation_b = manager_a.transport_session_for_test();
+        assert_ne!(
+            session_generation_b.instance_id_for_test(),
+            session_a.instance_id_for_test()
+        );
+        assert_eq!(
+            session_a.probe_other_session_for_test(&session_generation_b),
+            Err(crate::transport::TransportError::Inactive)
+        );
+        assert_ne!(
+            generation_b.runtime_instance_id.as_deref(),
+            Some(session_a.instance_id_for_test())
+        );
+        manager_a.stop_and_wait().unwrap();
+        manager_b.stop_and_wait().unwrap();
+        assert_clean(&manager_a);
+        assert_clean(&manager_b);
+    }
+
+    #[test]
+    fn process_ready_does_not_imply_transport_ready() {
+        let manager = manager();
+        manager
+            .start_mode_for_test(HelperMode::MissingTransport)
+            .unwrap();
+        let runtime = manager.wait_for_state(RuntimeState::Ready, Duration::from_secs(2));
+        let transport =
+            manager.wait_for_transport_state(TransportState::Failed, Duration::from_secs(2));
+        assert_eq!(runtime.state, RuntimeState::Ready);
+        assert_eq!(transport.runtime_instance_id, runtime.runtime_instance_id);
+        assert_eq!(transport.error_category, Some("endpoint_unavailable"));
+        assert_eq!(manager.snapshot().state, RuntimeState::Ready);
+        assert_eq!(
+            manager.stop_and_wait().unwrap().state,
+            RuntimeState::Stopped
+        );
         assert_clean(&manager);
     }
 
@@ -1627,6 +2034,10 @@ mod tests {
         assert_eq!(started.state, RuntimeState::Starting);
         let ready = manager.wait_for_state(RuntimeState::Ready, Duration::from_secs(8));
         assert_eq!(ready.runtime_instance_id, started.runtime_instance_id);
+        let transport =
+            manager.wait_for_transport_state(TransportState::Ready, Duration::from_secs(8));
+        assert_eq!(transport.runtime_instance_id, ready.runtime_instance_id);
+        assert_eq!(transport.protocol_version.as_deref(), Some("1"));
         assert_eq!(
             manager.stop_and_wait().unwrap().state,
             RuntimeState::Stopped
@@ -1638,6 +2049,7 @@ mod tests {
         child: Child,
         stdin: ChildStdin,
         instance_id: String,
+        transport_session: Arc<TransportSession>,
     }
 
     impl ExternalHelper {
@@ -1659,11 +2071,14 @@ mod tests {
                 .stderr(Stdio::null())
                 .spawn()
                 .expect("unrelated synthetic process starts");
-            let stdin = child.stdin.take().unwrap();
+            let mut stdin = child.stdin.take().unwrap();
+            let transport_session = TransportSession::create(&instance_id).unwrap();
+            transport_session.write_child_init(&mut stdin).unwrap();
             Self {
                 child,
                 stdin,
                 instance_id,
+                transport_session,
             }
         }
 
@@ -1683,6 +2098,7 @@ mod tests {
                 let _ = self.child.kill();
             }
             let _ = self.child.wait();
+            self.transport_session.revoke();
         }
     }
 

@@ -1,6 +1,7 @@
 use tauri::Manager;
 
 pub mod runtime_manager;
+pub mod transport;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -8,6 +9,8 @@ pub fn run() {
         .manage(runtime_manager::RuntimeManager::new())
         .invoke_handler(tauri::generate_handler![
             runtime_manager::runtime_status,
+            runtime_manager::runtime_transport_status,
+            runtime_manager::runtime_transport_probe,
             runtime_manager::runtime_start_test,
             runtime_manager::runtime_stop,
             runtime_manager::runtime_restart_test,

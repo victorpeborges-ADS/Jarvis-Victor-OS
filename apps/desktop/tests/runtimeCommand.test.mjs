@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { executeRuntimeCommand } from "../src/runtimeCommand.ts";
+import { executeRuntimeCommand, parseTransportSnapshot } from "../src/runtimeCommand.ts";
 
 function envelope(state, id) {
   return JSON.stringify({
@@ -29,4 +29,21 @@ test("stop result belongs to A while the displayed status belongs to B", async (
   assert.equal(operation.snapshot.runtime_instance_id, "A");
   assert.equal(current.snapshot.runtime_instance_id, "B");
   assert.equal(current.snapshot.state, "READY");
+});
+
+test("transport status exposes only typed state and UDS protocol metadata", () => {
+  const status = parseTransportSnapshot(JSON.stringify({
+    state: "READY",
+    runtime_instance_id: "A",
+    endpoint_type: "uds",
+    protocol_version: "1",
+    error_category: null,
+    secret: "não deve atravessar IPC",
+    socket_path: "/private/jv.sock",
+  }));
+  assert.equal(status.state, "READY");
+  assert.equal(status.endpoint_type, "uds");
+  assert.equal("secret" in status, false);
+  assert.equal("socket_path" in status, false);
+  assert.throws(() => parseTransportSnapshot(JSON.stringify({ state: "READY", endpoint_type: "tcp" })));
 });
