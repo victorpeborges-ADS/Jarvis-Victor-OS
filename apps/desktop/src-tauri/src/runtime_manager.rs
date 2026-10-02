@@ -1249,6 +1249,9 @@ fn command_result(
 
 #[cfg(test)]
 mod tests {
+    #[path = "runtime_manager_linearization_tests.rs"]
+    mod linearization_tests;
+
     use super::*;
     use std::{
         io::Write,
@@ -1685,8 +1688,10 @@ mod tests {
             stop_manager.stop_and_wait()
         });
         barrier.wait();
-        let _ = starter.join().unwrap();
-        let _ = stopper.join().unwrap();
+        let start_result = starter.join().unwrap();
+        let stop_result = stopper.join().unwrap();
+        assert!(start_result.is_ok(), "start result: {start_result:?}");
+        assert!(stop_result.is_ok(), "stop result: {stop_result:?}");
         if manager.snapshot().state.is_active() {
             manager.stop_and_wait().unwrap();
         }
