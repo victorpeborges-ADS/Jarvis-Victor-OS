@@ -217,10 +217,27 @@ enum SupervisorMessage {
     Stop(Sender<RuntimeSnapshot>),
 }
 
+enum StopDecision {
+    Complete(RuntimeSnapshot),
+    WaitForGeneration {
+        runtime_instance_id: String,
+        snapshot: RuntimeSnapshot,
+    },
+}
+
+#[cfg(test)]
+#[derive(Clone)]
+struct StopWaitTestHook {
+    captured: Arc<std::sync::Barrier>,
+    resume: Arc<std::sync::Barrier>,
+}
+
 pub struct RuntimeManager {
     shared: Arc<Shared>,
     #[cfg(test)]
     helper_executable: Option<PathBuf>,
+    #[cfg(test)]
+    stop_wait_test_hook: Mutex<Option<StopWaitTestHook>>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -269,6 +286,8 @@ impl RuntimeManager {
             }),
             #[cfg(test)]
             helper_executable: None,
+            #[cfg(test)]
+            stop_wait_test_hook: Mutex::new(None),
         }
     }
 
@@ -381,48 +400,87 @@ impl RuntimeManager {
         Ok(inner.snapshot.clone())
     }
 
+    /// Linearizes the stop target under the state lock and queues STOP before releasing it.
+    fn begin_stop(&self) -> Result<StopDecision, ManagerError> {
+        let mut inner = lock_inner(&self.shared);
+        let snapshot = inner.snapshot.clone();
+        match snapshot.state {
+            RuntimeState::Stopped => Ok(StopDecision::Complete(snapshot)),
+            RuntimeState::Failed | RuntimeState::Crashed => {
+                let instance_id = snapshot.runtime_instance_id.as_deref().unwrap_or_default();
+                if transition_locked(&mut inner, RuntimeState::Stopped, instance_id) {
+                    inner.supervisor = None;
+                }
+                self.shared.changed.notify_all();
+                Ok(StopDecision::Complete(inner.snapshot.clone()))
+            }
+            RuntimeState::Stopping => Ok(StopDecision::WaitForGeneration {
+                runtime_instance_id: snapshot
+                    .runtime_instance_id
+                    .clone()
+                    .ok_or(ManagerError::SupervisorUnavailable)?,
+                snapshot,
+            }),
+            RuntimeState::Starting | RuntimeState::Ready => {
+                let runtime_instance_id = snapshot
+                    .runtime_instance_id
+                    .clone()
+                    .ok_or(ManagerError::SupervisorUnavailable)?;
+                let sender = inner
+                    .supervisor
+                    .clone()
+                    .ok_or(ManagerError::SupervisorUnavailable)?;
+                let (reply_tx, _reply_rx) = mpsc::channel();
+                if sender.send(SupervisorMessage::Stop(reply_tx)).is_err() {
+                    if inner.snapshot.state.is_terminal() {
+                        return Ok(StopDecision::Complete(inner.snapshot.clone()));
+                    }
+                    return Err(ManagerError::SupervisorUnavailable);
+                }
+                Ok(StopDecision::WaitForGeneration {
+                    runtime_instance_id,
+                    snapshot,
+                })
+            }
+        }
+    }
+
     /// Requests a controlled stop and returns immediately. The supervisor owns and reaps the child.
     fn request_stop(&self) -> Result<RuntimeSnapshot, ManagerError> {
-        let sender = {
-            let mut inner = lock_inner(&self.shared);
-            let state = inner.snapshot.state;
-            match state {
-                RuntimeState::Stopped => return Ok(inner.snapshot.clone()),
-                RuntimeState::Failed | RuntimeState::Crashed => {
-                    let instance_id = inner
-                        .snapshot
-                        .runtime_instance_id
-                        .clone()
-                        .unwrap_or_default();
-                    if transition_locked(&mut inner, RuntimeState::Stopped, &instance_id) {
-                        inner.supervisor = None;
-                    }
-                    self.shared.changed.notify_all();
-                    return Ok(inner.snapshot.clone());
-                }
-                RuntimeState::Stopping => return Ok(inner.snapshot.clone()),
-                RuntimeState::Starting | RuntimeState::Ready => inner.supervisor.clone(),
+        match self.begin_stop()? {
+            StopDecision::Complete(snapshot) | StopDecision::WaitForGeneration { snapshot, .. } => {
+                Ok(snapshot)
             }
-        };
-
-        let sender = sender.ok_or(ManagerError::SupervisorUnavailable)?;
-        let (reply_tx, _reply_rx) = mpsc::channel();
-        if sender.send(SupervisorMessage::Stop(reply_tx)).is_err() {
-            let snapshot = self.snapshot();
-            if snapshot.state.is_terminal() {
-                return Ok(snapshot);
-            }
-            return Err(ManagerError::SupervisorUnavailable);
         }
-        Ok(self.snapshot())
     }
 
     /// Used during normal application exit and in lifecycle tests; waits until the child is reaped.
     pub(crate) fn stop_and_wait(&self) -> Result<RuntimeSnapshot, ManagerError> {
-        self.request_stop()?;
+        let decision = self.begin_stop()?;
+        #[cfg(test)]
+        self.pause_stop_wait_for_test();
+
+        match decision {
+            StopDecision::Complete(snapshot) => Ok(snapshot),
+            StopDecision::WaitForGeneration {
+                runtime_instance_id,
+                ..
+            } => self.wait_for_generation(&runtime_instance_id),
+        }
+    }
+
+    fn wait_for_generation(
+        &self,
+        runtime_instance_id: &str,
+    ) -> Result<RuntimeSnapshot, ManagerError> {
         let deadline = Instant::now() + self.shared.options.command_timeout;
         let mut inner = lock_inner(&self.shared);
-        while inner.snapshot.state.is_active() {
+        loop {
+            if inner.snapshot.runtime_instance_id.as_deref() != Some(runtime_instance_id)
+                || !inner.snapshot.state.is_active()
+            {
+                return Ok(inner.snapshot.clone());
+            }
             let now = Instant::now();
             if now >= deadline {
                 return Err(ManagerError::CommandTimeout);
@@ -434,11 +492,34 @@ impl RuntimeManager {
                 .wait_timeout(inner, remaining)
                 .unwrap_or_else(|error| error.into_inner());
             inner = guard;
-            if result.timed_out() && inner.snapshot.state.is_active() {
+            if result.timed_out()
+                && inner.snapshot.runtime_instance_id.as_deref() == Some(runtime_instance_id)
+                && inner.snapshot.state.is_active()
+            {
                 return Err(ManagerError::CommandTimeout);
             }
         }
-        Ok(inner.snapshot.clone())
+    }
+
+    #[cfg(test)]
+    fn set_stop_wait_test_hook(&self, hook: Option<StopWaitTestHook>) {
+        *self
+            .stop_wait_test_hook
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = hook;
+    }
+
+    #[cfg(test)]
+    fn pause_stop_wait_for_test(&self) {
+        let hook = self
+            .stop_wait_test_hook
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone();
+        if let Some(hook) = hook {
+            hook.captured.wait();
+            hook.resume.wait();
+        }
     }
 
     #[cfg(test)]
