@@ -35,7 +35,7 @@ stateDiagram-v2
 
 - Startup vence em 5 s na configuração de produção: mata pelo handle e recolhe com `wait()`.
 - Saída antes de readiness produz `FAILED`; saída inesperada depois de readiness produz `CRASHED`.
-- Fechamento/falha de stdout antes de prontidão produz `FAILED`; depois de prontidão produz `CRASHED`.
+- Fechamento de stdout antes de prontidão aguarda a saída do child até o prazo de startup: saída observada produz `FAILED/child_exit_before_ready`; child ainda vivo no prazo produz `FAILED/readiness_channel_closed`. Falha de leitura do canal mantém sua categoria própria. Depois de prontidão, a saída inesperada produz `CRASHED`.
 - Após aceitar readiness, o manager escreve o ACK no pipe; se a escrita falhar, encerra o child e marca `CRASHED` com `readiness_ack_failed`.
 - Stop em startup ou pronto passa a `STOPPING`, escreve comando de parada e aguarda até 700 ms.
 - Se o child não sair no prazo, o supervisor mata apenas o handle próprio, chama `wait()` e fecha em `STOPPED` com `failure_category=shutdown_timeout`.

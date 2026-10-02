@@ -22,6 +22,8 @@ O valor é derivado de PID do parent, nanossegundos desde Unix epoch e sequênci
 
 O manager só reconhece uma linha completa que corresponda ao ID corrente. Após validação, escreve ACK no pipe; se não puder escrever, mata e recolhe o child e marca falha. Esta prontidão significa apenas que o helper sintético iniciou e concluiu o handshake local. Não significa API, SQLite, migrações, sessão, grants, origem web ou produto conectado.
 
+Antes de READY, EOF do stdout não prova que o processo terminou. O supervisor continua observando seu `Child` até a saída ou o prazo de startup e continua aceitando STOP. Saída observada antes do prazo usa `child_exit_before_ready` e o código real; se o child ainda vive quando o prazo vence, ele é encerrado pelo próprio handle e a categoria é `readiness_channel_closed`. Veja [`PRE_READY_FAILURE_CONTRACT.md`](PRE_READY_FAILURE_CONTRACT.md).
+
 ## Restrições de entrada
 
 - O frontend invoca comandos Tauri sem payload: `runtime_status`, `runtime_start_test`, `runtime_stop`, `runtime_restart_test`.

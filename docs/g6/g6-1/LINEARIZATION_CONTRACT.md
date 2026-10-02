@@ -17,9 +17,9 @@ Este contrato corrige somente a concorrência do supervisor sintético local MAC
 
 ## Espera e timeout
 
-A espera não mantém o mutex: `Condvar::wait_timeout` libera o lock durante a espera. Enquanto o snapshot ainda contém o ID-alvo em estado ativo, a operação continua aguardando. Se esse ID terminar, ou se um ID diferente se tornar atual, a operação retorna o snapshot corrente sem enviar STOP, aguardar ou matar a geração nova. Um ID diferente só pode ser publicado depois que a transição/reaping da geração anterior permitiu start ou restart.
+A espera não mantém o mutex: `Condvar::wait_timeout` libera o lock durante a espera. MAC-001.2 guarda a conclusão terminal em um objeto da geração capturado por `begin_stop()`. Mesmo se B substituir A no status global, `stop_and_wait(A)` retorna o snapshot terminal verdadeiro de A, sem enviar STOP, aguardar ou matar B. Consulte [`OPERATION_RESULT_CONTRACT.md`](OPERATION_RESULT_CONTRACT.md).
 
-`CommandTimeout` continua sendo erro quando o snapshot ainda é ativo e contém o mesmo ID-alvo ao vencer o prazo. O timeout não é convertido em sucesso. O mecanismo do supervisor para shutdown timeout continua podendo encerrar e reaped o child retido.
+`CommandTimeout` continua sendo erro quando a geração alvo não registrou conclusão terminal ao vencer o prazo. O timeout não é convertido em sucesso. O mecanismo do supervisor para shutdown timeout continua podendo encerrar e recolher o child retido.
 
 ## Eventos tardios
 
@@ -27,4 +27,4 @@ Readiness e eventos de saída/falha já são aplicados com igualdade exata do `r
 
 ## Locks e hooks
 
-O lock de estado continua sendo o único lock de produção neste fluxo. O envio usa `std::sync::mpsc` não limitado e não aguarda o child, I/O ou callback com o mutex retido. Hooks com barreiras usados para tornar interleavings determinísticos existem somente sob `cfg(test)`; não ampliam a superfície de produção.
+O envio usa `std::sync::mpsc` não limitado e não aguarda o child, I/O ou callback com o mutex de estado retido. A conclusão usa outro mutex/condvar por geração; a ordem de publicação é `Inner` → conclusão, e o waiter usa somente conclusão. Hooks com barreiras existem somente sob `cfg(test)`.
