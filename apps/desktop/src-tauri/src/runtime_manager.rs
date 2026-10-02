@@ -863,6 +863,7 @@ fn complete_transport_probe(shared: &Shared, instance_id: &str, session: Arc<Tra
     let mut inner = lock_inner(shared);
     if inner.snapshot.runtime_instance_id.as_deref() != Some(instance_id)
         || inner.snapshot.state != RuntimeState::Ready
+        || inner.transport_snapshot.state != TransportState::ProvingInstance
         || !inner
             .transport_session
             .as_ref()
@@ -1792,6 +1793,46 @@ mod tests {
             RuntimeState::Stopped
         );
         assert_clean(&manager);
+    }
+
+    #[test]
+    fn late_probe_result_cannot_restore_transport_after_stop_invalidation() {
+        let manager = manager();
+        let instance_id = "stop-race-instance";
+        let session = TransportSession::create(instance_id).unwrap();
+        {
+            let mut inner = lock_inner(&manager.shared);
+            inner.snapshot = RuntimeSnapshot {
+                state: RuntimeState::Ready,
+                runtime_instance_id: Some(instance_id.to_owned()),
+                pid: Some(1),
+                started_at_unix_ms: Some(1),
+                ready_at_unix_ms: Some(1),
+                exit_code: None,
+                failure_category: None,
+            };
+            inner.transport_snapshot = TransportSnapshot {
+                state: TransportState::ProvingInstance,
+                runtime_instance_id: Some(instance_id.to_owned()),
+                endpoint_type: Some("uds"),
+                protocol_version: None,
+                error_category: None,
+            };
+            inner.transport_session = Some(Arc::clone(&session));
+        }
+        session.deactivate();
+        {
+            let mut inner = lock_inner(&manager.shared);
+            inner.transport_snapshot.state = TransportState::Disconnected;
+        }
+
+        complete_transport_probe(&manager.shared, instance_id, Arc::clone(&session));
+        assert_eq!(
+            lock_inner(&manager.shared).transport_snapshot.state,
+            TransportState::Disconnected
+        );
+        session.revoke();
+        assert!(session.is_clean_for_test());
     }
 
     #[test]
