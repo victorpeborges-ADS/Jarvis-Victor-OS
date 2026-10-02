@@ -7,12 +7,12 @@ Prioridades indicam precedência, não estimativa de duração. “Arquivos prov
 ### G6-MAC-001 — Runtime Manager e child de prova
 
 - **Subgate:** G6.1
-- **Status:** implementação local sintética concluída; evidências e limites em [`g6-1/G6_MAC_001_REPORT.md`](g6-1/G6_MAC_001_REPORT.md).
+- **Status:** implementação local sintética MAC-001 concluída no SHA auditado; a auditoria independente encontrou um P2 em `stop_and_wait`. A correção pontual está na candidata MAC-001.1, com evidências em [`g6-1/G6_MAC_001_1_REPORT.md`](g6-1/G6_MAC_001_1_REPORT.md), pendente de reauditoria e decisão do proprietário.
 - **Objetivo executado:** iniciar, validar readiness por ID da instância, observar e finalizar um helper child iniciado pelo app.
 - **Arquivos alterados:** `apps/desktop/src-tauri/src/{lib.rs,main.rs,runtime_manager.rs}`, `apps/desktop/src/App.tsx`, `apps/desktop/src/App.css`, `apps/desktop/README.md` e documentação `docs/g6/g6-1/`.
 - **Testes:** ciclo completo, startup timeout, readiness errada/antiga, crash antes/depois de readiness, chamadas concorrentes, restart explícito, shutdown timeout, processo independente preservado e spawn/reap do executável Tauri release.
 - **Limite do status:** não integra a API Python, SQLite, endpoint, sessão, grant ou dados de produto; não gera `.app` nem aceita os itens restantes de G6.1.
-- **Próxima dependência:** G6-MAC-002 deve decidir e testar endpoint, porta e origin; este subgate não autoriza conexão.
+- **Próxima dependência:** MAC-002 permanece não iniciado. Só deve ser considerado depois da decisão de aceite de MAC-001.1; este subgate não autoriza conexão.
 
 ### G6-MAC-002 — Endpoint, porta e origin do WebView
 
