@@ -116,8 +116,12 @@ fn stop_of_ready_generation_does_not_wait_for_or_stop_a_new_generation() {
     release_stop_hook(&manager, &resume);
     let stop_result = stopper.join().unwrap().unwrap();
 
-    assert_eq!(stop_result.runtime_instance_id, ready_b.runtime_instance_id);
-    assert_eq!(stop_result.state, RuntimeState::Ready);
+    assert_eq!(
+        stop_result.runtime_instance_id.as_deref(),
+        Some(instance_a.as_str())
+    );
+    assert_eq!(stop_result.state, RuntimeState::Stopped);
+    assert_ne!(stop_result.runtime_instance_id, ready_b.runtime_instance_id);
     assert_eq!(
         manager.snapshot().runtime_instance_id,
         ready_b.runtime_instance_id
@@ -152,8 +156,12 @@ fn stop_of_starting_generation_does_not_wait_for_a_new_generation() {
     release_stop_hook(&manager, &resume);
     let stop_result = stopper.join().unwrap().unwrap();
 
-    assert_eq!(stop_result.runtime_instance_id, ready_b.runtime_instance_id);
-    assert_eq!(stop_result.state, RuntimeState::Ready);
+    assert_eq!(
+        stop_result.runtime_instance_id.as_deref(),
+        Some(instance_a.as_str())
+    );
+    assert_eq!(stop_result.state, RuntimeState::Stopped);
+    assert_ne!(stop_result.runtime_instance_id, ready_b.runtime_instance_id);
     assert_eq!(
         manager.snapshot().runtime_instance_id,
         ready_b.runtime_instance_id
@@ -162,6 +170,56 @@ fn stop_of_starting_generation_does_not_wait_for_a_new_generation() {
         manager.has_supervisor(),
         "generation B was reaped by stop(A)"
     );
+    manager.stop_and_wait().unwrap();
+    assert_clean(&manager);
+}
+
+#[test]
+fn stop_result_stays_with_a_while_b_is_starting() {
+    let manager = Arc::new(manager());
+    let a = manager.start_test().unwrap();
+    manager.wait_for_state(RuntimeState::Ready, Duration::from_secs(2));
+    let (captured, resume) = install_stop_hook(&manager);
+    let stop_manager = Arc::clone(&manager);
+    let stopper = thread::spawn(move || stop_manager.stop_and_wait());
+    captured.wait();
+    manager.wait_for_state(RuntimeState::Stopped, Duration::from_secs(2));
+    let b = manager.start_mode_for_test(HelperMode::SlowReady).unwrap();
+    assert_eq!(manager.snapshot().state, RuntimeState::Starting);
+    release_stop_hook(&manager, &resume);
+    let result = stopper.join().unwrap().unwrap();
+    assert_eq!(result.runtime_instance_id, a.runtime_instance_id);
+    assert_eq!(result.state, RuntimeState::Stopped);
+    assert_ne!(result.runtime_instance_id, b.runtime_instance_id);
+    assert_eq!(
+        manager.snapshot().runtime_instance_id,
+        b.runtime_instance_id
+    );
+    manager.stop_and_wait().unwrap();
+    assert_clean(&manager);
+}
+
+#[test]
+fn stop_result_stays_with_a_after_b_crashes_and_status_reports_b() {
+    let manager = Arc::new(manager());
+    let a = manager.start_test().unwrap();
+    manager.wait_for_state(RuntimeState::Ready, Duration::from_secs(2));
+    let (captured, resume) = install_stop_hook(&manager);
+    let stop_manager = Arc::clone(&manager);
+    let stopper = thread::spawn(move || stop_manager.stop_and_wait());
+    captured.wait();
+    manager.wait_for_state(RuntimeState::Stopped, Duration::from_secs(2));
+    let b = manager
+        .start_mode_for_test(HelperMode::CrashAfterReady)
+        .unwrap();
+    let crashed_b = manager.wait_for_state(RuntimeState::Crashed, Duration::from_secs(2));
+    release_stop_hook(&manager, &resume);
+    let result = stopper.join().unwrap().unwrap();
+    assert_eq!(result.runtime_instance_id, a.runtime_instance_id);
+    assert_eq!(result.state, RuntimeState::Stopped);
+    assert_ne!(result.runtime_instance_id, b.runtime_instance_id);
+    assert_eq!(manager.snapshot(), crashed_b);
+    assert!(manager.status_json().contains("\"state\":\"CRASHED\""));
     manager.stop_and_wait().unwrap();
     assert_clean(&manager);
 }
@@ -384,10 +442,10 @@ fn stopping_one_manager_does_not_stop_another_managers_child() {
 }
 
 #[test]
-#[ignore = "stress probe; run explicitly for the MAC-001.1 handoff"]
-fn stress_start_stop_race_500_rounds() {
+#[ignore = "stress probe; run explicitly for the MAC-001.2 handoff"]
+fn stress_start_stop_race_1000_rounds() {
     let started_at = Instant::now();
-    for round in 0..500 {
+    for round in 0..1000 {
         let manager = Arc::new(manager());
         let start_manager = Arc::clone(&manager);
         let stop_manager = Arc::clone(&manager);
@@ -399,6 +457,11 @@ fn stress_start_stop_race_500_rounds() {
         let stop = stop.unwrap_or_else(|error| panic!("round {round}: stop failed: {error:?}"));
 
         let current = manager.snapshot();
+        assert!(
+            stop.runtime_instance_id.is_none()
+                || stop.runtime_instance_id == start.runtime_instance_id,
+            "round {round}: stop result refers to a newer generation"
+        );
         assert!(
             current.state.is_terminal() || current.runtime_instance_id == start.runtime_instance_id,
             "round {round}: unexpected generation after race: {current:?}"
@@ -424,7 +487,7 @@ fn stress_start_stop_race_500_rounds() {
         assert_clean(&manager);
     }
     eprintln!(
-        "PASS start/stop stress rounds=500 duration_ms={}",
+        "PASS start/stop stress rounds=1000 duration_ms={}",
         started_at.elapsed().as_millis()
     );
 }
