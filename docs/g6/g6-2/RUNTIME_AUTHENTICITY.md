@@ -9,9 +9,9 @@
 
 ## Capacidade e prova
 
-1. Antes do spawn, Runtime Manager gera 32 bytes usando `SecRandomCopyBytes` do macOS e cria um UDS em diretório aleatório exclusivo da geração, modo 0700.
-2. O helper recebe ID, capacidade e path por um registro limitado escrito no `stdin` privado do processo supervisionado. Nenhum desses segredos é argumento, variável de ambiente, URL, log ou valor de resposta IPC.
-3. O helper vincula o UDS com permissão 0600 e só anuncia readiness depois do bind.
+1. Antes do spawn, Runtime Manager gera 32 bytes usando `SecRandomCopyBytes` do macOS, cria diretório aleatório exclusivo da geração com modo 0700 e mantém aberto um handle para ele. Registra `dev`/`inode` do handle e do nome criado.
+2. O processo recebe ID, capacidade e identidade do diretório por registro limitado no `stdin` privado. O path não é escrito nesse registro, em argv, ambiente, log nem IPC da WebView. O child inicia no diretório preparado pelo supervisor, abre `.` e compara sua identidade com `dev`/`inode` antes do bind.
+3. O helper vincula `runtime.sock` relativamente ao diretório aberto, com `umask(0177)` para criar o socket em modo 0600, e só anuncia readiness depois do bind. O supervisor verifica que o nome da sessão ainda aponta para o handle original antes de aceitar readiness.
 4. Depois do ACK de readiness, o native client consulta `health` e `version`; ambas são evidências informativas.
 5. O native client gera nonce novo de 32 bytes com o CSPRNG do macOS e envia o nonce em corpo de `POST /v1/instance-proof`.
 6. O helper retorna protocol, runtime kind, instance ID, build, resultado sintético e HMAC-SHA-256. A mensagem assinada tem domínio `jarvis-local-transport-proof-v1`, versão, tipo, ID, build, nonce e resultado `pong:<instance_id>`.
@@ -23,7 +23,9 @@ Health e version são consultas independentes e não autenticam. O resultado `po
 
 O objeto `TransportSession` e a capacidade ficam na camada Rust. IPC retorna somente estado, ID, tipo UDS, versão e categoria de erro. Uma Manager B tem chave e path independentes; resposta de B não valida com a chave de A, mesmo que ambas estejam `READY` e anunciem a mesma versão.
 
-Cada sessão captura path, capacidade e ID de sua geração. No stop, a capacidade é desativada imediatamente para impedir novos probes; se o child ainda está iniciando, o diretório permanece disponível até o child processar STOP/reap. Depois do reap, path e diretório são removidos. Uma sessão A retida por chamada pendente não consulta o estado atual para trocar para B. Depois do stop, a própria sessão A retorna `generation_inactive`.
+Cada sessão captura handle do diretório, path de conexão, capacidade e ID de sua geração. No stop ou perda do pipe de controle, a capacidade é desativada para impedir novos probes. Cleanup do socket usa `unlinkat` relativo ao handle do diretório, tanto no parent quanto no child. Renomear o diretório ou substituir o nome original por symlink não redireciona essa operação. O diretório vazio é preservado no runtime normal porque a biblioteca padrão não fornece remoção segura do próprio diretório pelo handle; sob path incerto, o sistema preserva qualquer artefato em vez de seguir outro caminho. Uma sessão A retida por chamada pendente não consulta o estado atual para trocar para B. Depois da revogação, a própria sessão A retorna `generation_inactive`.
+
+O canal stdin é ownership: EOF durante startup aborta readiness; EOF depois de ACK encerra o child, fecha o serviço UDS e invalida a capacidade. O shutdown por EOF usa diagnóstico `supervisor_lost`, separado do STOP normal. Uma resposta de probe que termine depois de stop/EOF não repõe `READY`.
 
 ## Criptografia e memória
 

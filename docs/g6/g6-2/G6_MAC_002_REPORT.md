@@ -1,5 +1,7 @@
 # G6-MAC-002 — Relatório da candidata
 
+> Registro histórico da candidata MAC-002 e de sua validação. Os achados de perda do supervisor e cleanup por pathname foram corrigidos em MAC-002.1; consulte [G6_MAC_002_1_REPORT.md](G6_MAC_002_1_REPORT.md) para o estado atual, evidências e riscos.
+
 ## Identificação
 
 - Branch: `feat/jarvis-g6-mac-002-local-transport-2026-10-02`

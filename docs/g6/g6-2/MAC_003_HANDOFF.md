@@ -14,9 +14,9 @@ O wire format HTTP, rotas, política de tamanho, Host, UDS e segregação de seg
 
 ## Trabalho necessário em MAC-003
 
-1. Preservar `Runtime Manager` como owner de spawn, PID, geração, endpoint privado, stop/restart, timeout e reap. Nenhum endpoint chega à WebView.
+1. Preservar `Runtime Manager` como owner de spawn, PID, geração, endpoint privado, stop/restart, timeout e reap. Preservar o contrato MAC-002.1: stdin é canal de ownership e EOF encerra o child; o socket é removido relativamente ao handle do diretório original; nenhum endpoint chega à WebView.
 2. Trocar o helper sintético por um processo Python local supervisionado, sem alterar o cliente Tauri/React para URL, porta ou fetch.
-3. Adaptar o runner oficial `apps/api/serve.py`, hoje bindado a loopback TCP, para aceitar UDS com o path criado pelo parent. Uvicorn oferece configuração `uds`; verificar também permissões do socket no runtime-alvo. Referências: [Uvicorn settings](https://www.uvicorn.org/settings/) e [Uvicorn deployment](https://www.uvicorn.org/deployment/).
+3. Adaptar o runner oficial `apps/api/serve.py`, hoje bindado a loopback TCP, para aceitar UDS relativamente ao CWD do child preparado pelo parent. O path não deve ser enviado em argv/environment nem mutado por pathname após bind. Uvicorn oferece configuração `uds`; verificar permissões do socket no runtime-alvo e não perder o handle/ownership filesystem seguro. Referências: [Uvicorn settings](https://www.uvicorn.org/settings/) e [Uvicorn deployment](https://www.uvicorn.org/deployment/).
 4. Ler o registro de inicialização de `stdin` antes de iniciar Uvicorn; não pôr chave em argv, environment, URL ou log. Expor a capacidade em contexto privado de processo à rota de prova e usar `hmac`/`hashlib` da biblioteca padrão Python ou biblioteca já aprovada. Conferir nonce, tamanho e comparação segura.
 5. Implementar as mesmas rotas sintéticas e o proof antes de ligar domínio de produto. `health` continua separado da prova.
 6. Somente no escopo autorizado, integrar app FastAPI real, SQLite/G5 e startup sem bypass de `serve.py`; executar migrations conforme ADR-010 e as autorizações vigentes. Não ativar multiworker.

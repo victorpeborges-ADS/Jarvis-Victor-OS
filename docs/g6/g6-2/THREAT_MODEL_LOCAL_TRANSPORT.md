@@ -18,6 +18,7 @@
 | Processo local falso | Pode abrir outro socket e imitar health/version; não possui capacidade da geração. | Falha na prova HMAC. |
 | Outro Manager JARVIS | Possui seu child, path e capacidade próprios. | Provas entre sessões A/B são rejeitadas. |
 | Outro usuário local | Não atravessa diretório 0700 nem socket 0600. | Não acessa o endpoint privado. |
+| Processo do mesmo UID que renomeia/substitui o nome `.jv-*` | Pode trocar o path por symlink, arquivo, diretório ou socket e causar DoS. | O child valida identidade `dev`/`inode`; bind ocorre no CWD estabelecido pelo spawn; cleanup usa handle de diretório + `unlinkat`, sem seguir o parent mutável. Canários fora da geração sobrevivem. |
 | Mesmo usuário, administrador ou processo comprometido | Pode causar DoS e, dependendo de privilégios do host, inspecionar ou alterar processos/arquivos do mesmo usuário. | Fora da garantia criptográfica do ADR-010; HMAC não protege o host comprometido. |
 
 ## Abusos considerados
@@ -25,7 +26,8 @@
 - Socket falso responde `200`, health correto e versão correta: prova com capacidade aleatória inválida é rejeitada.
 - Replay de prova anterior: nonce aleatório fresco é parte do HMAC, portanto a resposta antiga não valida.
 - Outra geração/Manager: ID e chave do runtime A são verificados contra a sessão A; B não valida A.
-- Socket ausente, stale ou substituído: connect, versão/prova ou revogação falha fechado; sessão antiga nunca resolve endpoint da geração nova.
+- Socket ausente, stale ou substituído: connect, versão/prova ou revogação falha fechado; sessão antiga nunca resolve endpoint da geração nova. Se o nome do diretório foi substituído, operações de cleanup continuam ancoradas no handle originalmente aberto e nunca percorrem o target do symlink.
+- EOF permanente no pipe herdado: é perda de ownership. O child encerra em startup ou depois de READY; requests em andamento não publicam resposta tardia depois que o canal foi invalidado.
 - Resposta inválida, excessiva, truncada, lenta, conexão fechada ou runtime que cai: limites e prazos geram `FAILED`; não há resposta infinita.
 - UI tenta SSRF ou endpoint arbitrário: não existe comando genérico; comandos de transporte não recebem argumentos.
 - Browser envia Origin: runtime sintético recusa header Origin. Browser não abre UDS através de fetch.
@@ -38,9 +40,10 @@ Same-user malware com inspeção privilegiada, root/admin, exploração do próp
 ## Controles observáveis
 
 - segredo somente no pipe privado e memória native/child; nunca em args/env/URL/log/UI;
-- path UDS efêmero por geração em diretório 0700, socket 0600;
+- path UDS aleatório por geração em diretório 0700 e socket 0600; aleatoriedade reduz colisões acidentais, não autoriza operações contra processos do mesmo UID;
+- identidade `dev`/`inode` comparada e handle de diretório mantido pelo supervisor e child; `unlinkat` opera sobre o handle fixo e a folha `runtime.sock`, não sobre path absoluto mutável;
 - HMAC-SHA-256 com challenge CSPRNG, sistema Apple;
 - Tauri commands tipados e CSP sem ampliação;
 - estados separados de runtime e transporte;
-- revogação no stop/crash; timeouts, limite HTTP e cleanup;
+- revogação no stop, EOF e crash; timeouts, limite HTTP, cleanup ancorado ao handle e preservação de diretório vazio quando rmdir seguro não está disponível;
 - logs com ID, tipo de endpoint, estado, versão e categoria; sem prova, chave ou corpo.

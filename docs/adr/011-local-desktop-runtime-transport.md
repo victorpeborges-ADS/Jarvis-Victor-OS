@@ -43,3 +43,15 @@ O protocolo implementa um subconjunto fechado de HTTP/1.1 com rotas fixas, `Host
 - [Rust — Unix domain sockets](https://doc.rust-lang.org/std/os/unix/net/index.html)
 - [Uvicorn — configurações, incluindo UDS](https://www.uvicorn.org/settings/)
 - [Uvicorn — deployment](https://www.uvicorn.org/deployment/)
+
+## Aditamento MAC-002.1 — EOF do supervisor e cleanup UDS (2026-10-06)
+
+Este aditamento corrige o lifecycle local sem alterar a escolha UDS, o contrato criptográfico nem ADR-010.
+
+- O registro enviado pelo parent agora contém `instance_id`, capacidade de 256 bits e `dev`/`inode` da sessão; não contém o path do socket. O child inicia com o diretório da geração como CWD, abre `.`, verifica sua identidade e binda `runtime.sock` relativamente a esse diretório com modo 0600.
+- O parent conserva um handle do diretório original. Child e parent removem somente a folha fixa `runtime.sock` com `unlinkat` relativamente ao handle. Renomear o diretório ou substituir o nome por symlink não redireciona cleanup ao target externo. O check do nome é usado para falhar readiness; a mutação do socket não depende de `check → unlink(path)`.
+- EOF definitivo no canal herdado de controle revoga ownership. Antes de readiness, startup aborta sem `READY`; depois do ACK, o child deixa de aceitar pedidos, suprime respostas pendentes após a observação de EOF, remove o socket ancorado ao handle e sai com motivo `supervisor_lost`. O parent revoga a capacidade e reap o processo. STOP continua sendo encerramento normal distinto.
+- O diretório privado vazio é preservado após cleanup porque remover o próprio diretório exigiria resolver um nome mutável sem uma primitiva segura disponível nesta implementação. É um artefato limitado; gerações futuras usam novos nomes aleatórios. Diretórios desconhecidos ou substituições são preservados.
+- Nenhuma crate/dependência foi adicionada. O código usa wrappers FFI pequenos para `unlinkat` e `umask` do sistema, além de `File`/`MetadataExt` da biblioteca padrão.
+
+O path aleatório reduz colisões acidentais; não é controle de autorização contra processos do mesmo UID. HMAC continua sendo a autenticação do runtime sintético. O escopo local, sintético e monoprocesso permanece inalterado.

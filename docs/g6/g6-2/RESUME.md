@@ -1,5 +1,7 @@
 # Retomada — G6-MAC-002
 
+> Resumo histórico da MAC-002. A implementação vigente de lifecycle está em [RESUME_MAC_002_1.md](RESUME_MAC_002_1.md); a documentação de validação e limites está em [G6_MAC_002_1_REPORT.md](G6_MAC_002_1_REPORT.md).
+
 ## Candidata
 
 - Branch: `feat/jarvis-g6-mac-002-local-transport-2026-10-02`
@@ -9,7 +11,7 @@
 
 ## Estado
 
-O Runtime Manager cria UDS e capacidade exclusivos por geração; envia ambos via pipe stdin e mantém chave/path fora da WebView. Readiness e autenticação têm estados separados. O native client verifica health, versão e prova HMAC com nonce novo, incluindo operação sintética assinada. Stop revoga sessão antes de aguardar o child e limpa endpoint. Não há FastAPI, G5, SQLite, migrations, TCP, OAuth, contas ou rede remota.
+O Runtime Manager cria UDS e capacidade exclusivos por geração; o pipe carrega ID, capability e identidade do diretório, sem path. O child valida CWD por `dev`/`inode` e faz bind relativo. Readiness e autenticação têm estados separados. O native client verifica health, versão e prova HMAC com nonce novo, incluindo operação sintética assinada. Stop/EOF revogam a sessão; cleanup do socket usa FD de diretório e `unlinkat`, mantendo o diretório vazio preservado. Não há FastAPI, G5, SQLite, migrations, TCP, OAuth, contas ou rede remota.
 
 ## Retomar a validação
 
