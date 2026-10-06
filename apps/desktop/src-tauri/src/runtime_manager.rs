@@ -6,7 +6,7 @@ use std::{
     io::{self, BufRead, BufReader, Write},
     process::{Child, Command, ExitStatus, Stdio},
     sync::{
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc::{self, Receiver, RecvTimeoutError, Sender},
         Arc, Condvar, Mutex, MutexGuard,
     },
@@ -17,6 +17,7 @@ use std::{
 const READY_PREFIX: &str = "JARVIS_RUNTIME_READY ";
 const ACK_PREFIX: &str = "JARVIS_RUNTIME_ACK ";
 const STOP_PREFIX: &str = "JARVIS_RUNTIME_STOP ";
+const SUPERVISOR_LOST_EXIT: i32 = 48;
 const TEST_HELPER_SWITCH: &str = "--jarvis-runtime-test-helper";
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(5);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(700);
@@ -263,6 +264,15 @@ enum SupervisorMessage {
     StdoutClosed,
     StdoutFailed,
     Stop(Sender<RuntimeSnapshot>),
+    #[cfg(test)]
+    CloseControl(Sender<()>),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ControlSignal {
+    Acknowledged,
+    Stop,
+    SupervisorLost,
 }
 
 enum StopDecision {
@@ -450,6 +460,7 @@ impl RuntimeManager {
             self.helper_executable.as_deref(),
         )
         .map_err(|_| ManagerError::SpawnFailed)?;
+        command.current_dir(transport_session.directory_path());
         transition_log(previous, RuntimeState::Starting, &instance_id);
         inner.snapshot = RuntimeSnapshot {
             state: RuntimeState::Starting,
@@ -771,6 +782,26 @@ impl RuntimeManager {
     }
 
     #[cfg(test)]
+    fn close_control_for_test(&self) {
+        self.queue_control_close_for_test()
+            .recv_timeout(Duration::from_secs(1))
+            .expect("supervisor closed the control pipe");
+    }
+
+    #[cfg(test)]
+    fn queue_control_close_for_test(&self) -> Receiver<()> {
+        let sender = lock_inner(&self.shared)
+            .supervisor
+            .clone()
+            .expect("active generation has a supervisor");
+        let (reply, received) = mpsc::channel();
+        sender
+            .send(SupervisorMessage::CloseControl(reply))
+            .expect("supervisor worker is active");
+        received
+    }
+
+    #[cfg(test)]
     fn has_supervisor(&self) -> bool {
         lock_inner(&self.shared).supervisor.is_some()
     }
@@ -810,6 +841,7 @@ fn transition_allowed(from: RuntimeState, to: RuntimeState) -> bool {
             | (RuntimeState::Starting, RuntimeState::Stopping)
             | (RuntimeState::Starting, RuntimeState::Failed)
             | (RuntimeState::Ready, RuntimeState::Stopping)
+            | (RuntimeState::Ready, RuntimeState::Stopped)
             | (RuntimeState::Ready, RuntimeState::Crashed)
             | (RuntimeState::Stopping, RuntimeState::Stopped)
             | (RuntimeState::Failed, RuntimeState::Starting)
@@ -931,20 +963,35 @@ fn finish_child_exit(shared: &Shared, instance_id: &str, status: ExitStatus) {
     if inner.snapshot.runtime_instance_id.as_deref() != Some(instance_id) {
         return;
     }
+    let supervisor_lost = status.code() == Some(SUPERVISOR_LOST_EXIT);
     let target = match inner.snapshot.state {
         RuntimeState::Starting => {
-            inner.snapshot.failure_category = Some("child_exit_before_ready");
+            inner.snapshot.failure_category = Some(if supervisor_lost {
+                "supervisor_lost"
+            } else {
+                "child_exit_before_ready"
+            });
             RuntimeState::Failed
+        }
+        RuntimeState::Ready if supervisor_lost => {
+            inner.snapshot.failure_category = Some("supervisor_lost");
+            RuntimeState::Stopped
         }
         RuntimeState::Ready => {
             inner.snapshot.failure_category = Some("child_crash");
             RuntimeState::Crashed
         }
-        RuntimeState::Stopping => RuntimeState::Stopped,
+        RuntimeState::Stopping => {
+            if supervisor_lost {
+                inner.snapshot.failure_category = Some("supervisor_lost");
+            }
+            RuntimeState::Stopped
+        }
         _ => return,
     };
     inner.snapshot.exit_code = status.code();
     transition_locked(&mut inner, target, instance_id);
+    let failure_category = inner.snapshot.failure_category;
     revoke_transport_locked(
         &mut inner,
         instance_id,
@@ -953,7 +1000,7 @@ fn finish_child_exit(shared: &Shared, instance_id: &str, status: ExitStatus) {
         } else {
             TransportState::Failed
         },
-        Some("runtime_exited"),
+        failure_category,
     );
     inner.supervisor = None;
     complete_current_generation(&inner);
@@ -1132,7 +1179,21 @@ fn supervise_child(
 
         match message {
             SupervisorMessage::Output(line) => {
-                if is_ready_for(&line, &instance_id) && mark_ready(&shared, &instance_id) {
+                if is_ready_for(&line, &instance_id) {
+                    if lock_inner(&shared).snapshot.state != RuntimeState::Starting {
+                        continue;
+                    }
+                    if !transport_session.path_matches_handle() {
+                        let _ = child.kill();
+                        let status = child.wait().ok();
+                        finish_start_failure(
+                            &shared,
+                            &instance_id,
+                            "transport_path_changed",
+                            status,
+                        );
+                        return;
+                    }
                     let acknowledged = stdin.as_mut().is_some_and(|pipe| {
                         writeln!(pipe, "{ACK_PREFIX}{instance_id}")
                             .and_then(|_| pipe.flush())
@@ -1141,12 +1202,21 @@ fn supervise_child(
                     if !acknowledged {
                         let _ = child.kill();
                         let status = child.wait().ok();
-                        finish_after_ready_failure(
+                        finish_start_failure(&shared, &instance_id, "supervisor_lost", status);
+                        return;
+                    }
+                    if !transport_session.path_matches_handle() {
+                        let _ = child.kill();
+                        let status = child.wait().ok();
+                        finish_start_failure(
                             &shared,
                             &instance_id,
-                            "readiness_ack_failed",
+                            "transport_path_changed",
                             status,
                         );
+                        return;
+                    }
+                    if !mark_ready(&shared, &instance_id) {
                         return;
                     }
                     {
@@ -1265,6 +1335,11 @@ fn supervise_child(
                         }
                     }
                 }
+            }
+            #[cfg(test)]
+            SupervisorMessage::CloseControl(reply) => {
+                drop(stdin.take());
+                let _ = reply.send(());
             }
         }
     }
@@ -1411,18 +1486,110 @@ fn close_stdout_for_helper() {
     }
 }
 
-fn wait_for_ack(input: &mut impl BufRead, instance_id: &str) -> bool {
-    loop {
+fn start_control_reader(
+    mut input: BufReader<io::Stdin>,
+    instance_id: String,
+) -> (Receiver<ControlSignal>, Arc<AtomicBool>) {
+    let (sender, receiver) = mpsc::channel();
+    let live = Arc::new(AtomicBool::new(true));
+    let reader_live = Arc::clone(&live);
+    thread::spawn(move || {
+        let expected_ack = format!("{ACK_PREFIX}{instance_id}");
+        let expected_stop = format!("{STOP_PREFIX}{instance_id}");
         let mut line = String::new();
-        if input.read_line(&mut line).unwrap_or(0) == 0 {
-            return false;
+        loop {
+            line.clear();
+            match input.read_line(&mut line) {
+                Ok(0) | Err(_) => {
+                    reader_live.store(false, Ordering::Release);
+                    let _ = sender.send(ControlSignal::SupervisorLost);
+                    return;
+                }
+                Ok(_) => match line.trim_end_matches(['\r', '\n']) {
+                    command if command == expected_ack => {
+                        if sender.send(ControlSignal::Acknowledged).is_err() {
+                            return;
+                        }
+                    }
+                    command if command == expected_stop => {
+                        reader_live.store(false, Ordering::Release);
+                        let _ = sender.send(ControlSignal::Stop);
+                        return;
+                    }
+                    _ => {}
+                },
+            }
         }
-        let command = line.trim_end_matches(['\r', '\n']);
-        if command == format!("{ACK_PREFIX}{instance_id}") {
-            return true;
+    });
+    (receiver, live)
+}
+
+fn next_control_signal(
+    receiver: &Receiver<ControlSignal>,
+    live: &AtomicBool,
+) -> Option<ControlSignal> {
+    match receiver.try_recv() {
+        Ok(signal) => Some(signal),
+        Err(mpsc::TryRecvError::Disconnected) => Some(ControlSignal::SupervisorLost),
+        Err(mpsc::TryRecvError::Empty) if !live.load(Ordering::Acquire) => {
+            Some(ControlSignal::SupervisorLost)
         }
-        if command == format!("{STOP_PREFIX}{instance_id}") {
-            return false;
+        Err(mpsc::TryRecvError::Empty) => None,
+    }
+}
+
+fn signal_exit_code(signal: ControlSignal) -> Option<i32> {
+    match signal {
+        ControlSignal::Acknowledged => None,
+        ControlSignal::Stop => Some(0),
+        ControlSignal::SupervisorLost => Some(SUPERVISOR_LOST_EXIT),
+    }
+}
+
+fn wait_for_ack(receiver: &Receiver<ControlSignal>, live: &AtomicBool) -> ControlSignal {
+    loop {
+        if let Some(signal) = next_control_signal(receiver, live) {
+            match signal {
+                ControlSignal::Acknowledged => return signal,
+                ControlSignal::Stop | ControlSignal::SupervisorLost => return signal,
+            }
+        }
+        match receiver.recv_timeout(POLL_INTERVAL) {
+            Ok(signal) => match signal {
+                ControlSignal::Acknowledged => return signal,
+                ControlSignal::Stop | ControlSignal::SupervisorLost => return signal,
+            },
+            Err(RecvTimeoutError::Disconnected) => return ControlSignal::SupervisorLost,
+            Err(RecvTimeoutError::Timeout) => {}
+        }
+    }
+}
+
+#[cfg(test)]
+fn wait_before_readiness(
+    receiver: &Receiver<ControlSignal>,
+    live: &AtomicBool,
+    delay: Duration,
+) -> Option<i32> {
+    let deadline = Instant::now() + delay;
+    loop {
+        if let Some(signal) = next_control_signal(receiver, live) {
+            if let Some(code) = signal_exit_code(signal) {
+                return Some(code);
+            }
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return None;
+        }
+        match receiver.recv_timeout(remaining.min(POLL_INTERVAL)) {
+            Ok(signal) => {
+                if let Some(code) = signal_exit_code(signal) {
+                    return Some(code);
+                }
+            }
+            Err(RecvTimeoutError::Disconnected) => return Some(SUPERVISOR_LOST_EXIT),
+            Err(RecvTimeoutError::Timeout) => {}
         }
     }
 }
@@ -1436,6 +1603,35 @@ fn run_helper(mode: HelperMode, instance_id: &str, stale_instance_id: Option<&st
         Ok(config) => config,
         Err(_) => return 44,
     };
+    let (control_receiver, control_live) = start_control_reader(input, instance_id.to_owned());
+
+    match mode {
+        HelperMode::CrashBeforeReady => return 41,
+        HelperMode::ExitZeroBeforeReady => return 0,
+        HelperMode::CloseStdoutThenExit => {
+            drop(output);
+            close_stdout_for_helper();
+            return 47;
+        }
+        HelperMode::SlowReady => {
+            if let Some(code) =
+                wait_before_readiness(&control_receiver, &control_live, Duration::from_millis(900))
+            {
+                return code;
+            }
+        }
+        HelperMode::CloseStdoutBeforeReady => {
+            drop(output);
+            close_stdout_for_helper();
+            return match wait_for_ack(&control_receiver, &control_live) {
+                ControlSignal::Stop => 0,
+                ControlSignal::SupervisorLost => SUPERVISOR_LOST_EXIT,
+                ControlSignal::Acknowledged => 0,
+            };
+        }
+        _ => {}
+    }
+
     let listener = if mode == HelperMode::Normal {
         match transport.bind() {
             Ok(listener) => Some(listener),
@@ -1446,27 +1642,12 @@ fn run_helper(mode: HelperMode, instance_id: &str, stale_instance_id: Option<&st
     };
 
     match mode {
-        HelperMode::CrashBeforeReady => return 41,
-        HelperMode::ExitZeroBeforeReady => return 0,
-        HelperMode::CloseStdoutThenExit => {
-            drop(output);
-            close_stdout_for_helper();
-            return 47;
-        }
-        HelperMode::SlowReady => thread::sleep(Duration::from_millis(900)),
-        HelperMode::CloseStdoutBeforeReady => {
-            drop(output);
-            close_stdout_for_helper();
-            let mut line = String::new();
-            while input.read_line(&mut line).unwrap_or(0) > 0 {
-                if line.trim_end_matches(['\r', '\n']) == format!("{STOP_PREFIX}{instance_id}") {
-                    return 0;
-                }
-                line.clear();
-            }
-            return 0;
-        }
         _ => {}
+    }
+    if let Some(signal) = next_control_signal(&control_receiver, &control_live) {
+        if let Some(code) = signal_exit_code(signal) {
+            return code;
+        }
     }
 
     let announced_id = match mode {
@@ -1494,32 +1675,33 @@ fn run_helper(mode: HelperMode, instance_id: &str, stale_instance_id: Option<&st
     }
     drop(output);
 
-    if !wait_for_ack(&mut input, instance_id) {
-        return 0;
+    match wait_for_ack(&control_receiver, &control_live) {
+        ControlSignal::Stop => return 0,
+        ControlSignal::SupervisorLost => return SUPERVISOR_LOST_EXIT,
+        ControlSignal::Acknowledged => {}
+    }
+    if !control_live.load(Ordering::Acquire) {
+        return SUPERVISOR_LOST_EXIT;
     }
     if mode == HelperMode::CrashAfterReady {
         return 42;
     }
     if mode == HelperMode::HangOnShutdown {
         loop {
-            let mut ignored = String::new();
-            if input.read_line(&mut ignored).unwrap_or(0) == 0 {
-                thread::sleep(Duration::from_millis(50));
-            }
+            thread::park_timeout(Duration::from_millis(50));
         }
     }
 
     if let Some(listener) = listener {
-        return serve_transport_until_stop(transport, listener, input, instance_id);
+        return serve_transport_until_stop(transport, listener, control_receiver, control_live);
     }
-
     loop {
-        let mut line = String::new();
-        if input.read_line(&mut line).unwrap_or(0) == 0 {
-            return 0;
-        }
-        if line.trim_end_matches(['\r', '\n']) == format!("{STOP_PREFIX}{instance_id}") {
-            return 0;
+        match control_receiver.recv_timeout(POLL_INTERVAL) {
+            Ok(ControlSignal::Stop) => return 0,
+            Ok(ControlSignal::SupervisorLost) | Err(RecvTimeoutError::Disconnected) => {
+                return SUPERVISOR_LOST_EXIT;
+            }
+            Ok(ControlSignal::Acknowledged) | Err(RecvTimeoutError::Timeout) => {}
         }
     }
 }
@@ -1533,10 +1715,16 @@ fn run_helper(_mode: HelperMode, instance_id: &str, _stale_instance_id: Option<&
         Ok(config) => config,
         Err(_) => return 44,
     };
+    let (control_receiver, control_live) = start_control_reader(input, instance_id.to_owned());
     let listener = match transport.bind() {
         Ok(listener) => listener,
         Err(_) => return 45,
     };
+    if let Some(signal) = next_control_signal(&control_receiver, &control_live) {
+        if let Some(code) = signal_exit_code(signal) {
+            return code;
+        }
+    }
     if writeln!(output, "{READY_PREFIX}{instance_id}")
         .and_then(|_| output.flush())
         .is_err()
@@ -1545,37 +1733,41 @@ fn run_helper(_mode: HelperMode, instance_id: &str, _stale_instance_id: Option<&
     }
     drop(output);
 
-    if !wait_for_ack(&mut input, instance_id) {
-        return 0;
+    match wait_for_ack(&control_receiver, &control_live) {
+        ControlSignal::Stop => return 0,
+        ControlSignal::SupervisorLost => return SUPERVISOR_LOST_EXIT,
+        ControlSignal::Acknowledged => {}
     }
-    serve_transport_until_stop(transport, listener, input, instance_id)
+    if !control_live.load(Ordering::Acquire) {
+        return SUPERVISOR_LOST_EXIT;
+    }
+    serve_transport_until_stop(transport, listener, control_receiver, control_live)
 }
 
 fn serve_transport_until_stop(
     transport: ChildTransportConfig,
     listener: std::os::unix::net::UnixListener,
-    input: BufReader<io::Stdin>,
-    instance_id: &str,
+    control_receiver: Receiver<ControlSignal>,
+    control_live: Arc<AtomicBool>,
 ) -> i32 {
-    let (stop_sender, stop_receiver) = mpsc::channel();
-    let expected_stop = format!("{STOP_PREFIX}{instance_id}");
-    thread::spawn(move || {
-        let mut input = input;
-        let mut line = String::new();
-        while input.read_line(&mut line).unwrap_or(0) > 0 {
-            if line.trim_end_matches(['\r', '\n']) == expected_stop {
-                let _ = stop_sender.send(());
-                return;
-            }
-            line.clear();
-        }
-    });
     loop {
-        if stop_receiver.try_recv().is_ok() {
-            return 0;
+        if let Some(signal) = next_control_signal(&control_receiver, &control_live) {
+            if let Some(code) = signal_exit_code(signal) {
+                return code;
+            }
         }
-        match transport.serve_one(&listener, Duration::from_millis(10)) {
+        match transport.serve_one_with_liveness(&listener, Duration::from_millis(10), &control_live)
+        {
             Ok(_) => {}
+            Err(crate::transport::TransportError::Inactive) => {
+                return if next_control_signal(&control_receiver, &control_live)
+                    == Some(ControlSignal::Stop)
+                {
+                    0
+                } else {
+                    SUPERVISOR_LOST_EXIT
+                };
+            }
             Err(_) => return 46,
         }
     }
@@ -1659,7 +1851,9 @@ mod tests {
 
     use super::*;
     use std::{
-        io::Write,
+        fs,
+        io::{BufRead, Read, Write},
+        os::unix::{fs::PermissionsExt, net::UnixStream},
         path::Path,
         process::ChildStdin,
         sync::{Barrier, Mutex as TestMutex},
@@ -1713,6 +1907,14 @@ mod tests {
         assert_eq!(transport.endpoint_type, Some("uds"));
         assert_eq!(transport.protocol_version.as_deref(), Some("1"));
         let transport_session = manager.transport_session_for_test();
+        assert_eq!(
+            fs::symlink_metadata(transport_session.socket_path_for_test())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
         let stopped = manager.stop_and_wait().unwrap();
         assert_eq!(stopped.state, RuntimeState::Stopped);
         assert_eq!(
@@ -1773,6 +1975,32 @@ mod tests {
         manager_b.stop_and_wait().unwrap();
         assert_clean(&manager_a);
         assert_clean(&manager_b);
+    }
+
+    #[test]
+    fn concurrent_probes_are_serialized_and_publish_first_completed_result() {
+        let manager = Arc::new(manager());
+        manager.start_test().unwrap();
+        manager.wait_for_state(RuntimeState::Ready, Duration::from_secs(2));
+        manager.wait_for_transport_state(TransportState::Ready, Duration::from_secs(2));
+
+        let barrier = Arc::new(Barrier::new(3));
+        let mut workers = Vec::new();
+        for _ in 0..2 {
+            let manager = Arc::clone(&manager);
+            let barrier = Arc::clone(&barrier);
+            workers.push(thread::spawn(move || {
+                barrier.wait();
+                manager.probe_transport_now()
+            }));
+        }
+        barrier.wait();
+        for worker in workers {
+            assert_eq!(worker.join().unwrap().state, TransportState::Ready);
+        }
+        assert!(manager.transport_status_json().contains("READY"));
+        manager.stop_and_wait().unwrap();
+        assert_clean(&manager);
     }
 
     #[test]
@@ -2097,6 +2325,7 @@ mod tests {
         fn start() -> Self {
             let instance_id = new_instance_id();
             let executable = env::current_exe().unwrap();
+            let transport_session = TransportSession::create(&instance_id).unwrap();
             let mut child = Command::new(executable)
                 .arg("--ignored")
                 .arg("--exact")
@@ -2107,13 +2336,13 @@ mod tests {
                 .env_clear()
                 .env(HELPER_ID_ENV, &instance_id)
                 .env(HELPER_MODE_ENV, HelperMode::Normal.as_str())
+                .current_dir(transport_session.directory_path())
                 .stdin(Stdio::piped())
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
                 .spawn()
                 .expect("unrelated synthetic process starts");
             let mut stdin = child.stdin.take().unwrap();
-            let transport_session = TransportSession::create(&instance_id).unwrap();
             transport_session.write_child_init(&mut stdin).unwrap();
             Self {
                 child,
@@ -2277,5 +2506,285 @@ mod tests {
             ManagerError::InvalidState
         );
         assert_eq!(manager.snapshot().state, RuntimeState::Stopped);
+    }
+
+    #[test]
+    fn supervisor_eof_during_starting_fails_without_readiness() {
+        let manager = manager();
+        manager.start_mode_for_test(HelperMode::SlowReady).unwrap();
+        let session = manager.transport_session_for_test();
+        let started = Instant::now();
+        manager.close_control_for_test();
+        let failed = manager.wait_for_state(RuntimeState::Failed, Duration::from_secs(1));
+        assert_eq!(failed.failure_category, Some("supervisor_lost"));
+        assert_eq!(failed.exit_code, Some(SUPERVISOR_LOST_EXIT));
+        assert_eq!(failed.ready_at_unix_ms, None);
+        assert!(started.elapsed() < Duration::from_millis(350));
+        assert!(session.is_clean_for_test());
+        assert_clean(&manager);
+    }
+
+    #[test]
+    fn supervisor_eof_after_ready_revokes_capability_and_reaps_child() {
+        let manager = manager();
+        manager.start_test().unwrap();
+        let ready = manager.wait_for_state(RuntimeState::Ready, Duration::from_secs(2));
+        let session = manager.transport_session_for_test();
+        manager.wait_for_transport_state(TransportState::Ready, Duration::from_secs(2));
+        let started = Instant::now();
+        manager.close_control_for_test();
+        let stopped = manager.wait_for_state(RuntimeState::Stopped, Duration::from_secs(1));
+        assert_eq!(stopped.runtime_instance_id, ready.runtime_instance_id);
+        assert_eq!(stopped.failure_category, Some("supervisor_lost"));
+        assert_eq!(stopped.exit_code, Some(SUPERVISOR_LOST_EXIT));
+        assert!(started.elapsed() < Duration::from_millis(350));
+        assert_eq!(
+            manager.transport_status_json().contains("DISCONNECTED"),
+            true
+        );
+        assert_eq!(
+            session.probe(),
+            Err(crate::transport::TransportError::Inactive)
+        );
+        assert!(session.is_clean_for_test());
+        assert_clean(&manager);
+        assert_eq!(
+            manager.stop_and_wait().unwrap().state,
+            RuntimeState::Stopped
+        );
+    }
+
+    #[test]
+    fn eof_and_stop_race_is_idempotent() {
+        let manager = manager();
+        manager.start_test().unwrap();
+        manager.wait_for_state(RuntimeState::Ready, Duration::from_secs(2));
+        manager.wait_for_transport_state(TransportState::Ready, Duration::from_secs(2));
+        let session = manager.transport_session_for_test();
+        let close_ack = manager.queue_control_close_for_test();
+        let stopped = manager.stop_and_wait().unwrap();
+        close_ack
+            .recv_timeout(Duration::from_secs(1))
+            .expect("control close request completed");
+        assert_eq!(stopped.state, RuntimeState::Stopped);
+        assert!(matches!(
+            stopped.failure_category,
+            None | Some("supervisor_lost")
+        ));
+        assert_eq!(
+            manager.stop_and_wait().unwrap().state,
+            RuntimeState::Stopped
+        );
+        assert!(session.is_clean_for_test());
+        assert_clean(&manager);
+    }
+
+    #[test]
+    fn repeated_supervisor_loss_observation_is_idempotent() {
+        let (sender, receiver) = mpsc::channel();
+        let live = AtomicBool::new(true);
+        drop(sender);
+
+        assert_eq!(
+            next_control_signal(&receiver, &live),
+            Some(ControlSignal::SupervisorLost)
+        );
+        assert_eq!(
+            next_control_signal(&receiver, &live),
+            Some(ControlSignal::SupervisorLost)
+        );
+    }
+
+    #[test]
+    fn supervisor_eof_during_proof_request_closes_child_without_late_response() {
+        let manager = manager();
+        manager.start_test().unwrap();
+        manager.wait_for_state(RuntimeState::Ready, Duration::from_secs(2));
+        manager.wait_for_transport_state(TransportState::Ready, Duration::from_secs(2));
+        let session = manager.transport_session_for_test();
+        let mut stream = UnixStream::connect(session.socket_path_for_test()).unwrap();
+        let body = "00".repeat(32);
+        let header = format!(
+            "POST /v1/instance-proof HTTP/1.1\r\nHost: jarvis.local\r\nConnection: close\r\nContent-Length: {}\r\nContent-Type: text/plain\r\n\r\n",
+            body.len()
+        );
+        stream.write_all(header.as_bytes()).unwrap();
+        stream.write_all(&body.as_bytes()[..16]).unwrap();
+        let close_ack = manager.queue_control_close_for_test();
+        close_ack
+            .recv_timeout(Duration::from_secs(1))
+            .expect("supervisor dropped control pipe");
+        let _ = stream.write_all(&body.as_bytes()[16..]);
+        stream
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        let mut late_response = Vec::new();
+        let mut chunk = [0_u8; 256];
+        loop {
+            match stream.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(count) => late_response.extend_from_slice(&chunk[..count]),
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::ConnectionReset
+                            | io::ErrorKind::TimedOut
+                            | io::ErrorKind::WouldBlock
+                    ) =>
+                {
+                    break;
+                }
+                Err(error) => panic!("unexpected proof socket error: {error}"),
+            }
+        }
+        assert!(late_response.is_empty(), "proof response arrived after EOF");
+        let stopped = manager.wait_for_state(RuntimeState::Stopped, Duration::from_secs(1));
+        assert_eq!(stopped.failure_category, Some("supervisor_lost"));
+        assert_eq!(
+            manager.transport_status_json().contains("DISCONNECTED"),
+            true
+        );
+        assert!(session.is_clean_for_test());
+        assert_clean(&manager);
+    }
+
+    #[test]
+    fn hard_parent_loss_closes_inherited_control_pipe_and_child_exits_bounded() {
+        let instance_id = new_instance_id();
+        let session = TransportSession::create(&instance_id).unwrap();
+        let executable = env::current_exe().unwrap();
+        let mut child = Command::new(executable)
+            .arg("--ignored")
+            .arg("--exact")
+            .arg("runtime_manager::tests::runtime_helper_entry")
+            .arg("--format=terse")
+            .arg("--nocapture")
+            .arg("--test-threads=1")
+            .env_clear()
+            .env(HELPER_ID_ENV, &instance_id)
+            .env(HELPER_MODE_ENV, "normal")
+            .current_dir(session.directory_path())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut stdin = child.stdin.take().unwrap();
+        session.write_child_init(&mut stdin).unwrap();
+        let stdout = child.stdout.take().unwrap();
+        let (line_sender, line_receiver) = mpsc::channel();
+        thread::spawn(move || {
+            let mut stdout = BufReader::new(stdout);
+            loop {
+                let mut line = String::new();
+                match stdout.read_line(&mut line) {
+                    Ok(0) => return,
+                    Ok(_) => {
+                        if line_sender.send(line).is_err() {
+                            return;
+                        }
+                    }
+                    Err(_) => return,
+                }
+            }
+        });
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut output_lines = Vec::new();
+        let ready = loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("helper did not announce readiness; output={output_lines:?}");
+            }
+            match line_receiver.recv_timeout(remaining) {
+                Ok(line) if line.trim() == format!("{READY_PREFIX}{instance_id}") => break line,
+                Ok(line) => output_lines.push(line),
+                Err(RecvTimeoutError::Disconnected) => {
+                    let status = child.wait().unwrap();
+                    let mut stderr = String::new();
+                    child
+                        .stderr
+                        .take()
+                        .unwrap()
+                        .read_to_string(&mut stderr)
+                        .unwrap();
+                    panic!("helper exited before readiness: status={status}, stderr={stderr}, output={output_lines:?}");
+                }
+                Err(RecvTimeoutError::Timeout) => {}
+            }
+        };
+        assert_eq!(ready.trim(), format!("{READY_PREFIX}{instance_id}"));
+        writeln!(stdin, "{ACK_PREFIX}{instance_id}").unwrap();
+        stdin.flush().unwrap();
+        drop(stdin);
+
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let status = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break status;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "helper did not exit after pipe EOF"
+            );
+            thread::sleep(POLL_INTERVAL);
+        };
+        assert_eq!(status.code(), Some(SUPERVISOR_LOST_EXIT));
+        assert!(fs::symlink_metadata(session.socket_path_for_test()).is_err());
+        session.revoke();
+        assert!(session.is_clean_for_test());
+    }
+
+    #[test]
+    #[ignore = "MAC-002.1 lifecycle stress; run explicitly"]
+    fn stress_normal_transport_lifecycle_500_rounds() {
+        for round in 0..500 {
+            let manager = manager();
+            manager
+                .start_test()
+                .unwrap_or_else(|error| panic!("round {round}: start failed: {error:?}"));
+            manager.wait_for_state(RuntimeState::Ready, Duration::from_secs(2));
+            manager.wait_for_transport_state(TransportState::Ready, Duration::from_secs(2));
+            assert_eq!(
+                manager.probe_transport_now().state,
+                TransportState::Ready,
+                "round {round}: authenticated request failed"
+            );
+            let session = manager.transport_session_for_test();
+            assert_eq!(
+                manager.stop_and_wait().unwrap().state,
+                RuntimeState::Stopped,
+                "round {round}: stop failed"
+            );
+            assert!(session.is_clean_for_test(), "round {round}: UDS remained");
+            assert_clean(&manager);
+        }
+    }
+
+    #[test]
+    #[ignore = "MAC-002.1 EOF stress; run explicitly"]
+    fn stress_supervisor_eof_200_rounds() {
+        for round in 0..200 {
+            let manager = manager();
+            manager.start_test().unwrap();
+            manager.wait_for_state(RuntimeState::Ready, Duration::from_secs(2));
+            manager.wait_for_transport_state(TransportState::Ready, Duration::from_secs(2));
+            let session = manager.transport_session_for_test();
+            let started = Instant::now();
+            manager.close_control_for_test();
+            let stopped = manager.wait_for_state(RuntimeState::Stopped, Duration::from_secs(1));
+            assert_eq!(
+                stopped.failure_category,
+                Some("supervisor_lost"),
+                "round {round}"
+            );
+            assert!(
+                started.elapsed() < Duration::from_millis(350),
+                "round {round}"
+            );
+            assert!(session.is_clean_for_test(), "round {round}: UDS remained");
+            assert_clean(&manager);
+        }
     }
 }
