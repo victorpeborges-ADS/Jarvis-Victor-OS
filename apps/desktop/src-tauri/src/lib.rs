@@ -11,9 +11,15 @@ pub fn run() {
             runtime_manager::runtime_status,
             runtime_manager::runtime_transport_status,
             runtime_manager::runtime_transport_probe,
-            runtime_manager::runtime_start_test,
+            runtime_manager::g5_session_status,
+            runtime_manager::g5_session_open,
+            runtime_manager::g5_mission_read_grant_create,
+            runtime_manager::g5_mission_read_grant_revoke,
+            runtime_manager::g5_session_close,
+            runtime_manager::g5_missions_list,
+            runtime_manager::runtime_start,
             runtime_manager::runtime_stop,
-            runtime_manager::runtime_restart_test,
+            runtime_manager::runtime_restart,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application");

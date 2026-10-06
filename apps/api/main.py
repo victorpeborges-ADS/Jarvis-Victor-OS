@@ -9,7 +9,7 @@ from pathlib import Path
 from fastapi import APIRouter, FastAPI, HTTPException, Request, Response
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, PlainTextResponse
 
 from pydantic import ValidationError
 
@@ -30,6 +30,8 @@ from mission_api import router as mission_router
 from review_api import router as review_router
 from knowledge_api import router as knowledge_router
 from selected_source_api import router as selected_source_router
+from native_app_api import router as native_app_router
+from native_runtime import NativeProtocolBoundary, NativeRuntimeIdentity, create_native_runtime_router
 from loopback import ALLOWED_ORIGINS, is_allowed_host_header, is_loopback_address
 from memory_store import MemoryStoreError, SQLiteMemoryStore
 from mission_engine import recover_interrupted
@@ -186,5 +188,46 @@ def create_app(config: LocalServerConfig, *, database_path: str | Path | None = 
 
     for error_type in (MemoryStoreError, sqlite3.Error, OSError):
         app.add_exception_handler(error_type, memory_store_unavailable)
+
+    return app
+
+
+def create_native_app(
+    identity: NativeRuntimeIdentity,
+    *,
+    database_path: str | Path | None = None,
+) -> FastAPI:
+    """Build the closed UDS-only app; web/demo routers are deliberately absent."""
+    store = SQLiteMemoryStore(database_path)
+    calendar_provider = CalendarProvider()
+    calendar_sync_service = CalendarSyncService(store, calendar_provider)
+
+    @asynccontextmanager
+    async def lifespan(_app: FastAPI):
+        store.initialize()
+        from source_admission import reconcile_legacy_selected_sources
+        reconcile_legacy_selected_sources(store)
+        recover_interrupted(store)
+        yield
+
+    app = FastAPI(
+        title="JARVIS MAC-003 local runtime",
+        docs_url=None,
+        redoc_url=None,
+        openapi_url=None,
+        lifespan=lifespan,
+    )
+    app.state.memory_store = store
+    app.state.calendar_sim_provider = calendar_provider
+    app.state.calendar_sync_service = calendar_sync_service
+    app.include_router(create_native_runtime_router(identity))
+    app.include_router(native_app_router)
+    app.add_middleware(NativeProtocolBoundary, identity=identity)
+
+    @app.exception_handler(MemoryStoreError)
+    @app.exception_handler(sqlite3.Error)
+    @app.exception_handler(OSError)
+    async def memory_store_unavailable(_request: Request, _exc: Exception):
+        return PlainTextResponse("ok=false\ncode=operation_failed\n", status_code=200)
 
     return app

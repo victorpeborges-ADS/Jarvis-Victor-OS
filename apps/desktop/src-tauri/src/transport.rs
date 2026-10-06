@@ -24,15 +24,28 @@ const INIT_PREFIX: &[u8] = b"JARVIS_TRANSPORT_INIT ";
 const SOCKET_LEAF: &[u8] = b"runtime.sock\0";
 const PROTOCOL_VERSION: &str = "1";
 const RUNTIME_KIND: &str = "jarvis-synthetic";
-const BUILD_ID: &str = "g6-mac-002-synthetic-v1";
+const BUILD_ID: &str = "g6-mac-003-fastapi-g5-v1";
 const HEALTH_ROUTE: &str = "/v1/health";
 const VERSION_ROUTE: &str = "/v1/version";
 const PROOF_ROUTE: &str = "/v1/instance-proof";
+const APP_SESSION_OPEN_ROUTE: &str = "/v1/app/session/open";
+const APP_SESSION_CLOSE_ROUTE: &str = "/v1/app/session/close";
+const APP_GRANT_CREATE_ROUTE: &str = "/v1/app/grants/mission-read";
+const APP_GRANT_REVOKE_ROUTE: &str = "/v1/app/grants/mission-read/revoke";
+const APP_MISSIONS_LIST_ROUTE: &str = "/v1/app/missions/list";
+const APP_ROUTES: [&str; 5] = [
+    APP_SESSION_OPEN_ROUTE,
+    APP_SESSION_CLOSE_ROUTE,
+    APP_GRANT_CREATE_ROUTE,
+    APP_GRANT_REVOKE_ROUTE,
+    APP_MISSIONS_LIST_ROUTE,
+];
 const CONNECT_TIMEOUT: Duration = Duration::from_millis(350);
 const REQUEST_TIMEOUT: Duration = Duration::from_millis(900);
 const SERVER_REQUEST_TIMEOUT: Duration = Duration::from_millis(500);
 const MAX_REQUEST_HEADER_BYTES: usize = 1024;
 const MAX_REQUEST_BODY_BYTES: usize = 128;
+const MAX_APP_REQUEST_BODY_BYTES: usize = 1024;
 const MAX_RESPONSE_HEADER_BYTES: usize = 2048;
 const MAX_RESPONSE_BODY_BYTES: usize = 2048;
 const MAX_INIT_BYTES: usize = 1024;
@@ -133,6 +146,7 @@ pub(crate) enum TransportError {
     Timeout,
     MalformedResponse,
     ResponseTooLarge,
+    ApplicationRequestTooLarge,
     HttpRejected,
     ProofRejected,
     IncompatibleVersion,
@@ -148,6 +162,7 @@ impl TransportError {
             Self::Timeout => "request_timeout",
             Self::MalformedResponse => "malformed_response",
             Self::ResponseTooLarge => "response_too_large",
+            Self::ApplicationRequestTooLarge => "application_request_too_large",
             Self::HttpRejected => "http_rejected",
             Self::ProofRejected => "proof_rejected",
             Self::IncompatibleVersion => "incompatible_version",
@@ -256,6 +271,10 @@ impl TransportSession {
 
     fn probe_endpoint(&self, endpoint: &std::path::Path) -> Result<(), TransportError> {
         let _serial = lock(&self.request_lock);
+        self.probe_endpoint_locked(endpoint)
+    }
+
+    fn probe_endpoint_locked(&self, endpoint: &std::path::Path) -> Result<(), TransportError> {
         self.ensure_active()?;
         let health = self.exchange_at(endpoint, Verb::Get, HEALTH_ROUTE, b"")?;
         if health != b"ok\n" {
@@ -280,6 +299,26 @@ impl TransportSession {
         self.verify_proof(&version, &proof_body, &response)?;
         self.ensure_active()?;
         Ok(())
+    }
+
+    /// Calls one closed MAC-003 operation after revalidating the runtime proof.
+    /// The WebView cannot provide a path or HTTP method.
+    pub(crate) fn call_g5_application(
+        &self,
+        route: &'static str,
+        body: &[u8],
+    ) -> Result<Vec<u8>, TransportError> {
+        if !APP_ROUTES.contains(&route) {
+            return Err(TransportError::HttpRejected);
+        }
+        if body.len() > MAX_APP_REQUEST_BODY_BYTES {
+            return Err(TransportError::ApplicationRequestTooLarge);
+        }
+        let _serial = lock(&self.request_lock);
+        self.probe_endpoint_locked(&self.socket_path)?;
+        let result = self.exchange_at(&self.socket_path, Verb::Post, route, body)?;
+        self.ensure_active()?;
+        Ok(result)
     }
 
     #[cfg(test)]
@@ -1250,6 +1289,20 @@ mod tests {
         Close,
     }
 
+    #[test]
+    fn g5_calls_are_route_closed_and_body_bounded_before_connecting() {
+        let session = TransportSession::create("application-route-allowlist").unwrap();
+        assert_eq!(
+            session.call_g5_application("/real/missions", b""),
+            Err(TransportError::HttpRejected)
+        );
+        assert_eq!(
+            session.call_g5_application(APP_SESSION_OPEN_ROUTE, &vec![b'x'; 1025]),
+            Err(TransportError::ApplicationRequestTooLarge)
+        );
+        session.revoke();
+    }
+
     struct Canaries {
         root: PathBuf,
     }
@@ -1404,6 +1457,11 @@ mod tests {
         let crash_on_proof = env::var("JARVIS_FAKE_CRASH_ON_PROOF").as_deref() == Ok("1");
         let listener = UnixListener::bind(&path).unwrap();
         fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        let stdout = io::stdout();
+        let mut stdout = stdout.lock();
+        writeln!(stdout, "JARVIS_FAKE_RUNTIME_READY {instance_id}").unwrap();
+        stdout.flush().unwrap();
+        drop(stdout);
         loop {
             let (mut stream, _) = listener.accept().unwrap();
             let (start, _) = read_fake_request(&mut stream);
@@ -1462,19 +1520,29 @@ mod tests {
                 if crash_on_proof { "1" } else { "0" },
             )
             .stdin(Stdio::null())
-            .stdout(Stdio::null())
+            .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .spawn()
             .unwrap();
-        let fake = FakeProcess(child);
-        let deadline = Instant::now() + Duration::from_secs(2);
-        while !session.socket_path.exists() && Instant::now() < deadline {
-            thread::sleep(Duration::from_millis(5));
-        }
-        assert!(
-            session.socket_path.exists(),
-            "fake runtime did not bind its UDS"
-        );
+        let mut fake = FakeProcess(child);
+        let stdout = fake.0.stdout.take().unwrap();
+        let (ready_sender, ready_receiver) = std::sync::mpsc::channel();
+        let instance_id = session.instance_id.clone();
+        let ready_line = format!("JARVIS_FAKE_RUNTIME_READY {instance_id}");
+        let expected_ready_line = ready_line.clone();
+        thread::spawn(move || {
+            for line in std::io::BufReader::new(stdout).lines().flatten() {
+                if line == expected_ready_line {
+                    let _ = ready_sender.send(line);
+                    return;
+                }
+            }
+            let _ = ready_sender.send(String::new());
+        });
+        let ready = ready_receiver
+            .recv_timeout(Duration::from_secs(2))
+            .expect("fake runtime signals readiness after UDS bind");
+        assert_eq!(ready, ready_line);
         fake
     }
 

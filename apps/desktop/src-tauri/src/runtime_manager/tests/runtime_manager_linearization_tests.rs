@@ -359,7 +359,15 @@ fn late_events_from_generation_a_cannot_change_generation_b() {
     let instance_b = started_b.runtime_instance_id.clone().unwrap();
     assert_ne!(instance_a, instance_b);
     let before_late_events = manager.snapshot();
-    assert!(!mark_ready(&manager.shared, &instance_a));
+    let current_transport = lock_inner(&manager.shared)
+        .transport_session
+        .clone()
+        .expect("generation B owns a transport session");
+    assert!(!mark_ready_after_transport(
+        &manager.shared,
+        &instance_a,
+        &current_transport
+    ));
     finish_start_failure(&manager.shared, &instance_a, "late_old_start_failure", None);
     finish_after_ready_failure(
         &manager.shared,

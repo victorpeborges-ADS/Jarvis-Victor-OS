@@ -1,9 +1,10 @@
-use crate::transport::{ChildTransportConfig, TransportSession, TransportSnapshot, TransportState};
-#[cfg(test)]
-use std::path::{Path, PathBuf};
+use crate::transport::{
+    ChildTransportConfig, TransportError, TransportSession, TransportSnapshot, TransportState,
+};
 use std::{
     env,
     io::{self, BufRead, BufReader, Write},
+    path::{Path, PathBuf},
     process::{Child, Command, ExitStatus, Stdio},
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -131,6 +132,7 @@ enum HelperMode {
 }
 
 impl HelperMode {
+    #[cfg(test)]
     fn as_str(self) -> &'static str {
         match self {
             Self::Normal => "normal",
@@ -229,8 +231,64 @@ struct Inner {
     snapshot: RuntimeSnapshot,
     transport_snapshot: TransportSnapshot,
     transport_session: Option<Arc<TransportSession>>,
+    g5_session: Option<G5Session>,
+    g5_grant: Option<G5Grant>,
     supervisor: Option<Sender<SupervisorMessage>>,
     completion: Option<Arc<GenerationCompletion>>,
+}
+
+struct G5Session {
+    runtime_instance_id: String,
+    token: SecretText,
+    csrf_token: SecretText,
+    expires_at: String,
+    expires_at_unix_seconds: u64,
+}
+
+struct G5Grant {
+    id: String,
+    domain_id: String,
+    expires_at: String,
+    expires_at_unix_seconds: u64,
+}
+
+struct SecretText(String);
+
+impl SecretText {
+    fn new(value: String) -> Self {
+        Self(value)
+    }
+
+    fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl Drop for SecretText {
+    fn drop(&mut self) {
+        // NUL bytes are valid UTF-8, so replacing the initialized bytes keeps
+        // String's invariant while clearing secret material before release.
+        unsafe { self.0.as_mut_vec().fill(0) };
+    }
+}
+
+struct SecretBytes(Vec<u8>);
+
+impl SecretBytes {
+    fn new(value: Vec<u8>) -> Self {
+        Self(value)
+    }
+
+    fn as_slice(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl Drop for SecretBytes {
+    fn drop(&mut self) {
+        self.0.fill(0);
+        std::hint::black_box(&self.0);
+    }
 }
 
 /// Kept alive by stop waiters after a later generation replaces `Inner.snapshot`.
@@ -261,6 +319,7 @@ impl GenerationCompletion {
 
 enum SupervisorMessage {
     Output(String),
+    TransportVerified(Result<(), TransportError>),
     StdoutClosed,
     StdoutFailed,
     Stop(Sender<RuntimeSnapshot>),
@@ -293,6 +352,7 @@ struct StopWaitTestHook {
 
 pub struct RuntimeManager {
     shared: Arc<Shared>,
+    g5_operation: Mutex<()>,
     #[cfg(test)]
     helper_executable: Option<PathBuf>,
     #[cfg(test)]
@@ -324,7 +384,7 @@ impl ManagerError {
             },
             Self::SupervisorUnavailable => "O supervisor local não está disponível.",
             Self::CommandTimeout => "O runtime não confirmou o encerramento dentro do prazo.",
-            Self::SpawnFailed => "Não foi possível iniciar o processo de teste.",
+            Self::SpawnFailed => "Não foi possível iniciar o backend local.",
             Self::TransportSetupFailed => "Não foi possível preparar o canal local autenticado.",
         }
     }
@@ -342,12 +402,15 @@ impl RuntimeManager {
                     snapshot: RuntimeSnapshot::stopped(),
                     transport_snapshot: TransportSnapshot::disconnected(),
                     transport_session: None,
+                    g5_session: None,
+                    g5_grant: None,
                     supervisor: None,
                     completion: None,
                 }),
                 changed: Condvar::new(),
                 options,
             }),
+            g5_operation: Mutex::new(()),
             #[cfg(test)]
             helper_executable: None,
             #[cfg(test)]
@@ -372,6 +435,506 @@ impl RuntimeManager {
 
     fn transport_status_json(&self) -> String {
         lock_inner(&self.shared).transport_snapshot.json()
+    }
+
+    fn g5_session_status_json(&self) -> String {
+        let mut inner = lock_inner(&self.shared);
+        expire_cached_authorization(&mut inner);
+        let session = inner.g5_session.as_ref().filter(|session| {
+            inner.snapshot.runtime_instance_id.as_deref()
+                == Some(session.runtime_instance_id.as_str())
+                && inner.snapshot.state == RuntimeState::Ready
+        });
+        let grant = if session.is_some() {
+            inner.g5_grant.as_ref()
+        } else {
+            None
+        };
+        format!(
+            "{{\"ok\":true,\"session_active\":{},\"session_expires_at\":{},\"grant_active\":{},\"grant_domain_id\":{},\"grant_expires_at\":{}}}",
+            session.is_some(),
+            json_optional_string(session.map(|value| value.expires_at.as_str())),
+            grant.is_some(),
+            json_optional_string(grant.map(|value| value.domain_id.as_str())),
+            json_optional_string(grant.map(|value| value.expires_at.as_str())),
+        )
+    }
+
+    fn active_transport_for_g5(&self) -> Result<(String, Arc<TransportSession>), &'static str> {
+        let inner = lock_inner(&self.shared);
+        if inner.snapshot.state != RuntimeState::Ready
+            || inner.transport_snapshot.state != TransportState::Ready
+        {
+            return Err("runtime_unavailable");
+        }
+        let instance_id = inner
+            .snapshot
+            .runtime_instance_id
+            .clone()
+            .ok_or("runtime_unavailable")?;
+        let session = inner
+            .transport_session
+            .clone()
+            .ok_or("runtime_unavailable")?;
+        Ok((instance_id, session))
+    }
+
+    fn g5_session_open(&self, passphrase: String) -> String {
+        let _operation = self
+            .g5_operation
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let passphrase = SecretText::new(passphrase);
+        if passphrase.as_str().len() < 12 || passphrase.as_str().len() > 128 {
+            return g5_error_json("credential_rejected");
+        }
+        {
+            let mut inner = lock_inner(&self.shared);
+            expire_cached_authorization(&mut inner);
+            if inner.g5_session.is_some() {
+                return g5_error_json("session_already_open");
+            }
+        }
+        let (instance_id, transport) = match self.active_transport_for_g5() {
+            Ok(value) => value,
+            Err(error) => return g5_error_json(error),
+        };
+        let body = SecretBytes::new(encode_application_fields(&[(
+            "passphrase",
+            passphrase.as_str(),
+        )]));
+        let response = match transport.call_g5_application("/v1/app/session/open", body.as_slice())
+        {
+            Ok(value) => SecretBytes::new(value),
+            Err(_) => return g5_error_json("transport_failure"),
+        };
+        // The form body contains the user-entered credential and is cleared
+        // before parsing the response.
+        drop(body);
+        let mut fields = match parse_application_response(response.as_slice()) {
+            Ok(value) => value,
+            Err(()) => return g5_error_json("protocol_failure"),
+        };
+        if app_response_error(&fields).is_some() {
+            let error = app_response_error(&fields).unwrap_or("operation_failed");
+            return g5_error_json(error);
+        }
+        if !app_fields_match(
+            &fields,
+            &[
+                "ok",
+                "principal",
+                "session_token",
+                "csrf_token",
+                "expires_at_epoch",
+                "expires_at",
+            ],
+        ) || app_field(&fields, "ok") != Some("true")
+            || app_field(&fields, "principal") != Some("owner")
+        {
+            return g5_error_json("protocol_failure");
+        }
+        let token = match take_app_secret(&mut fields, "session_token") {
+            Some(value) if is_session_token(value.as_str()) => value,
+            _ => return g5_error_json("protocol_failure"),
+        };
+        let csrf_token = match take_app_secret(&mut fields, "csrf_token") {
+            Some(value) if is_session_token(value.as_str()) => value,
+            _ => return g5_error_json("protocol_failure"),
+        };
+        let expires_at = match take_app_secret(&mut fields, "expires_at") {
+            Some(value) if !value.as_str().is_empty() && value.as_str().len() <= 64 => {
+                value.as_str().to_owned()
+            }
+            _ => return g5_error_json("protocol_failure"),
+        };
+        let expires_at_unix_seconds = match take_app_secret(&mut fields, "expires_at_epoch")
+            .and_then(|value| value.as_str().parse::<u64>().ok())
+        {
+            Some(value) if value > unix_time_seconds() => value,
+            _ => return g5_error_json("protocol_failure"),
+        };
+        let mut inner = lock_inner(&self.shared);
+        if inner.snapshot.runtime_instance_id.as_deref() != Some(instance_id.as_str())
+            || inner.snapshot.state != RuntimeState::Ready
+            || inner.transport_snapshot.state != TransportState::Ready
+            || !inner
+                .transport_session
+                .as_ref()
+                .is_some_and(|current| Arc::ptr_eq(current, &transport))
+        {
+            return g5_error_json("stale_generation");
+        }
+        inner.g5_session = Some(G5Session {
+            runtime_instance_id: instance_id,
+            token,
+            csrf_token,
+            expires_at: expires_at.clone(),
+            expires_at_unix_seconds,
+        });
+        format!(
+            "{{\"ok\":true,\"session_active\":true,\"expires_at\":{}}}",
+            json_string(&expires_at)
+        )
+    }
+
+    fn g5_mission_read_grant_create(&self) -> String {
+        let _operation = self
+            .g5_operation
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        {
+            let mut inner = lock_inner(&self.shared);
+            expire_cached_authorization(&mut inner);
+            if inner.g5_grant.is_some() {
+                return g5_error_json("grant_conflict");
+            }
+        }
+        let (instance_id, transport, token, csrf_token) = match self.g5_credentials_for_active() {
+            Ok(value) => value,
+            Err(error) => return g5_error_json(error),
+        };
+        let body = SecretBytes::new(encode_application_fields(&[
+            ("session_token", token.as_str()),
+            ("csrf_token", csrf_token.as_str()),
+            ("domain_id", "dom_synthetic_a"),
+        ]));
+        let response =
+            match transport.call_g5_application("/v1/app/grants/mission-read", body.as_slice()) {
+                Ok(value) => SecretBytes::new(value),
+                Err(_) => return g5_error_json("transport_failure"),
+            };
+        let mut fields = match parse_application_response(response.as_slice()) {
+            Ok(value) => value,
+            Err(()) => return g5_error_json("protocol_failure"),
+        };
+        if let Some(error) = app_response_error(&fields) {
+            clear_cached_authorization_after_rejection(
+                &self.shared,
+                &instance_id,
+                &transport,
+                token.as_str(),
+                error,
+            );
+            return g5_error_json(error);
+        }
+        if !app_fields_match(
+            &fields,
+            &[
+                "ok",
+                "grant_id",
+                "domain_id",
+                "expires_at_epoch",
+                "expires_at",
+            ],
+        ) || app_field(&fields, "ok") != Some("true")
+            || app_field(&fields, "domain_id") != Some("dom_synthetic_a")
+        {
+            return g5_error_json("protocol_failure");
+        }
+        let grant_id = match take_app_secret(&mut fields, "grant_id") {
+            Some(value) if is_hex_identifier(value.as_str()) => value.as_str().to_owned(),
+            _ => return g5_error_json("protocol_failure"),
+        };
+        let expires_at = match take_app_secret(&mut fields, "expires_at") {
+            Some(value) if !value.as_str().is_empty() && value.as_str().len() <= 64 => {
+                value.as_str().to_owned()
+            }
+            _ => return g5_error_json("protocol_failure"),
+        };
+        let expires_at_unix_seconds = match take_app_secret(&mut fields, "expires_at_epoch")
+            .and_then(|value| value.as_str().parse::<u64>().ok())
+        {
+            Some(value) if value > unix_time_seconds() => value,
+            _ => return g5_error_json("protocol_failure"),
+        };
+        let mut inner = lock_inner(&self.shared);
+        if !g5_generation_matches(&inner, &instance_id, &transport)
+            || inner
+                .g5_session
+                .as_ref()
+                .is_none_or(|session| session.token.as_str() != token.as_str())
+        {
+            return g5_error_json("stale_generation");
+        }
+        inner.g5_grant = Some(G5Grant {
+            id: grant_id,
+            domain_id: "dom_synthetic_a".to_owned(),
+            expires_at: expires_at.clone(),
+            expires_at_unix_seconds,
+        });
+        format!(
+            "{{\"ok\":true,\"grant_active\":true,\"domain_id\":\"dom_synthetic_a\",\"expires_at\":{}}}",
+            json_string(&expires_at)
+        )
+    }
+
+    fn g5_mission_read_grant_revoke(&self) -> String {
+        let _operation = self
+            .g5_operation
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        self.g5_mission_read_grant_revoke_locked()
+    }
+
+    fn g5_mission_read_grant_revoke_locked(&self) -> String {
+        let (instance_id, transport, token, csrf_token, grant_id) = {
+            let inner = lock_inner(&self.shared);
+            let Some(session) = inner.g5_session.as_ref() else {
+                return g5_error_json("session_required");
+            };
+            let Some(grant) = inner.g5_grant.as_ref() else {
+                return g5_error_json("grant_required");
+            };
+            if inner.snapshot.state != RuntimeState::Ready
+                || inner.transport_snapshot.state != TransportState::Ready
+                || inner.snapshot.runtime_instance_id.as_deref()
+                    != Some(session.runtime_instance_id.as_str())
+            {
+                return g5_error_json("runtime_unavailable");
+            }
+            let Some(transport) = inner.transport_session.clone() else {
+                return g5_error_json("runtime_unavailable");
+            };
+            (
+                session.runtime_instance_id.clone(),
+                transport,
+                SecretText::new(session.token.as_str().to_owned()),
+                SecretText::new(session.csrf_token.as_str().to_owned()),
+                grant.id.clone(),
+            )
+        };
+        let body = SecretBytes::new(encode_application_fields(&[
+            ("session_token", token.as_str()),
+            ("csrf_token", csrf_token.as_str()),
+            ("grant_id", &grant_id),
+        ]));
+        let response = match transport
+            .call_g5_application("/v1/app/grants/mission-read/revoke", body.as_slice())
+        {
+            Ok(value) => SecretBytes::new(value),
+            Err(_) => return g5_error_json("transport_failure"),
+        };
+        let fields = match parse_application_response(response.as_slice()) {
+            Ok(value) => value,
+            Err(()) => return g5_error_json("protocol_failure"),
+        };
+        if let Some(error) = app_response_error(&fields) {
+            clear_cached_authorization_after_rejection(
+                &self.shared,
+                &instance_id,
+                &transport,
+                token.as_str(),
+                error,
+            );
+            return g5_error_json(error);
+        }
+        if !app_fields_match(&fields, &["ok", "revoked"])
+            || app_field(&fields, "ok") != Some("true")
+            || app_field(&fields, "revoked") != Some("true")
+        {
+            return g5_error_json("protocol_failure");
+        }
+        let mut inner = lock_inner(&self.shared);
+        if !g5_generation_matches(&inner, &instance_id, &transport)
+            || inner
+                .g5_session
+                .as_ref()
+                .is_none_or(|session| session.token.as_str() != token.as_str())
+        {
+            return g5_error_json("stale_generation");
+        }
+        if inner
+            .g5_grant
+            .as_ref()
+            .is_some_and(|grant| grant.id == grant_id)
+        {
+            inner.g5_grant = None;
+        }
+        "{\"ok\":true,\"grant_active\":false}".to_owned()
+    }
+
+    fn g5_session_close(&self) -> String {
+        let _operation = self
+            .g5_operation
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        {
+            let mut inner = lock_inner(&self.shared);
+            expire_cached_authorization(&mut inner);
+            if inner.g5_grant.is_some() {
+                return g5_error_json("grant_active");
+            }
+        }
+        let (instance_id, transport, token, csrf_token) = match self.g5_credentials_for_active() {
+            Ok(value) => value,
+            Err(error) => return g5_error_json(error),
+        };
+        let body = SecretBytes::new(encode_application_fields(&[
+            ("session_token", token.as_str()),
+            ("csrf_token", csrf_token.as_str()),
+        ]));
+        let response = match transport.call_g5_application("/v1/app/session/close", body.as_slice())
+        {
+            Ok(value) => SecretBytes::new(value),
+            Err(_) => return g5_error_json("transport_failure"),
+        };
+        let fields = match parse_application_response(response.as_slice()) {
+            Ok(value) => value,
+            Err(()) => return g5_error_json("protocol_failure"),
+        };
+        if let Some(error) = app_response_error(&fields) {
+            clear_cached_authorization_after_rejection(
+                &self.shared,
+                &instance_id,
+                &transport,
+                token.as_str(),
+                error,
+            );
+            return g5_error_json(error);
+        }
+        if !app_fields_match(&fields, &["ok", "closed"])
+            || app_field(&fields, "ok") != Some("true")
+            || app_field(&fields, "closed") != Some("true")
+        {
+            return g5_error_json("protocol_failure");
+        }
+        let mut inner = lock_inner(&self.shared);
+        if !g5_generation_matches(&inner, &instance_id, &transport)
+            || inner
+                .g5_session
+                .as_ref()
+                .is_none_or(|session| session.token.as_str() != token.as_str())
+        {
+            return g5_error_json("stale_generation");
+        }
+        inner.g5_session = None;
+        inner.g5_grant = None;
+        "{\"ok\":true,\"session_active\":false,\"grant_active\":false}".to_owned()
+    }
+
+    fn g5_missions_list(&self) -> String {
+        let _operation = self
+            .g5_operation
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let (instance_id, transport, token, _csrf_token) = match self.g5_credentials_for_active() {
+            Ok(value) => value,
+            Err(error) => return g5_error_json(error),
+        };
+        if lock_inner(&self.shared).g5_grant.is_none() {
+            return g5_error_json("grant_required");
+        }
+        let body = SecretBytes::new(encode_application_fields(&[
+            ("session_token", token.as_str()),
+            ("domain_id", "dom_synthetic_a"),
+        ]));
+        let response = match transport.call_g5_application("/v1/app/missions/list", body.as_slice())
+        {
+            Ok(value) => SecretBytes::new(value),
+            Err(_) => return g5_error_json("transport_failure"),
+        };
+        let mut fields = match parse_application_response(response.as_slice()) {
+            Ok(value) => value,
+            Err(()) => return g5_error_json("protocol_failure"),
+        };
+        if let Some(error) = app_response_error(&fields) {
+            clear_cached_authorization_after_rejection(
+                &self.shared,
+                &instance_id,
+                &transport,
+                token.as_str(),
+                error,
+            );
+            return g5_error_json(error);
+        }
+        let count = app_field(&fields, "count");
+        let expected = if count == Some("0") {
+            &["ok", "dataset", "count"][..]
+        } else if count == Some("1") {
+            &[
+                "ok",
+                "dataset",
+                "count",
+                "mission_id",
+                "title",
+                "domain_id",
+                "status",
+                "revision",
+            ][..]
+        } else {
+            return g5_error_json("protocol_failure");
+        };
+        if !app_fields_match(&fields, expected)
+            || app_field(&fields, "ok") != Some("true")
+            || app_field(&fields, "dataset") != Some("api_synthetic")
+        {
+            return g5_error_json("protocol_failure");
+        }
+        let result = if count == Some("0") {
+            "{\"ok\":true,\"dataset\":\"api_synthetic\",\"items\":[]}".to_owned()
+        } else {
+            let mission_id = take_app_secret(&mut fields, "mission_id").unwrap();
+            let title = take_app_secret(&mut fields, "title").unwrap();
+            let domain_id = take_app_secret(&mut fields, "domain_id").unwrap();
+            let status = take_app_secret(&mut fields, "status").unwrap();
+            let revision = take_app_secret(&mut fields, "revision").unwrap();
+            if mission_id.as_str().is_empty()
+                || mission_id.as_str().len() > 128
+                || mission_id.as_str().chars().any(char::is_control)
+                || title.as_str().chars().count() > 80
+                || domain_id.as_str() != "dom_synthetic_a"
+                || !is_safe_mission_status(status.as_str())
+                || revision.as_str().parse::<u64>().is_err()
+            {
+                return g5_error_json("protocol_failure");
+            }
+            format!(
+                "{{\"ok\":true,\"dataset\":\"api_synthetic\",\"items\":[{{\"id\":{},\"title\":{},\"domain_id\":{},\"status\":{},\"revision\":{}}}]}}",
+                json_string(mission_id.as_str()),
+                json_string(title.as_str()),
+                json_string(domain_id.as_str()),
+                json_string(status.as_str()),
+                revision.as_str(),
+            )
+        };
+        let inner = lock_inner(&self.shared);
+        if !g5_generation_matches(&inner, &instance_id, &transport)
+            || inner
+                .g5_session
+                .as_ref()
+                .is_none_or(|session| session.token.as_str() != token.as_str())
+        {
+            return g5_error_json("stale_generation");
+        }
+        result
+    }
+
+    fn g5_credentials_for_active(
+        &self,
+    ) -> Result<(String, Arc<TransportSession>, SecretText, SecretText), &'static str> {
+        let mut inner = lock_inner(&self.shared);
+        expire_cached_authorization(&mut inner);
+        let Some(session) = inner.g5_session.as_ref() else {
+            return Err("session_required");
+        };
+        if inner.snapshot.state != RuntimeState::Ready
+            || inner.transport_snapshot.state != TransportState::Ready
+            || inner.snapshot.runtime_instance_id.as_deref()
+                != Some(session.runtime_instance_id.as_str())
+        {
+            return Err("runtime_unavailable");
+        }
+        let transport = inner
+            .transport_session
+            .clone()
+            .ok_or("runtime_unavailable")?;
+        Ok((
+            session.runtime_instance_id.clone(),
+            transport,
+            SecretText::new(session.token.as_str().to_owned()),
+            SecretText::new(session.csrf_token.as_str().to_owned()),
+        ))
     }
 
     fn probe_transport_now(&self) -> TransportSnapshot {
@@ -525,6 +1088,7 @@ impl RuntimeManager {
         let shared = Arc::clone(&self.shared);
         let options = self.shared.options;
         let worker_instance_id = instance_id.clone();
+        let supervisor_sender = sender.clone();
         thread::spawn(move || {
             supervise_child(
                 shared,
@@ -532,6 +1096,7 @@ impl RuntimeManager {
                 child,
                 stdin,
                 receiver,
+                supervisor_sender,
                 options,
                 transport_session,
             )
@@ -871,13 +1436,29 @@ fn transition_log(from: RuntimeState, to: RuntimeState, instance_id: &str) {
     );
 }
 
-fn mark_ready(shared: &Shared, instance_id: &str) -> bool {
+fn mark_ready_after_transport(
+    shared: &Shared,
+    instance_id: &str,
+    session: &Arc<TransportSession>,
+) -> bool {
     let mut inner = lock_inner(shared);
     if inner.snapshot.runtime_instance_id.as_deref() != Some(instance_id)
         || inner.snapshot.state != RuntimeState::Starting
+        || inner.transport_snapshot.state != TransportState::ProvingInstance
+        || !inner
+            .transport_session
+            .as_ref()
+            .is_some_and(|current| Arc::ptr_eq(current, session))
     {
         return false;
     }
+    inner.transport_snapshot = TransportSnapshot {
+        state: TransportState::Ready,
+        runtime_instance_id: Some(instance_id.to_owned()),
+        endpoint_type: Some("uds"),
+        protocol_version: Some("1".to_owned()),
+        error_category: None,
+    };
     if !transition_locked(&mut inner, RuntimeState::Ready, instance_id) {
         return false;
     }
@@ -949,6 +1530,8 @@ fn revoke_transport_locked(
     if let Some(session) = inner.transport_session.take() {
         session.revoke();
     }
+    inner.g5_session = None;
+    inner.g5_grant = None;
     inner.transport_snapshot = TransportSnapshot {
         state,
         runtime_instance_id: Some(instance_id.to_owned()),
@@ -1097,11 +1680,13 @@ fn supervise_child(
     mut child: Child,
     mut stdin: Option<std::process::ChildStdin>,
     receiver: Receiver<SupervisorMessage>,
+    sender: Sender<SupervisorMessage>,
     options: RuntimeOptions,
     transport_session: Arc<TransportSession>,
 ) {
     let startup_deadline = Instant::now() + options.startup_timeout;
     let mut readiness_channel_closed = false;
+    let mut readiness_acknowledged = false;
     loop {
         let state = lock_inner(&shared).snapshot.state;
         if state == RuntimeState::Starting {
@@ -1180,7 +1765,9 @@ fn supervise_child(
         match message {
             SupervisorMessage::Output(line) => {
                 if is_ready_for(&line, &instance_id) {
-                    if lock_inner(&shared).snapshot.state != RuntimeState::Starting {
+                    if readiness_acknowledged
+                        || lock_inner(&shared).snapshot.state != RuntimeState::Starting
+                    {
                         continue;
                     }
                     if !transport_session.path_matches_handle() {
@@ -1216,14 +1803,12 @@ fn supervise_child(
                         );
                         return;
                     }
-                    if !mark_ready(&shared, &instance_id) {
-                        return;
-                    }
+                    readiness_acknowledged = true;
                     {
                         let mut inner = lock_inner(&shared);
                         if inner.snapshot.runtime_instance_id.as_deref()
                             == Some(instance_id.as_str())
-                            && inner.snapshot.state == RuntimeState::Ready
+                            && inner.snapshot.state == RuntimeState::Starting
                         {
                             inner.transport_snapshot = TransportSnapshot {
                                 state: TransportState::ProvingInstance,
@@ -1234,12 +1819,37 @@ fn supervise_child(
                             };
                         }
                     }
-                    let probe_shared = Arc::clone(&shared);
-                    let probe_instance = instance_id.clone();
+                    let probe_sender = sender.clone();
                     let probe_session = Arc::clone(&transport_session);
                     thread::spawn(move || {
-                        complete_transport_probe(&probe_shared, &probe_instance, probe_session)
+                        let result = probe_session.probe();
+                        let _ = probe_sender.send(SupervisorMessage::TransportVerified(result));
                     });
+                }
+            }
+            SupervisorMessage::TransportVerified(result) => {
+                if lock_inner(&shared).snapshot.state != RuntimeState::Starting {
+                    continue;
+                }
+                match result {
+                    Ok(()) if transport_session.path_matches_handle() => {
+                        if !mark_ready_after_transport(&shared, &instance_id, &transport_session) {
+                            continue;
+                        }
+                        eprintln!(
+                            "runtime authenticated and ready instance_id={instance_id} endpoint_type=uds protocol_version=1"
+                        );
+                    }
+                    result => {
+                        let category = match result {
+                            Err(error) => error.category(),
+                            Ok(()) => "transport_path_changed",
+                        };
+                        let _ = child.kill();
+                        let status = child.wait().ok();
+                        finish_start_failure(&shared, &instance_id, category, status);
+                        return;
+                    }
                 }
             }
             SupervisorMessage::StdoutClosed => {
@@ -1373,6 +1983,7 @@ fn is_ready_for(line: &str, expected_instance_id: &str) -> bool {
     line == format!("{READY_PREFIX}{expected_instance_id}")
 }
 
+#[cfg(test)]
 fn helper_arguments(instance_id: &str, mode: HelperMode) -> Vec<String> {
     vec![
         TEST_HELPER_SWITCH.to_owned(),
@@ -1415,11 +2026,31 @@ fn helper_command(
     }
     #[cfg(not(test))]
     {
+        let _ = mode;
         let _ = stale_instance_id;
-        let executable = env::current_exe()?;
+        let api_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../api")
+            .canonicalize()?;
+        let venv_python = api_root.join(".venv/bin/python");
+        let executable = if venv_python.is_file() {
+            venv_python
+        } else {
+            PathBuf::from("python3.12")
+        };
         let mut command = Command::new(executable);
         command.env_clear();
-        command.args(helper_arguments(instance_id, mode));
+        command
+            .arg("-u")
+            .arg(api_root.join("serve.py"))
+            .arg("--desktop-runtime")
+            .arg(instance_id)
+            .env("PYTHONUNBUFFERED", "1")
+            .env("PYTHONDONTWRITEBYTECODE", "1");
+        for name in ["JARVIS_LOCAL_PASSPHRASE", "JARVIS_DATABASE_PATH"] {
+            if let Some(value) = env::var_os(name) {
+                command.env(name, value);
+            }
+        }
         Ok(command)
     }
 }
@@ -1438,6 +2069,32 @@ fn unix_time_ms() -> u128 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis()
+}
+
+fn unix_time_seconds() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+fn expire_cached_authorization(inner: &mut Inner) {
+    let now = unix_time_seconds();
+    if inner
+        .g5_session
+        .as_ref()
+        .is_some_and(|session| session.expires_at_unix_seconds <= now)
+    {
+        inner.g5_session = None;
+        inner.g5_grant = None;
+    }
+    if inner
+        .g5_grant
+        .as_ref()
+        .is_some_and(|grant| grant.expires_at_unix_seconds <= now)
+    {
+        inner.g5_grant = None;
+    }
 }
 
 fn json_string(value: &str) -> String {
@@ -1465,6 +2122,220 @@ fn json_optional_number(value: Option<impl std::fmt::Display>) -> String {
     value
         .map(|number| number.to_string())
         .unwrap_or_else(|| "null".to_owned())
+}
+
+fn g5_error_json(code: &str) -> String {
+    let message = match code {
+        "runtime_unavailable" => "O runtime local autenticado não está pronto.",
+        "credential_rejected" => "Credencial local recusada ou não configurada.",
+        "session_required" => "Abra novamente a sessão G5 local.",
+        "session_already_open" => "Já existe uma sessão G5 aberta neste runtime.",
+        "grant_required" => "A concessão de leitura está ausente ou expirada.",
+        "grant_active" => "Revogue a concessão de leitura antes de encerrar a sessão.",
+        "grant_conflict" => "Já existe uma concessão ativa para este escopo.",
+        "scope_invalid" => "O escopo fixo de leitura foi recusado.",
+        "grant_expired" => "A concessão de leitura expirou.",
+        "stale_generation" => "A resposta pertence a um runtime encerrado.",
+        "protocol_failure" => "O backend retornou uma resposta inválida.",
+        _ => "Não foi possível concluir a operação G5 local.",
+    };
+    format!("{{\"ok\":false,\"error\":{}}}", json_string(message))
+}
+
+fn encode_application_fields(fields: &[(&str, &str)]) -> Vec<u8> {
+    let mut body = Vec::new();
+    for (name, value) in fields {
+        body.extend_from_slice(name.as_bytes());
+        body.push(b'=');
+        append_application_value(value.as_bytes(), &mut body);
+        body.push(b'\n');
+    }
+    body
+}
+
+fn append_application_value(value: &[u8], output: &mut Vec<u8>) {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    for byte in value {
+        if byte.is_ascii_alphanumeric() || matches!(*byte, b'-' | b'_' | b'.' | b'~') {
+            output.push(*byte);
+        } else {
+            output.push(b'%');
+            output.push(HEX[(byte >> 4) as usize]);
+            output.push(HEX[(byte & 0x0f) as usize]);
+        }
+    }
+}
+
+fn parse_application_response(body: &[u8]) -> Result<Vec<(String, SecretText)>, ()> {
+    if body.is_empty() || body.len() > 2048 || !body.ends_with(b"\n") || body.contains(&b'\r') {
+        return Err(());
+    }
+    let text = std::str::from_utf8(&body[..body.len() - 1]).map_err(|_| ())?;
+    let mut parsed = Vec::new();
+    for line in text.split('\n') {
+        if parsed.len() >= 8 {
+            return Err(());
+        }
+        let (name, encoded) = line.split_once('=').ok_or(())?;
+        if name.is_empty()
+            || !name
+                .bytes()
+                .all(|byte| byte.is_ascii_lowercase() || byte == b'_')
+            || parsed.iter().any(|(existing, _)| existing == name)
+        {
+            return Err(());
+        }
+        let mut decoded = Vec::with_capacity(encoded.len());
+        let bytes = encoded.as_bytes();
+        let mut index = 0;
+        while index < bytes.len() {
+            if bytes[index] == b'%' {
+                if index + 2 >= bytes.len() {
+                    return Err(());
+                }
+                let high = application_hex_nibble(bytes[index + 1]).ok_or(())?;
+                let low = application_hex_nibble(bytes[index + 2]).ok_or(())?;
+                decoded.push((high << 4) | low);
+                index += 3;
+            } else {
+                let byte = bytes[index];
+                if !(byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~')) {
+                    return Err(());
+                }
+                decoded.push(byte);
+                index += 1;
+            }
+        }
+        let value = String::from_utf8(decoded).map_err(|_| ())?;
+        let mut canonical = Vec::with_capacity(encoded.len());
+        append_application_value(value.as_bytes(), &mut canonical);
+        let is_canonical = canonical.as_slice() == encoded.as_bytes();
+        canonical.fill(0);
+        if !is_canonical {
+            return Err(());
+        }
+        parsed.push((name.to_owned(), SecretText::new(value)));
+    }
+    Ok(parsed)
+}
+
+fn application_hex_nibble(value: u8) -> Option<u8> {
+    match value {
+        b'0'..=b'9' => Some(value - b'0'),
+        b'A'..=b'F' => Some(value - b'A' + 10),
+        _ => None,
+    }
+}
+
+fn app_fields_match(fields: &[(String, SecretText)], expected: &[&str]) -> bool {
+    fields.len() == expected.len()
+        && fields
+            .iter()
+            .zip(expected)
+            .all(|((name, _), expected)| name == expected)
+}
+
+fn app_field<'a>(fields: &'a [(String, SecretText)], name: &str) -> Option<&'a str> {
+    fields
+        .iter()
+        .find(|(field, _)| field == name)
+        .map(|(_, value)| value.as_str())
+}
+
+fn take_app_secret(fields: &mut Vec<(String, SecretText)>, name: &str) -> Option<SecretText> {
+    fields
+        .iter()
+        .position(|(field, _)| field == name)
+        .map(|index| fields.remove(index).1)
+}
+
+fn app_response_error(fields: &[(String, SecretText)]) -> Option<&'static str> {
+    if app_field(fields, "ok") != Some("false") {
+        return None;
+    }
+    if !app_fields_match(fields, &["ok", "code"]) {
+        return Some("protocol_failure");
+    }
+    Some(match app_field(fields, "code")? {
+        "credential_rejected" => "credential_rejected",
+        "session_required" => "session_required",
+        "grant_required" => "grant_required",
+        "grant_active" => "grant_active",
+        "scope_invalid" => "scope_invalid",
+        "grant_conflict" => "grant_conflict",
+        "grant_expired" => "grant_expired",
+        "operation_failed" => "operation_failed",
+        _ => "protocol_failure",
+    })
+}
+
+fn is_session_token(value: &str) -> bool {
+    (32..=128).contains(&value.len())
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+}
+
+fn is_hex_identifier(value: &str) -> bool {
+    value.len() == 32
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+}
+
+fn is_safe_mission_status(value: &str) -> bool {
+    matches!(
+        value,
+        "draft"
+            | "planned"
+            | "awaiting_approval"
+            | "running"
+            | "blocked"
+            | "done"
+            | "cancelled"
+            | "failed"
+            | "interrupted"
+    )
+}
+
+fn g5_generation_matches(
+    inner: &Inner,
+    instance_id: &str,
+    transport: &Arc<TransportSession>,
+) -> bool {
+    inner.snapshot.state == RuntimeState::Ready
+        && inner.transport_snapshot.state == TransportState::Ready
+        && inner.snapshot.runtime_instance_id.as_deref() == Some(instance_id)
+        && inner
+            .transport_session
+            .as_ref()
+            .is_some_and(|current| Arc::ptr_eq(current, transport))
+}
+
+fn clear_cached_authorization_after_rejection(
+    shared: &Shared,
+    instance_id: &str,
+    transport: &Arc<TransportSession>,
+    session_token: &str,
+    error: &str,
+) {
+    let mut inner = lock_inner(shared);
+    if !g5_generation_matches(&inner, instance_id, transport)
+        || inner
+            .g5_session
+            .as_ref()
+            .is_none_or(|session| session.token.as_str() != session_token)
+    {
+        return;
+    }
+    match error {
+        "session_required" => {
+            inner.g5_session = None;
+            inner.g5_grant = None;
+        }
+        "grant_required" | "grant_expired" => inner.g5_grant = None,
+        _ => {}
+    }
 }
 
 fn json_envelope(ok: bool, snapshot: &RuntimeSnapshot, error: Option<&str>) -> String {
@@ -1632,7 +2503,7 @@ fn run_helper(mode: HelperMode, instance_id: &str, stale_instance_id: Option<&st
         _ => {}
     }
 
-    let listener = if mode == HelperMode::Normal {
+    let listener = if mode != HelperMode::MissingTransport {
         match transport.bind() {
             Ok(listener) => Some(listener),
             Err(_) => return 45,
@@ -1683,17 +2554,15 @@ fn run_helper(mode: HelperMode, instance_id: &str, stale_instance_id: Option<&st
     if !control_live.load(Ordering::Acquire) {
         return SUPERVISOR_LOST_EXIT;
     }
-    if mode == HelperMode::CrashAfterReady {
-        return 42;
-    }
-    if mode == HelperMode::HangOnShutdown {
-        loop {
-            thread::park_timeout(Duration::from_millis(50));
-        }
-    }
-
     if let Some(listener) = listener {
-        return serve_transport_until_stop(transport, listener, control_receiver, control_live);
+        return serve_transport_until_stop(
+            transport,
+            listener,
+            control_receiver,
+            control_live,
+            mode == HelperMode::CrashAfterReady,
+            mode == HelperMode::HangOnShutdown,
+        );
     }
     loop {
         match control_receiver.recv_timeout(POLL_INTERVAL) {
@@ -1741,7 +2610,14 @@ fn run_helper(_mode: HelperMode, instance_id: &str, _stale_instance_id: Option<&
     if !control_live.load(Ordering::Acquire) {
         return SUPERVISOR_LOST_EXIT;
     }
-    serve_transport_until_stop(transport, listener, control_receiver, control_live)
+    serve_transport_until_stop(
+        transport,
+        listener,
+        control_receiver,
+        control_live,
+        false,
+        false,
+    )
 }
 
 fn serve_transport_until_stop(
@@ -1749,7 +2625,10 @@ fn serve_transport_until_stop(
     listener: std::os::unix::net::UnixListener,
     control_receiver: Receiver<ControlSignal>,
     control_live: Arc<AtomicBool>,
+    crash_after_authentication: bool,
+    hang_after_authentication: bool,
 ) -> i32 {
+    let mut authenticated_requests = 0;
     loop {
         if let Some(signal) = next_control_signal(&control_receiver, &control_live) {
             if let Some(code) = signal_exit_code(signal) {
@@ -1758,7 +2637,18 @@ fn serve_transport_until_stop(
         }
         match transport.serve_one_with_liveness(&listener, Duration::from_millis(10), &control_live)
         {
-            Ok(_) => {}
+            Ok(true) => {
+                authenticated_requests += 1;
+                if authenticated_requests == 3 && crash_after_authentication {
+                    return 42;
+                }
+                if authenticated_requests == 3 && hang_after_authentication {
+                    loop {
+                        thread::park_timeout(Duration::from_millis(50));
+                    }
+                }
+            }
+            Ok(false) => {}
             Err(crate::transport::TransportError::Inactive) => {
                 return if next_control_signal(&control_receiver, &control_live)
                     == Some(ControlSignal::Stop)
@@ -1807,7 +2697,37 @@ pub fn runtime_transport_probe(manager: tauri::State<'_, RuntimeManager>) -> Str
 }
 
 #[tauri::command]
-pub fn runtime_start_test(manager: tauri::State<'_, RuntimeManager>) -> String {
+pub fn g5_session_status(manager: tauri::State<'_, RuntimeManager>) -> String {
+    manager.g5_session_status_json()
+}
+
+#[tauri::command]
+pub fn g5_session_open(manager: tauri::State<'_, RuntimeManager>, passphrase: String) -> String {
+    manager.g5_session_open(passphrase)
+}
+
+#[tauri::command]
+pub fn g5_mission_read_grant_create(manager: tauri::State<'_, RuntimeManager>) -> String {
+    manager.g5_mission_read_grant_create()
+}
+
+#[tauri::command]
+pub fn g5_mission_read_grant_revoke(manager: tauri::State<'_, RuntimeManager>) -> String {
+    manager.g5_mission_read_grant_revoke()
+}
+
+#[tauri::command]
+pub fn g5_session_close(manager: tauri::State<'_, RuntimeManager>) -> String {
+    manager.g5_session_close()
+}
+
+#[tauri::command]
+pub fn g5_missions_list(manager: tauri::State<'_, RuntimeManager>) -> String {
+    manager.g5_missions_list()
+}
+
+#[tauri::command]
+pub fn runtime_start(manager: tauri::State<'_, RuntimeManager>) -> String {
     let result = manager.start_test();
     command_result(&manager, "start", result)
 }
@@ -1819,7 +2739,7 @@ pub fn runtime_stop(manager: tauri::State<'_, RuntimeManager>) -> String {
 }
 
 #[tauri::command]
-pub fn runtime_restart_test(manager: tauri::State<'_, RuntimeManager>) -> String {
+pub fn runtime_restart(manager: tauri::State<'_, RuntimeManager>) -> String {
     let result = manager.restart_test();
     command_result(&manager, "restart", result)
 }
@@ -1889,6 +2809,186 @@ mod tests {
             .expect("parent provides a fixed helper mode");
         let stale_instance_id = env::var(HELPER_STALE_ID_ENV).ok();
         std::process::exit(run_helper(mode, &instance_id, stale_instance_id.as_deref()));
+    }
+
+    #[test]
+    fn application_protocol_encoding_and_response_parser_are_canonical() {
+        let body = encode_application_fields(&[
+            ("passphrase", "senha com acento: ação"),
+            ("domain_id", "dom_synthetic_a"),
+        ]);
+        assert_eq!(
+            std::str::from_utf8(&body).unwrap(),
+            "passphrase=senha%20com%20acento%3A%20a%C3%A7%C3%A3o\ndomain_id=dom_synthetic_a\n"
+        );
+
+        let fields =
+            parse_application_response(b"ok=true\ntitle=Miss%C3%A3o%20sint%C3%A9tica\n").unwrap();
+        assert!(app_fields_match(&fields, &["ok", "title"]));
+        assert_eq!(app_field(&fields, "title"), Some("Missão sintética"));
+        assert!(parse_application_response(b"ok=true\nok=false\n").is_err());
+        assert!(parse_application_response(b"title=%c3%a3\n").is_err());
+        assert!(parse_application_response(b"title=bad+space\n").is_err());
+    }
+
+    struct FastApiChild {
+        child: Child,
+        stdin: ChildStdin,
+        instance_id: String,
+    }
+
+    impl FastApiChild {
+        fn stop(&mut self) -> i32 {
+            if self.child.try_wait().ok().flatten().is_none() {
+                let _ = writeln!(self.stdin, "{STOP_PREFIX}{}", self.instance_id);
+                let _ = self.stdin.flush();
+            }
+            let deadline = Instant::now() + Duration::from_secs(3);
+            loop {
+                if let Ok(Some(status)) = self.child.try_wait() {
+                    return status.code().unwrap_or(-1);
+                }
+                if Instant::now() >= deadline {
+                    let _ = self.child.kill();
+                    return self
+                        .child
+                        .wait()
+                        .ok()
+                        .and_then(|status| status.code())
+                        .unwrap_or(-1);
+                }
+                thread::sleep(Duration::from_millis(5));
+            }
+        }
+    }
+
+    impl Drop for FastApiChild {
+        fn drop(&mut self) {
+            let _ = self.stop();
+        }
+    }
+
+    #[test]
+    fn rust_manager_uses_fastapi_g5_over_authenticated_uds() {
+        let api_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../api");
+        let python = api_root.join(".venv/bin/python");
+        assert!(
+            python.is_file(),
+            "locked API virtualenv must be prepared before desktop integration tests"
+        );
+
+        let manager = manager();
+        assert!(manager
+            .g5_missions_list()
+            .contains("Abra novamente a sessão"));
+        let instance_id = new_instance_id();
+        let session = TransportSession::create(&instance_id).unwrap();
+        let database_path = session.directory_path().join("g5-integration.sqlite3");
+        let seed = Command::new(&python)
+            .arg("-c")
+            .arg("from memory_store import SQLiteMemoryStore; from mission_repository import MissionRepository; import os; store=SQLiteMemoryStore(os.environ['JARVIS_DATABASE_PATH']); store.initialize(); MissionRepository(store).create('owner', 'Missão sintética Rust → FastAPI', 'dom_synthetic_a', 'mac003-rust-seed')")
+            .current_dir(&api_root)
+            .env_clear()
+            .env("JARVIS_DATABASE_PATH", &database_path)
+            .env("PYTHONDONTWRITEBYTECODE", "1")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .expect("synthetic test database seeder starts");
+        assert!(seed.success(), "synthetic test seed succeeds");
+
+        let mut child = Command::new(&python)
+            .arg("-u")
+            .arg(api_root.join("serve.py"))
+            .arg("--desktop-runtime")
+            .arg(&instance_id)
+            .current_dir(session.directory_path())
+            .env_clear()
+            .env("JARVIS_LOCAL_PASSPHRASE", "senha-sintetica-rust-mac003")
+            .env("JARVIS_DATABASE_PATH", &database_path)
+            .env("PYTHONDONTWRITEBYTECODE", "1")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("supervised FastAPI runtime starts");
+        let stdin = child.stdin.take().unwrap();
+        let mut process = FastApiChild {
+            child,
+            stdin,
+            instance_id: instance_id.clone(),
+        };
+        session.write_child_init(&mut process.stdin).unwrap();
+        let stdout = process.child.stdout.take().unwrap();
+        let (ready_sender, ready_receiver) = mpsc::channel();
+        thread::spawn(move || {
+            let mut line = String::new();
+            let _ = BufReader::new(stdout).read_line(&mut line);
+            let _ = ready_sender.send(line);
+        });
+        let ready = ready_receiver
+            .recv_timeout(Duration::from_secs(12))
+            .expect("FastAPI startup reaches READY");
+        assert_eq!(ready, format!("{READY_PREFIX}{instance_id}\n"));
+        writeln!(process.stdin, "{ACK_PREFIX}{instance_id}").unwrap();
+        process.stdin.flush().unwrap();
+
+        assert!(
+            session.probe().is_ok(),
+            "Rust validates health, version and HMAC proof"
+        );
+        {
+            let mut inner = lock_inner(&manager.shared);
+            inner.snapshot = RuntimeSnapshot {
+                state: RuntimeState::Ready,
+                runtime_instance_id: Some(instance_id.clone()),
+                pid: Some(process.child.id()),
+                started_at_unix_ms: Some(unix_time_ms()),
+                ready_at_unix_ms: Some(unix_time_ms()),
+                exit_code: None,
+                failure_category: None,
+            };
+            inner.transport_snapshot = TransportSnapshot {
+                state: TransportState::Ready,
+                runtime_instance_id: Some(instance_id.clone()),
+                endpoint_type: Some("uds"),
+                protocol_version: Some("1".to_owned()),
+                error_category: None,
+            };
+            inner.transport_session = Some(Arc::clone(&session));
+        }
+
+        let rejected = manager.g5_session_open("senha-incorreta-sintetica".to_owned());
+        assert!(rejected.contains("Credencial local recusada"));
+        assert!(!rejected.contains("senha-incorreta-sintetica"));
+        let opened = manager.g5_session_open("senha-sintetica-rust-mac003".to_owned());
+        assert!(opened.contains("\"session_active\":true"));
+        assert!(!opened.contains("session_token"));
+        assert!(manager.g5_missions_list().contains("concessão de leitura"));
+
+        let granted = manager.g5_mission_read_grant_create();
+        assert!(granted.contains("\"grant_active\":true"));
+        assert!(!granted.contains("grant_id"));
+        let missions = manager.g5_missions_list();
+        assert!(missions.contains("Missão sintética Rust → FastAPI"));
+        assert!(missions.contains("\"dataset\":\"api_synthetic\""));
+        assert!(!missions.contains("session_token"));
+        assert!(!missions.contains("csrf_token"));
+        assert!(manager.g5_session_close().contains("Revogue a concessão"));
+
+        let revoked = manager.g5_mission_read_grant_revoke();
+        assert!(revoked.contains("\"grant_active\":false"));
+        assert!(manager.g5_missions_list().contains("concessão de leitura"));
+        let closed = manager.g5_session_close();
+        assert!(closed.contains("\"session_active\":false"));
+        assert!(!closed.contains("session_token"));
+        assert_eq!(process.stop(), 0);
+        session.revoke();
+        for suffix in ["", "-wal", "-shm"] {
+            let path = PathBuf::from(format!("{}{suffix}", database_path.display()));
+            let _ = fs::remove_file(path);
+        }
+        let _ = fs::remove_dir(session.directory_path());
     }
 
     #[test]
@@ -2004,18 +3104,18 @@ mod tests {
     }
 
     #[test]
-    fn process_ready_does_not_imply_transport_ready() {
+    fn runtime_ready_requires_authenticated_transport() {
         let manager = manager();
         manager
             .start_mode_for_test(HelperMode::MissingTransport)
             .unwrap();
-        let runtime = manager.wait_for_state(RuntimeState::Ready, Duration::from_secs(2));
+        let runtime = manager.wait_for_state(RuntimeState::Failed, Duration::from_secs(2));
         let transport =
             manager.wait_for_transport_state(TransportState::Failed, Duration::from_secs(2));
-        assert_eq!(runtime.state, RuntimeState::Ready);
+        assert_eq!(runtime.state, RuntimeState::Failed);
+        assert_eq!(runtime.failure_category, Some("endpoint_unavailable"));
         assert_eq!(transport.runtime_instance_id, runtime.runtime_instance_id);
         assert_eq!(transport.error_category, Some("endpoint_unavailable"));
-        assert_eq!(manager.snapshot().state, RuntimeState::Ready);
         assert_eq!(
             manager.stop_and_wait().unwrap().state,
             RuntimeState::Stopped

@@ -1,10 +1,11 @@
 import { useEffect, useState } from "react";
 import { invoke, isTauri } from "@tauri-apps/api/core";
 import "./App.css";
-import { executeRuntimeCommand, parseRuntimeEnvelope, parseTransportSnapshot } from "./runtimeCommand";
-import type { RuntimeEnvelope, RuntimeState, RuntimeCommand, TransportSnapshot, TransportState } from "./runtimeCommand";
+import { createG5Ipc, executeRuntimeCommand, parseRuntimeEnvelope, parseTransportSnapshot } from "./runtimeCommand";
+import type { G5CommandResult, G5Mission, G5SessionSnapshot, RuntimeEnvelope, RuntimeState, RuntimeCommand, TransportSnapshot, TransportState } from "./runtimeCommand";
 
 const STORAGE_KEY = "jarvis-desktop-demo-captures-v1";
+const g5Ipc = createG5Ipc((command, args) => invoke<string>(command, args));
 const sections = ["Agora", "Inbox", "Missões", "Aprovações", "Runtime local", "Configurações"] as const;
 type Section = (typeof sections)[number];
 type Capture = { id: string; text: string; created_at: string };
@@ -25,6 +26,12 @@ const transportStateLabels: Record<TransportState, string> = {
   READY: "Autenticado",
   INCOMPATIBLE: "Versão incompatível",
   FAILED: "Falhou",
+};
+
+const missionStatusLabels: Record<G5Mission["status"], string> = {
+  draft: "Rascunho", planned: "Planejada", awaiting_approval: "Aguardando aprovação",
+  running: "Em execução", blocked: "Bloqueada", done: "Concluída", cancelled: "Cancelada",
+  failed: "Falhou", interrupted: "Interrompida",
 };
 
 function readCaptures(): Capture[] {
@@ -48,30 +55,42 @@ function App() {
   const [transport, setTransport] = useState<TransportSnapshot | null>(null);
   const [runtimeError, setRuntimeError] = useState("");
   const [runtimeBusy, setRuntimeBusy] = useState(false);
+  const [g5Status, setG5Status] = useState<G5SessionSnapshot | null>(null);
+  const [g5Busy, setG5Busy] = useState(false);
+  const [g5Error, setG5Error] = useState("");
+  const [passphrase, setPassphrase] = useState("");
+  const [grantConfirmed, setGrantConfirmed] = useState(false);
+  const [missions, setMissions] = useState<G5Mission[]>([]);
   const runtimeAvailable = isTauri();
 
   useEffect(() => {
-    if (section !== "Runtime local" || !runtimeAvailable) return;
+    if (!(section === "Runtime local" || section === "Missões") || !runtimeAvailable) return;
     let cancelled = false;
     const refresh = async () => {
       try {
-        const [response, transportResponse] = await Promise.all([
+        const [response, transportResponse, g5Response] = await Promise.all([
           invoke<string>("runtime_status"),
           invoke<string>("runtime_transport_status"),
+          g5Ipc.sessionStatus(),
         ]);
         const next = parseRuntimeEnvelope(response);
         const nextTransport = parseTransportSnapshot(transportResponse);
-        if (!cancelled) {
-          setRuntime(next);
-          setTransport(nextTransport);
-          setRuntimeError("");
+          if (!cancelled) {
+            setRuntime(next);
+            setTransport(nextTransport);
+            setG5Status(g5Response);
+            if (next.snapshot.state !== "READY" || nextTransport.state !== "READY") {
+              setGrantConfirmed(false);
+              setMissions([]);
+            }
+            setRuntimeError("");
         }
       } catch {
         if (!cancelled) setRuntimeError("Não foi possível consultar o supervisor local.");
       }
     };
     void refresh();
-    const timer = window.setInterval(() => void refresh(), 350);
+    const timer = window.setInterval(() => void refresh(), 500);
     return () => {
       cancelled = true;
       window.clearInterval(timer);
@@ -104,6 +123,56 @@ function App() {
     }
   }
 
+  async function runG5Command(action: "open-session", passphrase: string): Promise<void>;
+  async function runG5Command(action: "create-grant" | "revoke-grant" | "close-session" | "list-missions"): Promise<void>;
+  async function runG5Command(
+    action: "open-session" | "create-grant" | "revoke-grant" | "close-session" | "list-missions",
+    passphrase?: string,
+  ) {
+    setG5Busy(true);
+    setG5Error("");
+    if (action === "create-grant") setGrantConfirmed(false);
+    try {
+      let result: G5CommandResult;
+      switch (action) {
+        case "open-session":
+          result = await g5Ipc.openSession(passphrase ?? "");
+          break;
+        case "create-grant":
+          result = await g5Ipc.createMissionReadGrant();
+          break;
+        case "revoke-grant":
+          result = await g5Ipc.revokeMissionReadGrant();
+          break;
+        case "close-session":
+          result = await g5Ipc.closeSession();
+          break;
+        case "list-missions":
+          result = await g5Ipc.listMissions();
+          break;
+      }
+      if (!result.ok) {
+        setG5Error(result.error ?? "A operação G5 local foi recusada.");
+      } else if (action === "list-missions") {
+        setMissions(result.items ?? []);
+      } else if (action === "revoke-grant" || action === "close-session") {
+        setMissions([]);
+      }
+      setG5Status(await g5Ipc.sessionStatus());
+    } catch {
+      setG5Error("Não foi possível falar com o backend local autenticado.");
+    } finally {
+      setG5Busy(false);
+    }
+  }
+
+  async function openG5Session(event: React.FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    const value = passphrase;
+    setPassphrase("");
+    await runG5Command("open-session", value);
+  }
+
   function saveCapture(event: React.FormEvent<HTMLFormElement>) {
     event.preventDefault();
     const content = text.trim();
@@ -126,7 +195,7 @@ function App() {
       <div className="brand" aria-label="JARVIS"><span className="mark">JV</span><span>JARVIS</span></div>
       <nav aria-label="Seções do JARVIS">{sections.map((item) => <button
         aria-current={section === item ? "page" : undefined} className={section === item ? "nav-item active" : "nav-item"}
-        key={item} onClick={() => { setSection(item); setNotice(""); }} type="button">{item}</button>)}</nav>
+        key={item} onClick={() => { setSection(item); setNotice(""); if (item !== "Missões") { setPassphrase(""); setGrantConfirmed(false); } }} type="button">{item}</button>)}</nav>
       <p className="rail-note">macOS local · dados fictícios · sem conexão externa</p>
     </aside>
     <main className="content" id="conteudo">
@@ -149,18 +218,47 @@ function App() {
         <h3>Capturas neste aplicativo ({captures.length})</h3>
         {captures.length === 0 ? <p>Nenhuma captura local.</p> : <ul className="capture-list">{captures.map((item) => <li key={item.id}><span>{item.text}</span><small>{new Date(item.created_at).toLocaleString("pt-BR")}</small></li>)}</ul>}
       </article>}
-      {section === "Missões" && <article className="card"><p className="badge">API NÃO CONECTADA</p>
-        <h2>Execução permanece na web local</h2>
-        <p>Esta edição macOS não cria nem executa Missões no servidor. As {captures.length} captura(s) fictícia(s) estão somente neste aplicativo. Para a jornada sintética com SQLite e revisão, abra a web local e entre na integração.</p>
-        <ol><li><span>Capturar no Mac</span><span>{captures.length} local(is)</span></li><li><span>Criar Missão na API</span><span>Não conectado</span></li><li><span>Revisar artefato</span><span>Na web local</span></li></ol>
+      {section === "Missões" && <article className="card g5-card">
+        <p className="badge">{runtime?.snapshot.state === "READY" && transport?.state === "READY" ? "FASTAPI AUTENTICADA · DADOS SINTÉTICOS" : "BACKEND LOCAL NÃO PRONTO"}</p>
+        <h2>Leitura autorizada de Missões</h2>
+        <p>O backend local atende somente por UDS. Uma sessão aberta não concede leitura: confirme separadamente a concessão para <code>mission:read</code> no domínio sintético <code>dom_synthetic_a</code>.</p>
+        {!runtimeAvailable && <p className="runtime-hint">Este preview web não inicia processos locais nem abre sessões G5.</p>}
+        {runtimeAvailable && !g5Status?.session_active && <form className="g5-form" onSubmit={(event) => void openG5Session(event)}>
+          <label htmlFor="g5-passphrase">Credencial local G5</label>
+          <input id="g5-passphrase" type="password" autoComplete="off" maxLength={128} value={passphrase}
+            onChange={(event) => setPassphrase(event.currentTarget.value)} aria-describedby="g5-passphrase-help" />
+          <p id="g5-passphrase-help" className="field-hint">Usada somente para abrir a sessão local. O campo é limpo ao enviar e a credencial não fica salva.</p>
+          <button className="action" type="submit" disabled={g5Busy || runtime?.snapshot.state !== "READY" || transport?.state !== "READY" || new TextEncoder().encode(passphrase).length < 12 || new TextEncoder().encode(passphrase).length > 128}>Abrir sessão local</button>
+        </form>}
+        {runtimeAvailable && g5Status?.session_active && <section className="g5-state" aria-live="polite">
+          <p><strong>Sessão aberta.</strong> Válida até {g5Status.session_expires_at ? new Date(g5Status.session_expires_at).toLocaleString("pt-BR") : "expirar no servidor"}.</p>
+          {g5Status.grant_active ? <>
+            <p><strong>Concessão ativa:</strong> leitura de Missões em <code>dom_synthetic_a</code> até {g5Status.grant_expires_at ? new Date(g5Status.grant_expires_at).toLocaleString("pt-BR") : "expirar no servidor"}.</p>
+            <div className="g5-actions">
+              <button className="action" type="button" disabled={g5Busy} onClick={() => void runG5Command("list-missions")}>Ler uma missão sintética</button>
+              <button className="action secondary" type="button" disabled={g5Busy} onClick={() => void runG5Command("revoke-grant")}>Revogar concessão</button>
+            </div>
+          </> : <>
+            <label className="confirm"><input type="checkbox" checked={grantConfirmed} onChange={(event) => setGrantConfirmed(event.currentTarget.checked)} /> Confirmo leitura somente de Missões sintéticas em <code>dom_synthetic_a</code> por até 60 minutos.</label>
+            <button className="action" type="button" disabled={g5Busy || !grantConfirmed} onClick={() => void runG5Command("create-grant")}>Conceder leitura</button>
+          </>}
+          {!g5Status.grant_active && <button className="action secondary" type="button" disabled={g5Busy} onClick={() => void runG5Command("close-session")}>Encerrar sessão</button>}
+        </section>}
+        {g5Error && <p className="notice" role="alert">{g5Error}</p>}
+        {missions.length > 0 && <section className="g5-results" aria-live="polite"><h3>Resultado da API sintética</h3>
+          {missions.map((mission) => <article className="mission-summary" key={mission.id}>
+            <h4>{mission.title}</h4><p>{missionStatusLabels[mission.status]} · revisão {mission.revision} · {mission.domain_id}</p>
+          </article>)}
+        </section>}
+        {runtimeAvailable && g5Status?.grant_active && missions.length === 0 && <p className="field-hint">Nenhuma missão autorizada apareceu nesta leitura. O banco de teste permanece separado e não recebe fixtures automaticamente.</p>}
       </article>}
       {section === "Aprovações" && <article className="card"><p className="badge">SEM CONCESSÃO ATIVA</p>
         <h2>Nenhuma decisão neste cliente</h2><p>A fila persistente depende de sessão, concessão e API local. Este aplicativo não simula decisões nem aprova conteúdo automaticamente.</p>
       </article>}
       {section === "Runtime local" && <article className="card runtime-card">
-        <p className="badge">RUNTIME DE TESTE</p>
+        <p className="badge">RUNTIME FASTAPI / G5</p>
         <h2>Processo local supervisionado</h2>
-        <p>Este helper sintético valida início, prontidão, encerramento e recuperação. Ele não acessa a API G5, SQLite, rede ou dados do produto.</p>
+        <p>O supervisor inicia o FastAPI local diretamente. Pronto significa startup concluído e prova MAC-002 autenticada no UDS. O runtime não abre listener TCP nem conecta fontes externas.</p>
         <dl className="runtime-status" aria-live="polite">
           <div><dt>Estado</dt><dd>{runtime ? runtimeStateLabels[runtime.snapshot.state] : runtimeAvailable ? "Consultando" : "Indisponível neste preview"}</dd></div>
           <div><dt>Canal autenticado</dt><dd>{transport ? transportStateLabels[transport.state] : runtimeAvailable ? "Consultando" : "Indisponível neste preview"}</dd></div>
@@ -172,10 +270,10 @@ function App() {
           {runtime?.snapshot.exit_code !== null && runtime?.snapshot.exit_code !== undefined && <div><dt>Código de saída</dt><dd>{runtime.snapshot.exit_code}</dd></div>}
         </dl>
         <div className="runtime-actions">
-          <button className="action" type="button" disabled={!runtimeAvailable || runtimeBusy || runtime?.snapshot.state !== "STOPPED"} onClick={() => void runRuntimeCommand("runtime_start_test")}>Iniciar</button>
+          <button className="action" type="button" disabled={!runtimeAvailable || runtimeBusy || runtime?.snapshot.state !== "STOPPED"} onClick={() => void runRuntimeCommand("runtime_start")}>Iniciar</button>
           <button className="action secondary" type="button" disabled={!runtimeAvailable || runtimeBusy || !["STARTING", "READY", "STOPPING"].includes(runtime?.snapshot.state ?? "")} onClick={() => void runRuntimeCommand("runtime_stop")}>Parar</button>
-          <button className="action secondary" type="button" disabled={!runtimeAvailable || runtimeBusy || !["FAILED", "CRASHED"].includes(runtime?.snapshot.state ?? "")} onClick={() => void runRuntimeCommand("runtime_restart_test")}>Reiniciar</button>
-          <button className="action secondary" type="button" disabled={!runtimeAvailable || runtimeBusy || runtime?.snapshot.state !== "READY" || transport?.state === "READY"} onClick={() => void probeRuntimeTransport()}>Verificar canal local</button>
+          <button className="action secondary" type="button" disabled={!runtimeAvailable || runtimeBusy || !["FAILED", "CRASHED"].includes(runtime?.snapshot.state ?? "")} onClick={() => void runRuntimeCommand("runtime_restart")}>Reiniciar</button>
+          <button className="action secondary" type="button" disabled={!runtimeAvailable || runtimeBusy || runtime?.snapshot.state !== "READY"} onClick={() => void probeRuntimeTransport()}>Verificar canal local</button>
         </div>
         {!runtimeAvailable && <p className="runtime-hint">Os comandos de processo ficam disponíveis somente no aplicativo macOS. Este preview web não inicia processos.</p>}
         {runtimeError && <p className="notice" role="alert">{runtimeError}</p>}

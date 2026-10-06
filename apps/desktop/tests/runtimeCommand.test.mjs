@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { executeRuntimeCommand, parseTransportSnapshot } from "../src/runtimeCommand.ts";
+import { createG5Ipc, executeRuntimeCommand, parseG5CommandResult, parseG5SessionSnapshot, parseTransportSnapshot } from "../src/runtimeCommand.ts";
 
 function envelope(state, id) {
   return JSON.stringify({
@@ -46,4 +46,56 @@ test("transport status exposes only typed state and UDS protocol metadata", () =
   assert.equal("secret" in status, false);
   assert.equal("socket_path" in status, false);
   assert.throws(() => parseTransportSnapshot(JSON.stringify({ state: "READY", endpoint_type: "tcp" })));
+});
+
+test("G5 status and result parsers do not forward credentials or unknown fields", () => {
+  const status = parseG5SessionSnapshot(JSON.stringify({
+    ok: true,
+    session_active: true,
+    session_expires_at: "2026-10-06T12:00:00+00:00",
+    grant_active: false,
+    grant_domain_id: null,
+    grant_expires_at: null,
+    session_token: "synthetic-secret",
+  }));
+  assert.equal(status.session_active, true);
+  assert.equal("session_token" in status, false);
+
+  const result = parseG5CommandResult(JSON.stringify({
+    ok: true,
+    dataset: "api_synthetic",
+    items: [{ id: "mission_0123456789abcdef", title: "Missão sintética", domain_id: "dom_synthetic_a", status: "planned", revision: 1 }],
+    csrf_token: "synthetic-secret",
+  }));
+  assert.equal(result.items?.[0]?.title, "Missão sintética");
+  assert.equal("csrf_token" in result, false);
+  assert.throws(() => parseG5CommandResult(JSON.stringify({
+    ok: true,
+    dataset: "api_synthetic",
+    items: [{ id: "mission_1", title: "Tarefa", domain_id: "dom_synthetic_a", status: "unknown", revision: 0 }],
+  })));
+});
+
+test("G5 IPC exposes only the fixed typed operations", async () => {
+  const calls = [];
+  const ipc = createG5Ipc(async (command, args) => {
+    calls.push({ command, args });
+    if (command === "g5_session_status") return JSON.stringify({
+      ok: true, session_active: false, session_expires_at: null,
+      grant_active: false, grant_domain_id: null, grant_expires_at: null,
+    });
+    return JSON.stringify({ ok: true, session_active: true });
+  });
+  await ipc.sessionStatus();
+  const opened = await ipc.openSession("senha sintética de teste");
+  await ipc.createMissionReadGrant();
+  await ipc.revokeMissionReadGrant();
+  await ipc.listMissions();
+  await ipc.closeSession();
+  assert.deepEqual(calls.map(({ command }) => command), [
+    "g5_session_status", "g5_session_open", "g5_mission_read_grant_create",
+    "g5_mission_read_grant_revoke", "g5_missions_list", "g5_session_close",
+  ]);
+  assert.deepEqual(calls[1].args, { passphrase: "senha sintética de teste" });
+  assert.equal(opened.session_active, true);
 });

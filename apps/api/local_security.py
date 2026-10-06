@@ -93,6 +93,107 @@ def _passphrase_matches(supplied: str, expected: str) -> bool:
         return False
 
 
+def _open_session_for_passphrase(passphrase: str, rate_limit_key: str) -> Session:
+    """Shared G5 login operation; the ingress keeps its own origin policy."""
+    expected = _expected_passphrase()
+    if expected is None:
+        raise HTTPException(status_code=503, detail="sessão local não configurada")
+    _check_login_rate_limit(rate_limit_key)
+    if not _passphrase_matches(passphrase, expected):
+        _record_login_failure(rate_limit_key)
+        raise HTTPException(status_code=401, detail="credencial recusada")
+    _login_failures.pop(rate_limit_key, None)
+    _login_blocked_until.pop(rate_limit_key, None)
+    session = Session(
+        token=secrets.token_urlsafe(32),
+        csrf_token=secrets.token_urlsafe(32),
+        principal="owner",
+        expires_at=_now() + SESSION_TTL,
+    )
+    with _grant_lock:
+        _sessions[session.token] = session
+    return session
+
+
+def _session_by_token(token: str) -> Session:
+    with _grant_lock:
+        session = _sessions.get(token)
+        if session is None or session.expires_at <= _now():
+            if session is not None:
+                _sessions.pop(token, None)
+            raise HTTPException(status_code=401, detail="sessão ausente")
+        return session
+
+
+def _native_session(token: str, csrf_token: str | None = None, *, mutation: bool = False) -> Session:
+    session = _session_by_token(token)
+    if mutation and (not csrf_token or not hmac.compare_digest(csrf_token, session.csrf_token)):
+        raise HTTPException(status_code=403, detail="csrf recusado")
+    return session
+
+
+def _create_grant_for_session(session: Session, body: GrantIn) -> Grant:
+    resources = frozenset(body.resource_ids)
+    domains = frozenset(body.domain_ids)
+    with _grant_lock:
+        # The session is revalidated while the same grant lock serializes its
+        # use with logout and grant mutation.
+        current = _sessions.get(session.token)
+        if current is None or current.principal != session.principal or current.expires_at <= _now():
+            raise HTTPException(status_code=401, detail="sessão ausente")
+        for existing in _active_grants(session.principal, _now()):
+            overlaps = (
+                existing.connector == body.connector
+                and bool(existing.resource_ids & resources)
+                and bool(existing.domain_ids & domains)
+            )
+            if overlaps:
+                raise HTTPException(status_code=409, detail="grant ativo sobreposto")
+        grant = Grant(
+            id=secrets.token_hex(16),
+            principal=session.principal,
+            connector=body.connector,
+            resource_ids=resources,
+            domain_ids=domains,
+            expires_at=body.expires_at,
+        )
+        _grants[grant.id] = grant
+        return grant
+
+
+def _revoke_grant_for_session(
+    session: Session,
+    grant_id: str,
+    *,
+    connector: str | None = None,
+    resource_id: str | None = None,
+    domain_id: str | None = None,
+) -> Grant:
+    with _grant_lock:
+        current = _sessions.get(session.token)
+        if current is None or current.principal != session.principal or current.expires_at <= _now():
+            raise HTTPException(status_code=401, detail="sessão ausente")
+        grant = _grants.get(grant_id)
+        if grant is None or grant.principal != session.principal:
+            raise HTTPException(status_code=404, detail="concessão ausente")
+        if (
+            (connector is not None and grant.connector != connector)
+            or (resource_id is not None and resource_id not in grant.resource_ids)
+            or (domain_id is not None and domain_id not in grant.domain_ids)
+        ):
+            raise HTTPException(status_code=403, detail="escopo de concessão recusado")
+        grant.revoked = True
+        return grant
+
+
+def _close_session_for(session: Session) -> None:
+    with _grant_lock:
+        current = _sessions.get(session.token)
+        if current is None or current.principal != session.principal:
+            raise HTTPException(status_code=401, detail="sessão ausente")
+        _sessions.pop(session.token, None)
+
+
 class LoginIn(BaseModel):
     model_config = ConfigDict(hide_input_in_errors=True)
     passphrase: str = Field(min_length=12, max_length=200)
@@ -244,11 +345,7 @@ def _session_from(request: Request, *, mutation: bool = False) -> Session:
     if fetch_site is not None and fetch_site.lower() == "cross-site":
         raise HTTPException(status_code=403, detail="origem recusada")
     token = request.cookies.get(SESSION_COOKIE)
-    session = _sessions.get(token or "")
-    if session is None or session.expires_at <= _now():
-        if token:
-            _sessions.pop(token, None)
-        raise HTTPException(status_code=401, detail="sessão ausente")
+    session = _session_by_token(token or "")
     if mutation:
         supplied = request.headers.get(CSRF_HEADER)
         if not supplied or not hmac.compare_digest(supplied, session.csrf_token):
@@ -526,27 +623,11 @@ def open_session(body: LoginIn, request: Request, response: Response) -> Session
     key = _rate_limit_key(request)
     if not is_loopback_address(key):
         raise HTTPException(status_code=403, detail="origem de rede recusada")
-    expected = _expected_passphrase()
-    if expected is None:
-        raise HTTPException(status_code=503, detail="sessão local não configurada")
-    _check_login_rate_limit(key)
-    if not _passphrase_matches(body.passphrase, expected):
-        _record_login_failure(key)
-        raise HTTPException(status_code=401, detail="credencial recusada")
-    _login_failures.pop(key, None)
-    _login_blocked_until.pop(key, None)
-    token = secrets.token_urlsafe(32)
-    csrf_token = secrets.token_urlsafe(32)
-    _sessions[token] = Session(
-        token=token,
-        csrf_token=csrf_token,
-        principal="owner",
-        expires_at=_now() + SESSION_TTL,
-    )
+    session = _open_session_for_passphrase(body.passphrase, key)
     response.headers["Cache-Control"] = "no-store"
     response.headers["Pragma"] = "no-cache"
-    _set_cookie(response, token, request.url.scheme == "https")
-    return SessionOut(csrf_token=csrf_token, expires_at=_sessions[token].expires_at)
+    _set_cookie(response, session.token, request.url.scheme == "https")
+    return SessionOut(csrf_token=session.csrf_token, expires_at=session.expires_at)
 
 
 @router.get("/session", response_model=SessionOut)
@@ -563,8 +644,7 @@ def current_session(request: Request, response: Response) -> SessionOut:
 @router.delete("/session", status_code=204)
 def close_session(request: Request, response: Response) -> None:
     session = _session_from(request, mutation=True)
-    with _grant_lock:
-        _sessions.pop(session.token, None)
+    _close_session_for(session)
     response.delete_cookie(SESSION_COOKIE, path="/")
 
 
@@ -582,38 +662,19 @@ def list_active_grants(request: Request, response: Response) -> list[GrantOut]:
 @router.post("/grants", status_code=201, response_model=GrantOut)
 def create_grant(body: GrantIn, request: Request) -> GrantOut:
     session = _session_from(request, mutation=True)
-    resources = frozenset(body.resource_ids)
-    domains = frozenset(body.domain_ids)
-    with _grant_lock:
-        now = _now()
-        for existing in _active_grants(session.principal, now):
-            overlaps = (
-                existing.connector == body.connector
-                and bool(existing.resource_ids & resources)
-                and bool(existing.domain_ids & domains)
-            )
-            if overlaps:
-                raise HTTPException(status_code=409, detail="grant ativo sobreposto; revogue-o antes de conceder novamente")
-        grant = Grant(
-            id=secrets.token_hex(16),
-            principal=session.principal,
-            connector=body.connector,
-            resource_ids=resources,
-            domain_ids=domains,
-            expires_at=body.expires_at,
-        )
-        _grants[grant.id] = grant
+    try:
+        grant = _create_grant_for_session(session, body)
+    except HTTPException as exc:
+        if exc.status_code == 409:
+            raise HTTPException(status_code=409, detail="grant ativo sobreposto; revogue-o antes de conceder novamente") from exc
+        raise
     return _grant_response(grant)
 
 
 @router.post("/grants/{grant_id}/revoke", status_code=200)
 def revoke_grant(grant_id: str, request: Request) -> dict:
     session = _session_from(request, mutation=True)
-    with _grant_lock:
-        grant = _grants.get(grant_id)
-        if grant is None or grant.principal != session.principal:
-            raise HTTPException(status_code=404, detail="concessão ausente")
-        grant.revoked = True
+    grant = _revoke_grant_for_session(session, grant_id)
     return {"id": grant.id, "revoked": True}
 
 
