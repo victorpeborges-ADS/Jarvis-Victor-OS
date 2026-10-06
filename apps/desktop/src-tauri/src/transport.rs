@@ -1,7 +1,7 @@
 use std::{
     env, fs, io,
     io::{BufRead, Read, Write},
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc, Mutex, MutexGuard,
@@ -12,11 +12,16 @@ use std::{
 #[cfg(unix)]
 use std::os::unix::{
     ffi::OsStrExt,
-    fs::PermissionsExt,
+    fs::{MetadataExt, PermissionsExt},
+    io::AsRawFd,
     net::{UnixListener, UnixStream},
 };
 
+#[cfg(unix)]
+use std::os::raw::{c_char, c_int, c_uint};
+
 const INIT_PREFIX: &[u8] = b"JARVIS_TRANSPORT_INIT ";
+const SOCKET_LEAF: &[u8] = b"runtime.sock\0";
 const PROTOCOL_VERSION: &str = "1";
 const RUNTIME_KIND: &str = "jarvis-synthetic";
 const BUILD_ID: &str = "g6-mac-002-synthetic-v1";
@@ -33,6 +38,28 @@ const MAX_RESPONSE_BODY_BYTES: usize = 2048;
 const MAX_INIT_BYTES: usize = 1024;
 const SECRET_BYTES: usize = 32;
 const NONCE_BYTES: usize = 32;
+
+#[cfg(unix)]
+#[link(name = "System")]
+unsafe extern "C" {
+    fn unlinkat(directory_fd: c_int, path: *const c_char, flags: c_int) -> c_int;
+    fn umask(mask: c_uint) -> c_uint;
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct DirectoryIdentity {
+    dev: u64,
+    ino: u64,
+}
+
+impl DirectoryIdentity {
+    fn from_metadata(metadata: &fs::Metadata) -> Self {
+        Self {
+            dev: metadata.dev(),
+            ino: metadata.ino(),
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum TransportState {
@@ -139,8 +166,11 @@ pub(crate) struct TransportSession {
     instance_id: String,
     socket_path: PathBuf,
     directory: PathBuf,
+    directory_handle: fs::File,
+    directory_identity: DirectoryIdentity,
     secret: Mutex<Option<[u8; SECRET_BYTES]>>,
     active: AtomicBool,
+    cleanup_done: AtomicBool,
     request_lock: Mutex<()>,
 }
 
@@ -162,13 +192,25 @@ impl TransportSession {
         })?;
         if fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).is_err() {
             secret.fill(0);
-            let _ = fs::remove_dir(&directory);
+            return Err(TransportError::SetupFailed);
+        }
+        let directory_handle = fs::File::open(&directory).map_err(|_| {
+            secret.fill(0);
+            TransportError::SetupFailed
+        })?;
+        let directory_identity = directory_handle
+            .metadata()
+            .map(|metadata| DirectoryIdentity::from_metadata(&metadata))
+            .map_err(|_| TransportError::SetupFailed)?;
+        let named_identity = fs::symlink_metadata(&directory)
+            .map(|metadata| DirectoryIdentity::from_metadata(&metadata));
+        if named_identity.ok() != Some(directory_identity) {
+            secret.fill(0);
             return Err(TransportError::SetupFailed);
         }
         let socket_path = directory.join("runtime.sock");
         if socket_path.as_os_str().as_bytes().len() >= 104 {
             secret.fill(0);
-            let _ = fs::remove_dir(&directory);
             return Err(TransportError::SetupFailed);
         }
 
@@ -176,8 +218,11 @@ impl TransportSession {
             instance_id: instance_id.to_owned(),
             socket_path,
             directory,
+            directory_handle,
+            directory_identity,
             secret: Mutex::new(Some(secret)),
             active: AtomicBool::new(true),
+            cleanup_done: AtomicBool::new(false),
             request_lock: Mutex::new(()),
         }))
     }
@@ -193,7 +238,13 @@ impl TransportSession {
             .and_then(|_| writer.write_all(b"\t"))
             .and_then(|_| write_hex(writer, secret))
             .and_then(|_| writer.write_all(b"\t"))
-            .and_then(|_| write_hex(writer, self.socket_path.as_os_str().as_bytes()))
+            .and_then(|_| {
+                write!(
+                    writer,
+                    "{}\t{}",
+                    self.directory_identity.dev, self.directory_identity.ino
+                )
+            })
             .and_then(|_| writer.write_all(b"\n"))
             .and_then(|_| writer.flush())
             .map_err(|_| TransportError::SetupFailed)
@@ -243,13 +294,30 @@ impl TransportSession {
     pub(crate) fn is_clean_for_test(&self) -> bool {
         !self.active.load(Ordering::Acquire)
             && lock(&self.secret).is_none()
-            && !self.directory.exists()
-            && !self.socket_path.exists()
+            && fs::symlink_metadata(&self.socket_path).is_err()
     }
 
     #[cfg(test)]
     pub(crate) fn instance_id_for_test(&self) -> &str {
         &self.instance_id
+    }
+
+    pub(crate) fn directory_path(&self) -> &Path {
+        &self.directory
+    }
+
+    pub(crate) fn path_matches_handle(&self) -> bool {
+        fs::symlink_metadata(&self.directory)
+            .map(|metadata| {
+                metadata.file_type().is_dir()
+                    && DirectoryIdentity::from_metadata(&metadata) == self.directory_identity
+            })
+            .unwrap_or(false)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn socket_path_for_test(&self) -> &Path {
+        &self.socket_path
     }
 
     pub(crate) fn revoke(&self) {
@@ -266,8 +334,10 @@ impl TransportSession {
     }
 
     fn cleanup_endpoint(&self) {
-        let _ = fs::remove_file(&self.socket_path);
-        let _ = fs::remove_dir(&self.directory);
+        if self.cleanup_done.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        unlink_socket_at(&self.directory_handle);
     }
 
     fn ensure_active(&self) -> Result<(), TransportError> {
@@ -286,12 +356,27 @@ impl TransportSession {
         body: &[u8],
     ) -> Result<Vec<u8>, TransportError> {
         self.ensure_active()?;
-        let mut stream = connect_bounded(endpoint, CONNECT_TIMEOUT)?;
+        let mut stream = connect_bounded(endpoint, CONNECT_TIMEOUT).map_err(|error| {
+            eprintln!(
+                "transport exchange failed instance_id={} route={route} phase=connect category={}",
+                self.instance_id,
+                error.category()
+            );
+            error
+        })?;
         let request_deadline = Instant::now() + REQUEST_TIMEOUT;
         stream
             .set_read_timeout(Some(REQUEST_TIMEOUT))
             .and_then(|_| stream.set_write_timeout(Some(REQUEST_TIMEOUT)))
-            .map_err(|_| TransportError::EndpointUnavailable)?;
+            .map_err(|error| {
+                eprintln!(
+                    "transport exchange failed instance_id={} route={route} phase=timeout_setup kind={:?} os_error={:?}",
+                    self.instance_id,
+                    error.kind(),
+                    error.raw_os_error()
+                );
+                TransportError::EndpointUnavailable
+            })?;
 
         let method = match verb {
             Verb::Get => "GET",
@@ -305,8 +390,23 @@ impl TransportSession {
             .write_all(request.as_bytes())
             .and_then(|_| stream.write_all(body))
             .and_then(|_| stream.flush())
-            .map_err(map_io_error)?;
-        read_http_response(&mut stream, request_deadline)
+            .map_err(|error| {
+                eprintln!(
+                    "transport exchange failed instance_id={} route={route} phase=request_write kind={:?} os_error={:?}",
+                    self.instance_id,
+                    error.kind(),
+                    error.raw_os_error()
+                );
+                map_io_error(error)
+            })?;
+        read_http_response(&mut stream, request_deadline).map_err(|error| {
+            eprintln!(
+                "transport exchange failed instance_id={} route={route} phase=response_read category={}",
+                self.instance_id,
+                error.category()
+            );
+            error
+        })
     }
 
     fn verify_proof(
@@ -344,6 +444,10 @@ impl TransportSession {
 impl Drop for TransportSession {
     fn drop(&mut self) {
         self.revoke();
+        #[cfg(test)]
+        if self.path_matches_handle() && fs::symlink_metadata(&self.socket_path).is_err() {
+            let _ = fs::remove_dir(&self.directory);
+        }
     }
 }
 
@@ -459,16 +563,6 @@ fn write_hex(writer: &mut impl Write, bytes: &[u8]) -> io::Result<()> {
     Ok(())
 }
 
-fn decode_hex(value: &[u8]) -> Option<Vec<u8>> {
-    if value.len() % 2 != 0 {
-        return None;
-    }
-    value
-        .chunks_exact(2)
-        .map(|pair| Some((hex_nibble(pair[0])? << 4) | hex_nibble(pair[1])?))
-        .collect()
-}
-
 fn decode_hex_32(value: &str) -> Option<[u8; 32]> {
     decode_hex_array::<32>(value.as_bytes())
 }
@@ -515,6 +609,31 @@ fn map_io_error(error: io::Error) -> TransportError {
     }
 }
 
+fn map_framing_io_error(error: io::Error) -> TransportError {
+    match error.kind() {
+        io::ErrorKind::ConnectionReset
+        | io::ErrorKind::BrokenPipe
+        | io::ErrorKind::UnexpectedEof => TransportError::MalformedResponse,
+        _ => map_io_error(error),
+    }
+}
+
+#[cfg(unix)]
+fn unlink_socket_at(directory: &fs::File) {
+    let result = unsafe { unlinkat(directory.as_raw_fd(), SOCKET_LEAF.as_ptr().cast(), 0) };
+    if result == 0 {
+        eprintln!("transport socket cleanup result=removed_at_owned_directory");
+    } else {
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::NotFound {
+            eprintln!(
+                "transport socket cleanup result=preserved category={:?}",
+                error.kind()
+            );
+        }
+    }
+}
+
 fn read_http_response(
     stream: &mut UnixStream,
     deadline: Instant,
@@ -526,10 +645,8 @@ fn read_http_response(
         if remaining.is_zero() {
             return Err(TransportError::Timeout);
         }
-        stream
-            .set_read_timeout(Some(remaining))
-            .map_err(|_| TransportError::EndpointUnavailable)?;
-        let count = stream.read(&mut buffer).map_err(map_io_error)?;
+        let _ = stream.set_read_timeout(Some(remaining));
+        let count = stream.read(&mut buffer).map_err(map_framing_io_error)?;
         if count == 0 {
             return Err(TransportError::MalformedResponse);
         }
@@ -601,10 +718,8 @@ fn read_exact_deadline(
         if remaining.is_zero() {
             return Err(TransportError::Timeout);
         }
-        stream
-            .set_read_timeout(Some(remaining))
-            .map_err(|_| TransportError::EndpointUnavailable)?;
-        let count = stream.read(output).map_err(map_io_error)?;
+        let _ = stream.set_read_timeout(Some(remaining));
+        let count = stream.read(output).map_err(map_framing_io_error)?;
         if count == 0 {
             return Err(TransportError::MalformedResponse);
         }
@@ -750,8 +865,6 @@ pub(crate) fn read_child_init(
     reader: &mut impl io::BufRead,
     expected_instance_id: &str,
 ) -> Result<ChildTransportConfig, TransportError> {
-    use std::os::unix::ffi::OsStringExt;
-
     let mut record = Vec::with_capacity(MAX_INIT_BYTES);
     let count = match reader
         .take((MAX_INIT_BYTES + 1) as u64)
@@ -777,54 +890,72 @@ pub(crate) fn read_child_init(
         let mut fields = payload.split(|byte| *byte == b'\t');
         let instance_id = fields.next().ok_or(TransportError::SetupFailed)?;
         let secret_hex = fields.next().ok_or(TransportError::SetupFailed)?;
-        let path_hex = fields.next().ok_or(TransportError::SetupFailed)?;
+        let dev = fields
+            .next()
+            .and_then(|value| std::str::from_utf8(value).ok())
+            .and_then(|value| value.parse::<u64>().ok())
+            .ok_or(TransportError::SetupFailed)?;
+        let ino = fields
+            .next()
+            .and_then(|value| std::str::from_utf8(value).ok())
+            .and_then(|value| value.parse::<u64>().ok())
+            .ok_or(TransportError::SetupFailed)?;
         if fields.next().is_some() || instance_id != expected_instance_id.as_bytes() {
             return Err(TransportError::SetupFailed);
         }
         let mut secret =
             decode_hex_array::<SECRET_BYTES>(secret_hex).ok_or(TransportError::SetupFailed)?;
-        let path = match decode_hex(path_hex) {
-            Some(path) => path,
-            None => {
+        let directory = match fs::File::open(".") {
+            Ok(directory) => directory,
+            Err(_) => {
                 secret.fill(0);
                 return Err(TransportError::SetupFailed);
             }
         };
-        if path.is_empty() || path.contains(&0) || path.len() >= 104 {
+        let metadata = match directory.metadata() {
+            Ok(metadata) => metadata,
+            Err(_) => {
+                secret.fill(0);
+                return Err(TransportError::SetupFailed);
+            }
+        };
+        if !metadata.is_dir()
+            || DirectoryIdentity::from_metadata(&metadata) != (DirectoryIdentity { dev, ino })
+        {
             secret.fill(0);
             return Err(TransportError::SetupFailed);
         }
-        Ok((secret, path))
+        Ok((secret, directory))
     })();
     record.fill(0);
-    let (secret, path) = parsed?;
+    let (secret, directory) = parsed?;
     Ok(ChildTransportConfig {
         instance_id: expected_instance_id.to_owned(),
         secret,
-        socket_path: PathBuf::from(std::ffi::OsString::from_vec(path)),
+        directory,
     })
 }
 
 pub(crate) struct ChildTransportConfig {
     instance_id: String,
     secret: [u8; SECRET_BYTES],
-    socket_path: PathBuf,
+    directory: fs::File,
 }
 
 impl Drop for ChildTransportConfig {
     fn drop(&mut self) {
         self.secret.fill(0);
         std::hint::black_box(self.secret);
-        let _ = fs::remove_file(&self.socket_path);
+        unlink_socket_at(&self.directory);
     }
 }
 
 impl ChildTransportConfig {
     pub(crate) fn bind(&self) -> Result<UnixListener, TransportError> {
-        let listener =
-            UnixListener::bind(&self.socket_path).map_err(|_| TransportError::SetupFailed)?;
-        fs::set_permissions(&self.socket_path, fs::Permissions::from_mode(0o600))
-            .map_err(|_| TransportError::SetupFailed)?;
+        let previous_mask = unsafe { umask(0o177) };
+        let bind_result = UnixListener::bind("runtime.sock");
+        unsafe { umask(previous_mask) };
+        let listener = bind_result.map_err(|_| TransportError::SetupFailed)?;
         listener
             .set_nonblocking(true)
             .map_err(|_| TransportError::SetupFailed)?;
@@ -858,20 +989,61 @@ impl ChildTransportConfig {
         .into_bytes())
     }
 
+    #[cfg(test)]
     pub(crate) fn serve_one(
         &self,
         listener: &UnixListener,
         wait: Duration,
     ) -> Result<bool, TransportError> {
+        let live = AtomicBool::new(true);
+        self.serve_one_with_liveness(listener, wait, &live)
+    }
+
+    pub(crate) fn serve_one_with_liveness(
+        &self,
+        listener: &UnixListener,
+        wait: Duration,
+        live: &AtomicBool,
+    ) -> Result<bool, TransportError> {
+        self.serve_one_inner(listener, wait, live, || {})
+    }
+
+    #[cfg(test)]
+    fn serve_one_with_accept_hook_for_test(
+        &self,
+        listener: &UnixListener,
+        wait: Duration,
+        live: &AtomicBool,
+        accepted: std::sync::mpsc::Sender<()>,
+    ) -> Result<bool, TransportError> {
+        self.serve_one_inner(listener, wait, live, move || {
+            let _ = accepted.send(());
+        })
+    }
+
+    fn serve_one_inner(
+        &self,
+        listener: &UnixListener,
+        wait: Duration,
+        live: &AtomicBool,
+        after_accept: impl Fn(),
+    ) -> Result<bool, TransportError> {
         let deadline = Instant::now() + wait;
         loop {
+            if !live.load(Ordering::Acquire) {
+                return Err(TransportError::Inactive);
+            }
             match listener.accept() {
                 Ok((mut stream, _)) => {
+                    after_accept();
                     stream
                         .set_read_timeout(Some(SERVER_REQUEST_TIMEOUT))
                         .and_then(|_| stream.set_write_timeout(Some(SERVER_REQUEST_TIMEOUT)))
                         .map_err(|_| TransportError::EndpointUnavailable)?;
                     let response = self.handle_request(&mut stream);
+                    if !live.load(Ordering::Acquire) {
+                        return Err(TransportError::Inactive);
+                    }
                     let (status, body) = match response {
                         Ok(body) => ("200 OK", body),
                         Err(error) => ("400 Bad Request", error.category().as_bytes().to_vec()),
@@ -885,6 +1057,9 @@ impl ChildTransportConfig {
                         .and_then(|_| stream.write_all(&body))
                         .and_then(|_| stream.flush())
                         .map_err(map_io_error)?;
+                    if !live.load(Ordering::Acquire) {
+                        return Err(TransportError::Inactive);
+                    }
                     return Ok(true);
                 }
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
@@ -1075,6 +1250,50 @@ mod tests {
         Close,
     }
 
+    struct Canaries {
+        root: PathBuf,
+    }
+
+    impl Canaries {
+        fn create() -> Self {
+            let mut random = [0_u8; 16];
+            os_random(&mut random).unwrap();
+            let root = env::temp_dir().join(format!(".jv-canary-{}", hex(&random)));
+            random.fill(0);
+            fs::create_dir(&root).unwrap();
+            fs::create_dir(root.join("nested")).unwrap();
+            fs::write(root.join("canary.txt"), b"outside-text-canary\n").unwrap();
+            fs::write(root.join("runtime.sock"), b"outside-socket-canary\n").unwrap();
+            fs::write(root.join("nested/canary2"), b"outside-nested-canary\n").unwrap();
+            Self { root }
+        }
+
+        fn assert_intact(&self) {
+            assert_eq!(
+                fs::read(self.root.join("canary.txt")).unwrap(),
+                b"outside-text-canary\n"
+            );
+            assert_eq!(
+                fs::read(self.root.join("runtime.sock")).unwrap(),
+                b"outside-socket-canary\n"
+            );
+            assert_eq!(
+                fs::read(self.root.join("nested/canary2")).unwrap(),
+                b"outside-nested-canary\n"
+            );
+        }
+    }
+
+    impl Drop for Canaries {
+        fn drop(&mut self) {
+            let _ = fs::remove_file(self.root.join("canary.txt"));
+            let _ = fs::remove_file(self.root.join("runtime.sock"));
+            let _ = fs::remove_file(self.root.join("nested/canary2"));
+            let _ = fs::remove_dir(self.root.join("nested"));
+            let _ = fs::remove_dir(&self.root);
+        }
+    }
+
     fn fake_listener(session: &TransportSession) -> UnixListener {
         let listener = UnixListener::bind(&session.socket_path).unwrap();
         fs::set_permissions(&session.socket_path, fs::Permissions::from_mode(0o600)).unwrap();
@@ -1083,7 +1302,7 @@ mod tests {
 
     fn fake_server(session: &TransportSession, replies: Vec<FakeReply>) -> JoinHandle<()> {
         let listener = fake_listener(session);
-        let socket_path = session.socket_path.clone();
+        let directory = session.directory_handle.try_clone().unwrap();
         thread::spawn(move || {
             for reply in replies {
                 let (mut stream, _) = listener.accept().unwrap();
@@ -1098,7 +1317,7 @@ mod tests {
                 }
             }
             drop(listener);
-            let _ = fs::remove_file(socket_path);
+            unlink_socket_at(&directory);
         })
     }
 
@@ -1264,16 +1483,12 @@ mod tests {
         host: &str,
         extra_headers: &str,
     ) -> Vec<u8> {
-        use std::io::Cursor;
-
-        let mut init = Vec::new();
-        session.write_child_init(&mut init).unwrap();
-        let config = read_child_init(
-            &mut io::BufReader::new(Cursor::new(init)),
-            &session.instance_id,
-        )
-        .unwrap();
-        let listener = config.bind().unwrap();
+        let config = ChildTransportConfig {
+            instance_id: session.instance_id.clone(),
+            secret: lock(&session.secret).as_ref().unwrap().to_owned(),
+            directory: session.directory_handle.try_clone().unwrap(),
+        };
+        let listener = fake_listener(session);
         let socket_path = session.socket_path.clone();
         let server = thread::spawn(move || {
             assert!(config
@@ -1438,6 +1653,115 @@ mod tests {
     }
 
     #[test]
+    fn response_http_framing_subset_rejects_malformed_and_extra_bytes() {
+        let cases: Vec<(&str, Vec<u8>, TransportError)> = vec![
+            (
+                "malformed CRLF",
+                b"HTTP/1.1 200 OK\nContent-Length: 3\n\nok\n".to_vec(),
+                TransportError::MalformedResponse,
+            ),
+            (
+                "bytes after one framed response",
+                b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\nok\nHTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\nok\n".to_vec(),
+                TransportError::MalformedResponse,
+            ),
+            (
+                "duplicate Content-Length",
+                b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\nContent-Length: 3\r\n\r\nok\n".to_vec(),
+                TransportError::MalformedResponse,
+            ),
+            (
+                "conflicting Content-Length",
+                b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\nContent-Length: 4\r\n\r\nok\n".to_vec(),
+                TransportError::MalformedResponse,
+            ),
+            (
+                "truncated body",
+                b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nok\n".to_vec(),
+                TransportError::MalformedResponse,
+            ),
+            (
+                "invalid Content-Length",
+                b"HTTP/1.1 200 OK\r\nContent-Length: nope\r\n\r\nok\n".to_vec(),
+                TransportError::MalformedResponse,
+            ),
+            (
+                "Transfer-Encoding",
+                b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nContent-Length: 3\r\n\r\nok\n".to_vec(),
+                TransportError::MalformedResponse,
+            ),
+            (
+                "oversized body",
+                b"HTTP/1.1 200 OK\r\nContent-Length: 2049\r\n\r\n".to_vec(),
+                TransportError::ResponseTooLarge,
+            ),
+        ];
+
+        for (name, wire, expected) in cases {
+            let session = TransportSession::create(&format!("framing-{name}")).unwrap();
+            let server = fake_server(&session, vec![FakeReply::Wire(wire)]);
+            assert_eq!(session.probe(), Err(expected), "{name}");
+            server.join().unwrap();
+            session.revoke();
+        }
+
+        let session = TransportSession::create("oversized-header").unwrap();
+        let wire = format!(
+            "HTTP/1.1 200 OK\r\nX-Pad: {}\r\nContent-Length: 3\r\n\r\nok\n",
+            "x".repeat(MAX_RESPONSE_HEADER_BYTES)
+        )
+        .into_bytes();
+        let server = fake_server(&session, vec![FakeReply::Wire(wire)]);
+        assert_eq!(session.probe(), Err(TransportError::ResponseTooLarge));
+        server.join().unwrap();
+        session.revoke();
+    }
+
+    #[test]
+    fn supervisor_loss_during_inflight_proof_suppresses_late_response() {
+        let session = TransportSession::create("eof-inflight-proof").unwrap();
+        let config = ChildTransportConfig {
+            instance_id: session.instance_id.clone(),
+            secret: lock(&session.secret).as_ref().unwrap().to_owned(),
+            directory: session.directory_handle.try_clone().unwrap(),
+        };
+        let listener = fake_listener(&session);
+        let live = Arc::new(AtomicBool::new(true));
+        let server_live = Arc::clone(&live);
+        let (accepted_sender, accepted_receiver) = std::sync::mpsc::channel();
+        let server = thread::spawn(move || {
+            config.serve_one_with_accept_hook_for_test(
+                &listener,
+                Duration::from_secs(2),
+                &server_live,
+                accepted_sender,
+            )
+        });
+
+        let mut client = UnixStream::connect(&session.socket_path).unwrap();
+        let body = "00".repeat(NONCE_BYTES);
+        let header = format!(
+            "POST {PROOF_ROUTE} HTTP/1.1\r\nHost: jarvis.local\r\nConnection: close\r\nContent-Length: {}\r\nContent-Type: text/plain\r\n\r\n",
+            body.len()
+        );
+        client.write_all(header.as_bytes()).unwrap();
+        client.write_all(&body.as_bytes()[..16]).unwrap();
+        accepted_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("server accepted the in-flight request");
+        live.store(false, Ordering::Release);
+        client.write_all(&body.as_bytes()[16..]).unwrap();
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).unwrap();
+        assert!(
+            response.is_empty(),
+            "late response escaped after supervisor loss"
+        );
+        assert_eq!(server.join().unwrap(), Err(TransportError::Inactive));
+        session.revoke();
+    }
+
+    #[test]
     fn proof_is_bound_to_instance_version_build_and_nonce() {
         let version = Version {
             protocol: "1".to_owned(),
@@ -1483,8 +1807,305 @@ mod tests {
             0o700
         );
         assert!(session.socket_path.as_os_str().as_bytes().len() < 104);
+        assert!(session.path_matches_handle());
         session.revoke();
-        assert!(!session.directory.exists());
+        assert!(
+            session.directory.exists(),
+            "safe cleanup retains the empty directory"
+        );
+        assert!(fs::symlink_metadata(&session.socket_path).is_err());
         assert_eq!(session.probe(), Err(TransportError::Inactive));
+    }
+
+    #[test]
+    fn cleanup_is_anchored_to_original_directory_across_replacement_matrix() {
+        #[derive(Clone, Copy)]
+        enum Replacement {
+            File,
+            SymlinkToFile,
+            SymlinkToDirectory,
+            NewDirectory,
+            FakeSocket,
+        }
+
+        let canaries = Canaries::create();
+        for (index, replacement) in [
+            Replacement::File,
+            Replacement::SymlinkToFile,
+            Replacement::SymlinkToDirectory,
+            Replacement::NewDirectory,
+            Replacement::FakeSocket,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let session = TransportSession::create(&format!("path-matrix-{index}")).unwrap();
+            let original_path = session.directory_path().to_path_buf();
+            let retained = canaries.root.join(format!("session-original-{index}"));
+            fs::rename(&original_path, &retained).unwrap();
+            let fake_socket = match replacement {
+                Replacement::File => {
+                    fs::write(&original_path, b"replacement-file").unwrap();
+                    None
+                }
+                Replacement::SymlinkToFile => {
+                    std::os::unix::fs::symlink(canaries.root.join("canary.txt"), &original_path)
+                        .unwrap();
+                    None
+                }
+                Replacement::SymlinkToDirectory => {
+                    std::os::unix::fs::symlink(&canaries.root, &original_path).unwrap();
+                    None
+                }
+                Replacement::NewDirectory => {
+                    fs::create_dir(&original_path).unwrap();
+                    fs::write(original_path.join("runtime.sock"), b"replacement-directory")
+                        .unwrap();
+                    None
+                }
+                Replacement::FakeSocket => Some(UnixListener::bind(&original_path).unwrap()),
+            };
+
+            session.revoke();
+            canaries.assert_intact();
+            assert!(retained.is_dir());
+            if matches!(replacement, Replacement::NewDirectory) {
+                assert_eq!(
+                    fs::read(original_path.join("runtime.sock")).unwrap(),
+                    b"replacement-directory"
+                );
+            }
+            drop(fake_socket);
+            match replacement {
+                Replacement::NewDirectory => {
+                    fs::remove_file(original_path.join("runtime.sock")).unwrap();
+                    fs::remove_dir(&original_path).unwrap();
+                }
+                Replacement::FakeSocket => fs::remove_file(&original_path).unwrap(),
+                _ => fs::remove_file(&original_path).unwrap(),
+            }
+            fs::remove_dir(&retained).unwrap();
+        }
+        canaries.assert_intact();
+    }
+
+    #[test]
+    fn cleanup_after_bind_and_renamed_parent_preserves_external_canaries() {
+        let canaries = Canaries::create();
+        let session = TransportSession::create("path-after-bind").unwrap();
+        let listener = UnixListener::bind(&session.socket_path).unwrap();
+        fs::set_permissions(&session.socket_path, fs::Permissions::from_mode(0o600)).unwrap();
+        let original_path = session.directory_path().to_path_buf();
+        let retained = canaries.root.join("post-bind-original");
+        fs::rename(&original_path, &retained).unwrap();
+        std::os::unix::fs::symlink(&canaries.root, &original_path).unwrap();
+
+        session.revoke();
+        canaries.assert_intact();
+        assert!(fs::symlink_metadata(retained.join("runtime.sock")).is_err());
+        drop(listener);
+        fs::remove_file(&original_path).unwrap();
+        fs::remove_dir(&retained).unwrap();
+        canaries.assert_intact();
+    }
+
+    #[test]
+    fn child_drop_after_parent_rename_preserves_external_canaries() {
+        let canaries = Canaries::create();
+        let session = TransportSession::create("child-cleanup-after-rename").unwrap();
+        let config = ChildTransportConfig {
+            instance_id: session.instance_id.clone(),
+            secret: lock(&session.secret).as_ref().unwrap().to_owned(),
+            directory: session.directory_handle.try_clone().unwrap(),
+        };
+        let listener = UnixListener::bind(&session.socket_path).unwrap();
+        let original_path = session.directory_path().to_path_buf();
+        let retained = canaries.root.join("child-cleanup-original");
+        fs::rename(&original_path, &retained).unwrap();
+        std::os::unix::fs::symlink(&canaries.root, &original_path).unwrap();
+
+        drop(listener);
+        drop(config);
+        canaries.assert_intact();
+        assert!(fs::symlink_metadata(retained.join("runtime.sock")).is_err());
+        session.revoke();
+        fs::remove_file(&original_path).unwrap();
+        fs::remove_dir(&retained).unwrap();
+        canaries.assert_intact();
+    }
+
+    fn spawn_init_child_at(session: &TransportSession, cwd: &Path) -> io::Result<Child> {
+        let executable = env::current_exe().unwrap();
+        let mut child = Command::new(executable)
+            .arg("--ignored")
+            .arg("--exact")
+            .arg("runtime_manager::tests::runtime_helper_entry")
+            .arg("--format=terse")
+            .arg("--nocapture")
+            .arg("--test-threads=1")
+            .env_clear()
+            .env("JARVIS_RUNTIME_HELPER_ID", session.instance_id_for_test())
+            .env("JARVIS_RUNTIME_HELPER_MODE", "normal")
+            .current_dir(cwd)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()?;
+        let mut stdin = child.stdin.take().unwrap();
+        session.write_child_init(&mut stdin).unwrap();
+        drop(stdin);
+        Ok(child)
+    }
+
+    fn reap_init_child(mut child: Child) -> (i32, String) {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let status = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break status;
+            }
+            assert!(Instant::now() < deadline, "mismatched helper did not exit");
+            thread::sleep(Duration::from_millis(5));
+        };
+        let mut output = String::new();
+        child
+            .stdout
+            .take()
+            .unwrap()
+            .read_to_string(&mut output)
+            .unwrap();
+        (status.code().unwrap_or(-1), output)
+    }
+
+    fn spawn_init_child_with_current_session_path(session: &TransportSession) -> (i32, String) {
+        let child = spawn_init_child_at(session, session.directory_path()).unwrap();
+        reap_init_child(child)
+    }
+
+    #[test]
+    fn replacement_before_child_bind_fails_closed_without_ready_or_canary_deletion() {
+        let canaries = Canaries::create();
+        let session = TransportSession::create("path-before-bind").unwrap();
+        let original_path = session.directory_path().to_path_buf();
+        let retained = canaries.root.join("pre-bind-original");
+        fs::rename(&original_path, &retained).unwrap();
+        std::os::unix::fs::symlink(&canaries.root, &original_path).unwrap();
+
+        let (exit_code, output) = spawn_init_child_with_current_session_path(&session);
+        assert_eq!(exit_code, 44);
+        assert!(!output.contains("JARVIS_RUNTIME_READY"));
+        session.revoke();
+        canaries.assert_intact();
+        fs::remove_file(&original_path).unwrap();
+        fs::remove_dir(&retained).unwrap();
+        canaries.assert_intact();
+    }
+
+    #[test]
+    fn startup_path_replacement_types_fail_closed_before_bind() {
+        #[derive(Clone, Copy)]
+        enum Replacement {
+            File,
+            SymlinkToFile,
+            SymlinkToDirectory,
+            NewDirectory,
+            FakeSocket,
+        }
+
+        let canaries = Canaries::create();
+        for (index, replacement) in [
+            Replacement::File,
+            Replacement::SymlinkToFile,
+            Replacement::SymlinkToDirectory,
+            Replacement::NewDirectory,
+            Replacement::FakeSocket,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let session = TransportSession::create(&format!("startup-matrix-{index}")).unwrap();
+            let original_path = session.directory_path().to_path_buf();
+            let retained = canaries.root.join(format!("startup-original-{index}"));
+            fs::rename(&original_path, &retained).unwrap();
+            let fake_socket = match replacement {
+                Replacement::File => {
+                    fs::write(&original_path, b"replacement-file").unwrap();
+                    None
+                }
+                Replacement::SymlinkToFile => {
+                    std::os::unix::fs::symlink(canaries.root.join("canary.txt"), &original_path)
+                        .unwrap();
+                    None
+                }
+                Replacement::SymlinkToDirectory => {
+                    std::os::unix::fs::symlink(&canaries.root, &original_path).unwrap();
+                    None
+                }
+                Replacement::NewDirectory => {
+                    fs::create_dir(&original_path).unwrap();
+                    None
+                }
+                Replacement::FakeSocket => Some(UnixListener::bind(&original_path).unwrap()),
+            };
+
+            match replacement {
+                Replacement::File | Replacement::SymlinkToFile | Replacement::FakeSocket => {
+                    assert!(spawn_init_child_at(&session, &original_path).is_err());
+                }
+                Replacement::SymlinkToDirectory | Replacement::NewDirectory => {
+                    let child = spawn_init_child_at(&session, &original_path).unwrap();
+                    let (exit_code, output) = reap_init_child(child);
+                    assert_eq!(exit_code, 44, "replacement case {index}");
+                    assert!(!output.contains("JARVIS_RUNTIME_READY"), "case {index}");
+                }
+            }
+            drop(fake_socket);
+            session.revoke();
+            canaries.assert_intact();
+            match replacement {
+                Replacement::NewDirectory => fs::remove_dir(&original_path).unwrap(),
+                _ => fs::remove_file(&original_path).unwrap(),
+            }
+            fs::remove_dir(&retained).unwrap();
+        }
+        canaries.assert_intact();
+    }
+
+    #[test]
+    #[ignore = "MAC-002.1 adversarial filesystem stress; run explicitly"]
+    fn stress_path_substitution_200_rounds() {
+        let canaries = Canaries::create();
+        for round in 0..200 {
+            let session = TransportSession::create(&format!("path-stress-{round}")).unwrap();
+            let original_path = session.directory_path().to_path_buf();
+            let retained = canaries.root.join(format!("stress-original-{round}"));
+            fs::rename(&original_path, &retained).unwrap();
+            std::os::unix::fs::symlink(&canaries.root, &original_path).unwrap();
+            session.revoke();
+            canaries.assert_intact();
+            fs::remove_file(&original_path).unwrap();
+            fs::remove_dir(&retained).unwrap();
+        }
+        canaries.assert_intact();
+    }
+
+    #[test]
+    #[ignore = "MAC-002.1 child startup/path substitution stress; run explicitly"]
+    fn stress_child_startup_path_substitution_200_rounds() {
+        let canaries = Canaries::create();
+        for round in 0..200 {
+            let session = TransportSession::create(&format!("child-path-stress-{round}")).unwrap();
+            let original_path = session.directory_path().to_path_buf();
+            let retained = canaries.root.join(format!("child-original-{round}"));
+            fs::rename(&original_path, &retained).unwrap();
+            std::os::unix::fs::symlink(&canaries.root, &original_path).unwrap();
+            let (exit_code, output) = spawn_init_child_with_current_session_path(&session);
+            assert_eq!(exit_code, 44, "round {round}");
+            assert!(!output.contains("JARVIS_RUNTIME_READY"), "round {round}");
+            session.revoke();
+            canaries.assert_intact();
+            fs::remove_file(&original_path).unwrap();
+            fs::remove_dir(&retained).unwrap();
+        }
+        canaries.assert_intact();
     }
 }
