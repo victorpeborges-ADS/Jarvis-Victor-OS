@@ -1,5 +1,7 @@
 # Retomada — JARVIS G6-MAC-002.1
 
+> Estado: candidata aceita após auditoria independente final e integrada localmente à `main` por fast-forward. Consulte [ACEITE_G6_MAC_002.md](ACEITE_G6_MAC_002.md) para o registro formal, limites e advisory separado.
+
 ## Escopo
 
 Esta branch fecha apenas a perda de supervisor e a segurança filesystem do lifecycle UDS local. A base exata é `20626ebad5d01c6a8eee1a0366859e0be88764fd`; a branch é `feat/jarvis-g6-mac-002-1-uds-lifecycle-2026-10-02`. Não inicia MAC-003 nem altera G5 ou ADR-010.
@@ -18,4 +20,4 @@ Esta branch fecha apenas a perda de supervisor e a segurança filesystem do life
 
 ## Continuação
 
-Use o SHA completo final indicado no handoff para uma auditoria independente da candidata. Preserve a branch e os limites: sem merge, push, tag, deploy, FastAPI G5, alteração de ADR-010, OAuth, rede ou MAC-003. Diretórios vazios deixados pelo runtime são resíduos seguros documentados, não devem ser removidos agressivamente.
+SHA funcional aceito: `c64ee0ae02274bc8ba6041edae043450b9313b6d`. A árvore integrada coincide com a candidata auditada; a verificação da auditoria não foi repetida após o fast-forward. A integração local não autoriza push, tag, deploy, FastAPI G5, alteração de ADR-010, OAuth, rede ou MAC-003. Diretórios vazios deixados pelo runtime são resíduos seguros documentados, não devem ser removidos agressivamente.

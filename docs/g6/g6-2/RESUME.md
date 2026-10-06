@@ -2,6 +2,13 @@
 
 > Resumo histórico da MAC-002. A implementação vigente de lifecycle está em [RESUME_MAC_002_1.md](RESUME_MAC_002_1.md); a documentação de validação e limites está em [G6_MAC_002_1_REPORT.md](G6_MAC_002_1_REPORT.md).
 
+## Estado formal — 2026-10-06
+
+- Aceite independente final: **PASS**, sem achados P0/P1/P2 na candidata `c64ee0ae02274bc8ba6041edae043450b9313b6d`.
+- Integração local à `main`: fast-forward a partir de `00753c58b97c3103d428bc6a0a9351f97b6c050d`.
+- O escopo e os limites aceitos estão em [ACEITE_G6_MAC_002.md](ACEITE_G6_MAC_002.md). Isso não é aceite integral de G6.1; MAC-003 não foi iniciado.
+- O advisory transitivo `source-map-js@1.2.1` (GHSA-68fv-2mgg-jv7q / CVE-2026-93749) fica registrado como dívida P3 separada, a resolver antes de distribuição/produção.
+
 ## Candidata
 
 - Branch: `feat/jarvis-g6-mac-002-local-transport-2026-10-02`
@@ -13,9 +20,11 @@
 
 O Runtime Manager cria UDS e capacidade exclusivos por geração; o pipe carrega ID, capability e identidade do diretório, sem path. O child valida CWD por `dev`/`inode` e faz bind relativo. Readiness e autenticação têm estados separados. O native client verifica health, versão e prova HMAC com nonce novo, incluindo operação sintética assinada. Stop/EOF revogam a sessão; cleanup do socket usa FD de diretório e `unlinkat`, mantendo o diretório vazio preservado. Não há FastAPI, G5, SQLite, migrations, TCP, OAuth, contas ou rede remota.
 
-## Retomar a validação
+## Validação registrada
 
-Na worktree acima, executar:
+A matriz abaixo foi executada na candidata funcional `c64ee0ae02274bc8ba6041edae043450b9313b6d` antes do aceite. A integração foi fast-forward e acrescentou somente documentação; a matriz não foi repetida, conforme o handoff.
+
+Comandos usados na validação original:
 
 ```bash
 npm run build --prefix apps/desktop
