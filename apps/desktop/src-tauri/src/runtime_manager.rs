@@ -246,6 +246,7 @@ struct G5Session {
 }
 
 struct G5Grant {
+    session_token: SecretText,
     id: String,
     domain_id: String,
     expires_at: String,
@@ -658,6 +659,7 @@ impl RuntimeManager {
             return g5_error_json("stale_generation");
         }
         inner.g5_grant = Some(G5Grant {
+            session_token: SecretText::new(token.as_str().to_owned()),
             id: grant_id,
             domain_id: "dom_synthetic_a".to_owned(),
             expires_at: expires_at.clone(),
@@ -679,12 +681,13 @@ impl RuntimeManager {
 
     fn g5_mission_read_grant_revoke_locked(&self) -> String {
         let (instance_id, transport, token, csrf_token, grant_id) = {
-            let inner = lock_inner(&self.shared);
+            let mut inner = lock_inner(&self.shared);
+            expire_cached_authorization(&mut inner);
             let Some(session) = inner.g5_session.as_ref() else {
                 return g5_error_json("session_required");
             };
             let Some(grant) = inner.g5_grant.as_ref() else {
-                return g5_error_json("grant_required");
+                return "{\"ok\":true,\"grant_active\":false}".to_owned();
             };
             if inner.snapshot.state != RuntimeState::Ready
                 || inner.transport_snapshot.state != TransportState::Ready
@@ -762,9 +765,6 @@ impl RuntimeManager {
         {
             let mut inner = lock_inner(&self.shared);
             expire_cached_authorization(&mut inner);
-            if inner.g5_grant.is_some() {
-                return g5_error_json("grant_active");
-            }
         }
         let (instance_id, transport, token, csrf_token) = match self.g5_credentials_for_active() {
             Ok(value) => value,
@@ -2079,7 +2079,10 @@ fn unix_time_seconds() -> u64 {
 }
 
 fn expire_cached_authorization(inner: &mut Inner) {
-    let now = unix_time_seconds();
+    expire_cached_authorization_at(inner, unix_time_seconds());
+}
+
+fn expire_cached_authorization_at(inner: &mut Inner, now: u64) {
     if inner
         .g5_session
         .as_ref()
@@ -2088,11 +2091,13 @@ fn expire_cached_authorization(inner: &mut Inner) {
         inner.g5_session = None;
         inner.g5_grant = None;
     }
-    if inner
-        .g5_grant
-        .as_ref()
-        .is_some_and(|grant| grant.expires_at_unix_seconds <= now)
-    {
+    if inner.g5_grant.as_ref().is_some_and(|grant| {
+        grant.expires_at_unix_seconds <= now
+            || inner
+                .g5_session
+                .as_ref()
+                .is_none_or(|session| session.token.as_str() != grant.session_token.as_str())
+    }) {
         inner.g5_grant = None;
     }
 }
@@ -2831,6 +2836,51 @@ mod tests {
         assert!(parse_application_response(b"title=bad+space\n").is_err());
     }
 
+    #[test]
+    fn cached_grants_follow_session_identity_and_exact_expiry_boundary() {
+        let manager = manager();
+        let mut inner = lock_inner(&manager.shared);
+        inner.g5_session = Some(G5Session {
+            runtime_instance_id: "synthetic-generation".to_owned(),
+            token: SecretText::new("S1".to_owned()),
+            csrf_token: SecretText::new("synthetic-csrf".to_owned()),
+            expires_at: "synthetic-expiry".to_owned(),
+            expires_at_unix_seconds: 100,
+        });
+        inner.g5_grant = Some(G5Grant {
+            session_token: SecretText::new("S1".to_owned()),
+            id: "synthetic-grant".to_owned(),
+            domain_id: "dom_synthetic_a".to_owned(),
+            expires_at: "synthetic-expiry".to_owned(),
+            expires_at_unix_seconds: 200,
+        });
+        expire_cached_authorization_at(&mut inner, 99);
+        assert!(inner.g5_session.is_some() && inner.g5_grant.is_some());
+        inner.g5_session.as_mut().unwrap().token = SecretText::new("S2".to_owned());
+        expire_cached_authorization_at(&mut inner, 99);
+        assert!(inner.g5_session.is_some() && inner.g5_grant.is_none());
+        inner.g5_grant = Some(G5Grant {
+            session_token: SecretText::new("S2".to_owned()),
+            id: "synthetic-expiring-grant".to_owned(),
+            domain_id: "dom_synthetic_a".to_owned(),
+            expires_at: "synthetic-expiry".to_owned(),
+            expires_at_unix_seconds: 99,
+        });
+        expire_cached_authorization_at(&mut inner, 98);
+        assert!(inner.g5_session.is_some() && inner.g5_grant.is_some());
+        expire_cached_authorization_at(&mut inner, 99);
+        assert!(inner.g5_session.is_some() && inner.g5_grant.is_none());
+        inner.g5_grant = Some(G5Grant {
+            session_token: SecretText::new("S2".to_owned()),
+            id: "synthetic-grant-2".to_owned(),
+            domain_id: "dom_synthetic_a".to_owned(),
+            expires_at: "synthetic-expiry".to_owned(),
+            expires_at_unix_seconds: 200,
+        });
+        expire_cached_authorization_at(&mut inner, 100);
+        assert!(inner.g5_session.is_none() && inner.g5_grant.is_none());
+    }
+
     struct FastApiChild {
         child: Child,
         stdin: ChildStdin,
@@ -2974,14 +3024,38 @@ mod tests {
         assert!(missions.contains("\"dataset\":\"api_synthetic\""));
         assert!(!missions.contains("session_token"));
         assert!(!missions.contains("csrf_token"));
-        assert!(manager.g5_session_close().contains("Revogue a concessão"));
+        assert!(manager
+            .g5_session_status_json()
+            .contains("\"grant_active\":true"));
 
         let revoked = manager.g5_mission_read_grant_revoke();
         assert!(revoked.contains("\"grant_active\":false"));
+        assert!(manager
+            .g5_mission_read_grant_revoke()
+            .contains("\"grant_active\":false"));
         assert!(manager.g5_missions_list().contains("concessão de leitura"));
+        assert!(manager
+            .g5_mission_read_grant_create()
+            .contains("\"grant_active\":true"));
         let closed = manager.g5_session_close();
         assert!(closed.contains("\"session_active\":false"));
         assert!(!closed.contains("session_token"));
+        assert!(manager
+            .g5_session_open("senha-sintetica-rust-mac003".to_owned())
+            .contains("\"session_active\":true"));
+        assert!(manager
+            .g5_session_status_json()
+            .contains("\"grant_active\":false"));
+        assert!(manager.g5_missions_list().contains("concessão de leitura"));
+        assert!(manager
+            .g5_mission_read_grant_create()
+            .contains("\"grant_active\":true"));
+        assert!(manager
+            .g5_missions_list()
+            .contains("Missão sintética Rust → FastAPI"));
+        assert!(manager
+            .g5_session_close()
+            .contains("\"session_active\":false"));
         assert_eq!(process.stop(), 0);
         session.revoke();
         for suffix in ["", "-wal", "-shm"] {

@@ -79,8 +79,10 @@ function App() {
             setRuntime(next);
             setTransport(nextTransport);
             setG5Status(g5Response);
-            if (next.snapshot.state !== "READY" || nextTransport.state !== "READY") {
+            if (next.snapshot.state !== "READY" || nextTransport.state !== "READY" || !g5Response.session_active) {
               setGrantConfirmed(false);
+              setMissions([]);
+            } else if (!g5Response.grant_active) {
               setMissions([]);
             }
             setRuntimeError("");
@@ -158,7 +160,12 @@ function App() {
       } else if (action === "revoke-grant" || action === "close-session") {
         setMissions([]);
       }
-      setG5Status(await g5Ipc.sessionStatus());
+      const status = await g5Ipc.sessionStatus();
+      setG5Status(status);
+      if (!status.session_active || !status.grant_active) {
+        setMissions([]);
+        setGrantConfirmed(false);
+      }
     } catch {
       setG5Error("Não foi possível falar com o backend local autenticado.");
     } finally {
@@ -242,7 +249,7 @@ function App() {
             <label className="confirm"><input type="checkbox" checked={grantConfirmed} onChange={(event) => setGrantConfirmed(event.currentTarget.checked)} /> Confirmo leitura somente de Missões sintéticas em <code>dom_synthetic_a</code> por até 60 minutos.</label>
             <button className="action" type="button" disabled={g5Busy || !grantConfirmed} onClick={() => void runG5Command("create-grant")}>Conceder leitura</button>
           </>}
-          {!g5Status.grant_active && <button className="action secondary" type="button" disabled={g5Busy} onClick={() => void runG5Command("close-session")}>Encerrar sessão</button>}
+          <button className="action secondary" type="button" disabled={g5Busy} onClick={() => void runG5Command("close-session")}>Encerrar sessão e invalidar concessão</button>
         </section>}
         {g5Error && <p className="notice" role="alert">{g5Error}</p>}
         {missions.length > 0 && <section className="g5-results" aria-live="polite"><h3>Resultado da API sintética</h3>

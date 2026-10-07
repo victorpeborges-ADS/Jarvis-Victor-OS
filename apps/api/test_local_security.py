@@ -690,6 +690,8 @@ def test_rate_limit_recovers_after_process_restart():
 def test_supported_server_entrypoint_disables_proxy_headers(monkeypatch):
     import serve
 
+    monkeypatch.setattr(serve.sys, "argv", ["serve.py"])
+
     captured = {}
     monkeypatch.delenv("JARVIS_BIND_HOST", raising=False)
     monkeypatch.setattr(
@@ -706,6 +708,8 @@ def test_supported_server_entrypoint_disables_proxy_headers(monkeypatch):
 
 def test_supported_entrypoint_rejects_public_bind_before_uvicorn(monkeypatch):
     import serve
+
+    monkeypatch.setattr(serve.sys, "argv", ["serve.py"])
 
     monkeypatch.setenv("JARVIS_BIND_HOST", "0.0.0.0")
     monkeypatch.setattr(serve.uvicorn, "run", lambda *args, **kwargs: pytest.fail("uvicorn não deveria iniciar"))

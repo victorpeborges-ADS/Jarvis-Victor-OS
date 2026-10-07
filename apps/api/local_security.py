@@ -57,6 +57,7 @@ class Grant:
     domain_ids: frozenset[str]
     expires_at: datetime
     revoked: bool = False
+    session_token: str | None = None
 
 
 _sessions: dict[str, Session] = {}
@@ -120,7 +121,7 @@ def _session_by_token(token: str) -> Session:
         session = _sessions.get(token)
         if session is None or session.expires_at <= _now():
             if session is not None:
-                _sessions.pop(token, None)
+                _invalidate_session_locked(token)
             raise HTTPException(status_code=401, detail="sessão ausente")
         return session
 
@@ -138,10 +139,10 @@ def _create_grant_for_session(session: Session, body: GrantIn) -> Grant:
     with _grant_lock:
         # The session is revalidated while the same grant lock serializes its
         # use with logout and grant mutation.
-        current = _sessions.get(session.token)
-        if current is None or current.principal != session.principal or current.expires_at <= _now():
+        current = _session_by_token(session.token)
+        if current.principal != session.principal:
             raise HTTPException(status_code=401, detail="sessão ausente")
-        for existing in _active_grants(session.principal, _now()):
+        for existing in _active_grants(session.principal, _now(), session.token):
             overlaps = (
                 existing.connector == body.connector
                 and bool(existing.resource_ids & resources)
@@ -152,6 +153,7 @@ def _create_grant_for_session(session: Session, body: GrantIn) -> Grant:
         grant = Grant(
             id=secrets.token_hex(16),
             principal=session.principal,
+            session_token=session.token,
             connector=body.connector,
             resource_ids=resources,
             domain_ids=domains,
@@ -170,11 +172,11 @@ def _revoke_grant_for_session(
     domain_id: str | None = None,
 ) -> Grant:
     with _grant_lock:
-        current = _sessions.get(session.token)
-        if current is None or current.principal != session.principal or current.expires_at <= _now():
+        current = _session_by_token(session.token)
+        if current.principal != session.principal:
             raise HTTPException(status_code=401, detail="sessão ausente")
         grant = _grants.get(grant_id)
-        if grant is None or grant.principal != session.principal:
+        if grant is None or grant.principal != session.principal or grant.session_token != session.token:
             raise HTTPException(status_code=404, detail="concessão ausente")
         if (
             (connector is not None and grant.connector != connector)
@@ -191,7 +193,15 @@ def _close_session_for(session: Session) -> None:
         current = _sessions.get(session.token)
         if current is None or current.principal != session.principal:
             raise HTTPException(status_code=401, detail="sessão ausente")
-        _sessions.pop(session.token, None)
+        _invalidate_session_locked(session.token)
+
+
+def _invalidate_session_locked(token: str) -> None:
+    """Caller holds _grant_lock: logout/expiry and grant invalidation linearize."""
+    for grant in _grants.values():
+        if grant.session_token == token:
+            grant.revoked = True
+    _sessions.pop(token, None)
 
 
 class LoginIn(BaseModel):
@@ -353,10 +363,16 @@ def _session_from(request: Request, *, mutation: bool = False) -> Session:
     return session
 
 
-def _active_grants(principal: str, at: datetime | None = None) -> list[Grant]:
+def _active_grants(principal: str, at: datetime | None = None, session_token: str | None = None) -> list[Grant]:
     instant = at or _now()
     with _grant_lock:
-        return [grant for grant in _grants.values() if grant.principal == principal and not grant.revoked and grant.expires_at > instant]
+        for token, session in list(_sessions.items()):
+            if session.expires_at <= instant:
+                _invalidate_session_locked(token)
+        return [grant for grant in _grants.values()
+                if grant.principal == principal and not grant.revoked and grant.expires_at > instant
+                and (session_token is None or grant.session_token == session_token)
+                and (grant.session_token is None or grant.session_token in _sessions)]
 
 
 def _calendar_domains_for(principal: str, resource_id: str) -> frozenset[str]:
@@ -391,7 +407,7 @@ def mission_read_confirmed(principal: str, domain_id: str, session_token: str | 
     """Keep a synthetic mission read grant active while assembling its response."""
     with _grant_lock:
         _confirm_session_locked(principal, session_token)
-        if domain_id not in mission_domains(principal, MISSION_READ_RESOURCE):
+        if domain_id not in mission_domains(principal, MISSION_READ_RESOURCE, session_token):
             raise PermissionError("concessão de leitura revogada ou expirada")
         yield
 
@@ -401,6 +417,8 @@ def _confirm_session_locked(principal: str, session_token: str | None) -> None:
         return
     session = _sessions.get(session_token)
     if session is None or session.principal != principal or session.expires_at <= _now():
+        if session is not None and session.expires_at <= _now():
+            _invalidate_session_locked(session_token)
         raise PermissionError("sessão encerrada ou expirada")
 
 
@@ -417,7 +435,7 @@ def mission_read_scope_confirmed(
     """
     with _grant_lock:
         _confirm_session_locked(principal, session_token)
-        granted = mission_domains(principal, MISSION_READ_RESOURCE)
+        granted = mission_domains(principal, MISSION_READ_RESOURCE, session_token)
         allowed = granted if domain_id is None else granted & {domain_id}
         if not allowed:
             raise PermissionError("concessão de leitura revogada ou expirada")
@@ -433,7 +451,7 @@ def mission_review_read_scope_confirmed(
     """Hold read/review grants stable while review snapshots are assembled."""
     with _grant_lock:
         _confirm_session_locked(principal, session_token)
-        granted = mission_domains(principal, MISSION_READ_RESOURCE) | mission_domains(principal, MISSION_REVIEW_RESOURCE)
+        granted = mission_domains(principal, MISSION_READ_RESOURCE, session_token) | mission_domains(principal, MISSION_REVIEW_RESOURCE, session_token)
         allowed = granted if domain_id is None else granted & {domain_id}
         if not allowed:
             raise PermissionError("concessão de leitura ou revisão revogada ou expirada")
@@ -449,11 +467,8 @@ def mission_write_confirmed(principal: str, domain_id: str, session_token: str |
     event reads take the grant lock first and then the database.
     """
     with _grant_lock:
-        if session_token is not None:
-            session = _sessions.get(session_token)
-            if session is None or session.principal != principal or session.expires_at <= _now():
-                raise PermissionError("sessão encerrada ou expirada")
-        if domain_id not in mission_domains(principal, MISSION_WRITE_RESOURCE):
+        _confirm_session_locked(principal, session_token)
+        if domain_id not in mission_domains(principal, MISSION_WRITE_RESOURCE, session_token):
             raise PermissionError("concessão de missão revogada ou expirada")
         yield
 
@@ -465,16 +480,13 @@ def mission_review_confirmed(principal: str, domain_id: str, session_token: str 
     Lock order is grant lock, then the SQLite write transaction.
     """
     with _grant_lock:
-        if session_token is not None:
-            session = _sessions.get(session_token)
-            if session is None or session.principal != principal or session.expires_at <= _now():
-                raise PermissionError("sessão encerrada ou expirada")
-        if domain_id not in mission_domains(principal, MISSION_REVIEW_RESOURCE):
+        _confirm_session_locked(principal, session_token)
+        if domain_id not in mission_domains(principal, MISSION_REVIEW_RESOURCE, session_token):
             raise PermissionError("concessão de revisão revogada ou expirada")
         yield
 
 
-def mission_domains(principal: str, resource_id: str) -> frozenset[str]:
+def mission_domains(principal: str, resource_id: str, session_token: str | None = None) -> frozenset[str]:
     """Domains covered by an active mission_sim grant for one resource.
 
     A calendar grant never contributes. domain_id classifies; it does not authorize.
@@ -484,7 +496,7 @@ def mission_domains(principal: str, resource_id: str) -> frozenset[str]:
     allowed: set[str] = set()
     canonical = CANONICAL_RESOURCES["mission_sim"]
     with _grant_lock:
-        for grant in _active_grants(principal):
+        for grant in _active_grants(principal, session_token=session_token):
             if grant.connector != "mission_sim":
                 continue
             if resource_id not in grant.resource_ids or not grant.resource_ids <= canonical:
@@ -655,7 +667,8 @@ def list_active_grants(request: Request, response: Response) -> list[GrantOut]:
     response.headers["Cache-Control"] = "no-store"
     response.headers["Pragma"] = "no-cache"
     with _grant_lock:
-        active = _active_grants(session.principal)
+        _session_by_token(session.token)
+        active = _active_grants(session.principal, session_token=session.token)
         return [_grant_response(grant) for grant in sorted(active, key=lambda item: item.id)]
 
 
@@ -701,6 +714,10 @@ def read_briefing(request: Request) -> RealBriefingOut:
 
 def put_grant_for_tests(grant: Grant) -> None:
     with _grant_lock:
+        if grant.session_token is None:
+            sessions = [session for session in _sessions.values() if session.principal == grant.principal]
+            if len(sessions) == 1:
+                grant.session_token = sessions[0].token
         _grants[grant.id] = grant
 
 

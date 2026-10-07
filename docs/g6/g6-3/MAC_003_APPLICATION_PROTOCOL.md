@@ -68,10 +68,10 @@ Comandos Tauri MAC-003 sem rota, método, path, ID de instância ou escopo contr
 - `g5_session_open(passphrase)` — recebe a credencial digitada; o WebView limpa o campo depois da resposta. Rust encaminha a credencial apenas no corpo da operação `session/open` e zera os buffers temporários.
 - `g5_mission_read_grant_create()` — só é chamado pelo botão após consentimento visível para o domínio e validade fixos.
 - `g5_mission_read_grant_revoke()` — revoga a concessão nativa ativa.
-- `g5_session_close()` — encerra a sessão explicitamente; se houver grant nativo ativo, a UI exige revogá-lo antes de encerrar.
+- `g5_session_close()` — encerra a sessão explicitamente; invalida atomicamente todos os grants daquela sessão no servidor e limpa o cache Rust.
 - `g5_missions_list()` — retorna somente o DTO de missão limitado acima.
 
-No cliente, o token de sessão, CSRF e ID do grant ficam somente em memória no `RuntimeManager`, vinculados ao `runtime_instance_id`; só o Rust os envia ao backend em corpos de requisição UDS. A WebView recebe estado e DTOs limitados, nunca esses tokens. Expirações Unix fornecidas pela API permitem limpar tokens locais vencidos; também são apagados no stop, EOF, crash, restart e falha de geração. No servidor, sessões e grants continuam voláteis conforme G5 para que as checagens existentes possam validá-los. A passphrase digitada não é persistida nem registrada. O valor de comparação continua sendo a configuração local existente `JARVIS_LOCAL_PASSPHRASE`; o desktop não a inventa, não a muda e não a grava.
+No cliente, o token de sessão, CSRF e ID do grant ficam somente em memória no `RuntimeManager`, vinculados ao `runtime_instance_id`; só o Rust os envia ao backend em corpos de requisição UDS. A WebView recebe estado e DTOs limitados, nunca esses tokens. Expirações Unix fornecidas pela API permitem limpar tokens locais vencidos; também são apagados no stop, EOF, crash, restart e falha de geração. No servidor, cada grant pertence ao token da sessão que o criou (apenas em memória; nunca no DTO), e sessões e grants continuam voláteis conforme G5 para que as checagens existentes possam validá-los. A passphrase digitada não é persistida nem registrada. O valor de comparação continua sendo a configuração local existente `JARVIS_LOCAL_PASSPHRASE`; o desktop não a inventa, não a muda e não a grava.
 
 O cliente filho usa o interpretador Python 3.12 diretamente, sem shell ou launcher intermediário; stdin/stdout pertencem ao supervisor. O registro de capability continua privado em stdin. Somente a configuração local estritamente necessária para o runner pode ser encaminhada ao processo; capability nunca é environment. O runner desktop serve apenas o app FastAPI nativo em UDS, sem montar as rotas web, Swagger/OpenAPI ou endpoints DEMO no socket nativo. O runner oficial web continua loopback e suas validações de Origin/CSRF/host permanecem inalteradas.
 
@@ -80,8 +80,8 @@ O cliente filho usa o interpretador Python 3.12 diretamente, sem shell ou launch
 1. A pessoa informa explicitamente a passphrase local existente. O backend valida a passphrase e o rate limit G5 e cria sessão volátil; não cria grant.
 2. A UI apresenta o domínio `dom_synthetic_a`, o recurso `mission:read` e a validade de 60 minutos. A pessoa confirma; só então Rust solicita a criação do grant.
 3. O servidor define a expiração de 60 minutos na confirmação do grant. Cada leitura envia o token e o domínio pelo canal privado Rust→UDS. G5 revalida a sessão e o grant no servidor antes da consulta.
-4. Revogação exige ação explícita. Logout exige que o grant nativo seja revogado antes da sessão ser fechada.
-5. Logout é bloqueado enquanto o grant nativo estiver ativo; a pessoa deve revogá-lo por ação própria antes de encerrar a sessão. STOP/EOF/crash/restart encerram o processo FastAPI e descartam seus estados voláteis. Tokens locais são limpos; a nova geração não herda sessão ou grant e exige novo login e nova confirmação.
+4. Revogação exige ação explícita. Logout invalida os grants vinculados à sessão sob o mesmo lock de autorização.
+5. Logout permanece disponível com grant ativo. Fechamento ou expiração invalida os grants da sessão que os criou; uma sessão nova nunca herda autorização ou conflito da anterior. A expiração é observada na validação ou varredura de grants, sem scheduler. STOP/EOF/crash/restart encerram o processo FastAPI e descartam seus estados voláteis. Tokens locais são limpos; a nova geração não herda sessão ou grant e exige novo login e nova confirmação.
 
 ## Arquivos e plano de implementação
 
