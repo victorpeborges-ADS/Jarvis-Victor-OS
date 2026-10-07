@@ -42,8 +42,8 @@ O pedido Rust rejeita corpos maiores antes de conectar. O FastAPI rejeita tamanh
 
 | Método e caminho | Campos exatos do pedido | Resposta de sucesso |
 |---|---|---|
-| `POST /v1/app/session/open` | `passphrase` | `ok=true`, `principal=owner`, `session_token`, `csrf_token`, `expires_at_epoch`, `expires_at` |
-| `POST /v1/app/grants/mission-read` | `session_token`, `csrf_token`, `domain_id` | `ok=true`, `grant_id`, `domain_id`, `expires_at_epoch`, `expires_at` |
+| `POST /v1/app/session/open` | `passphrase` | `ok=true`, `principal=owner`, `session_token`, `csrf_token`, `expires_at_epoch_us`, `expires_at` |
+| `POST /v1/app/grants/mission-read` | `session_token`, `csrf_token`, `domain_id` | `ok=true`, `grant_id`, `domain_id`, `expires_at_epoch_us`, `expires_at` |
 | `POST /v1/app/grants/mission-read/revoke` | `session_token`, `csrf_token`, `grant_id` | `ok=true`, `revoked=true` |
 | `POST /v1/app/session/close` | `session_token`, `csrf_token` | `ok=true`, `closed=true` |
 | `POST /v1/app/missions/list` | `session_token`, `domain_id` | `ok=true`, `dataset`, `count` e campos da única missão, se houver |
@@ -71,7 +71,7 @@ Comandos Tauri MAC-003 sem rota, método, path, ID de instância ou escopo contr
 - `g5_session_close()` — encerra a sessão explicitamente; invalida atomicamente todos os grants daquela sessão no servidor e limpa o cache Rust.
 - `g5_missions_list()` — retorna somente o DTO de missão limitado acima.
 
-No cliente, o token de sessão, CSRF e ID do grant ficam somente em memória no `RuntimeManager`, vinculados ao `runtime_instance_id`; só o Rust os envia ao backend em corpos de requisição UDS. A WebView recebe estado e DTOs limitados, nunca esses tokens. Expirações Unix fornecidas pela API permitem limpar tokens locais vencidos; também são apagados no stop, EOF, crash, restart e falha de geração. No servidor, cada grant pertence ao token da sessão que o criou (apenas em memória; nunca no DTO), e sessões e grants continuam voláteis conforme G5 para que as checagens existentes possam validá-los. A passphrase digitada não é persistida nem registrada. O valor de comparação continua sendo a configuração local existente `JARVIS_LOCAL_PASSPHRASE`; o desktop não a inventa, não a muda e não a grava.
+No cliente, o token de sessão, CSRF e ID do grant ficam somente em memória no `RuntimeManager`, vinculados ao `runtime_instance_id`; só o Rust os envia ao backend em corpos de requisição UDS. A WebView recebe estado e DTOs limitados, nunca esses tokens. Expirações Unix fornecidas pela API são inteiros exatos em microssegundos (`expires_at_epoch_us`), calculados sem ponto flutuante a partir do datetime autoritativo. Rust compara em microssegundos, sem tolerância ou arredondamento de validade; o servidor revalida cada leitura. Esses instantes permitem limpar tokens locais vencidos; também são apagados no stop, EOF, crash, restart e falha de geração. No servidor, cada grant pertence ao token da sessão que o criou (apenas em memória; nunca no DTO), e sessões e grants continuam voláteis conforme G5 para que as checagens existentes possam validá-los. A passphrase digitada não é persistida nem registrada. O valor de comparação continua sendo a configuração local existente `JARVIS_LOCAL_PASSPHRASE`; o desktop não a inventa, não a muda e não a grava.
 
 O cliente filho usa o interpretador Python 3.12 diretamente, sem shell ou launcher intermediário; stdin/stdout pertencem ao supervisor. O registro de capability continua privado em stdin. Somente a configuração local estritamente necessária para o runner pode ser encaminhada ao processo; capability nunca é environment. O runner desktop serve apenas o app FastAPI nativo em UDS, sem montar as rotas web, Swagger/OpenAPI ou endpoints DEMO no socket nativo. O runner oficial web continua loopback e suas validações de Origin/CSRF/host permanecem inalteradas.
 

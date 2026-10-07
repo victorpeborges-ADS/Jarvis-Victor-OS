@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import re
-from datetime import timedelta, timezone
+from datetime import datetime, timedelta, timezone
 from urllib.parse import quote, unquote_to_bytes
 
 from fastapi import APIRouter, HTTPException, Request
@@ -51,6 +51,12 @@ def _decode_value(raw: str) -> str:
 
 def _encode_value(value: object) -> str:
     return quote(str(value), safe="-_.~")
+
+
+def _epoch_microseconds(value: datetime) -> int:
+    """Exact datetime precision; no float timestamp rounding or grace period."""
+    delta = value.astimezone(timezone.utc) - datetime(1970, 1, 1, tzinfo=timezone.utc)
+    return (delta.days * 86400 + delta.seconds) * 1_000_000 + delta.microseconds
 
 
 async def _read_fields(request: Request, expected: tuple[str, ...]) -> dict[str, str]:
@@ -140,7 +146,7 @@ async def open_native_session(request: Request) -> PlainTextResponse:
         principal=session.principal,
         session_token=session.token,
         csrf_token=session.csrf_token,
-        expires_at_epoch=int(session.expires_at.timestamp()),
+        expires_at_epoch_us=_epoch_microseconds(session.expires_at),
         expires_at=session.expires_at.isoformat(),
     )
 
@@ -181,7 +187,7 @@ async def create_native_mission_read_grant(request: Request) -> PlainTextRespons
     return _success(
         grant_id=grant.id,
         domain_id=NATIVE_DOMAIN,
-        expires_at_epoch=int(grant.expires_at.timestamp()),
+        expires_at_epoch_us=_epoch_microseconds(grant.expires_at),
         expires_at=grant.expires_at.isoformat(),
     )
 

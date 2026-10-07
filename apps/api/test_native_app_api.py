@@ -54,7 +54,7 @@ def login(client: TestClient) -> tuple[str, str]:
     )
     result = fields(opened)
     assert result["ok"] == "true"
-    assert int(result["expires_at_epoch"]) > int(time.time())
+    assert int(result["expires_at_epoch_us"]) > time.time_ns() // 1000
     return result["session_token"], result["csrf_token"]
 
 
@@ -98,7 +98,7 @@ def test_native_g5_requires_explicit_session_and_grant(native_client):
     grant_fields = fields(grant)
     assert grant_fields["ok"] == "true"
     assert grant_fields["domain_id"] == "dom_synthetic_a"
-    assert int(grant_fields["expires_at_epoch"]) > int(time.time())
+    assert int(grant_fields["expires_at_epoch_us"]) > time.time_ns() // 1000
     assert datetime.fromisoformat(grant_fields["expires_at"]).tzinfo is not None
 
     read = native_client.post(
@@ -287,3 +287,57 @@ def test_expired_session_invalidates_grants_during_mutation_revalidation(native_
     assert denied.value.status_code == 401
     assert token not in security._sessions
     assert security._grants[response["grant_id"]].revoked
+
+
+@pytest.mark.parametrize("offset_us", [-750_000, -1, 0])
+def test_fractional_grant_expiry_and_reconsent_match_authoritative_deadline(native_client, monkeypatch, offset_us):
+    from datetime import timedelta, timezone
+    import local_security as security
+    from native_app_api import _epoch_microseconds
+
+    instant = datetime(2026, 10, 7, 12, 0, 0, 750_000, tzinfo=timezone.utc)
+    monkeypatch.setattr(security, "_now", lambda: instant)
+    monkeypatch.setattr("native_app_api._now", lambda: instant)
+
+    def call(path, **values):
+        return fields(native_client.post("/v1/app/" + path, content=body(**values), headers=HEADERS))
+
+    opened = call("session/open", passphrase=PASSPHRASE)
+    token, csrf = opened["session_token"], opened["csrf_token"]
+    assert int(opened["expires_at_epoch_us"]) == _epoch_microseconds(datetime.fromisoformat(opened["expires_at"]))
+    assert int(opened["expires_at_epoch_us"]) % 1_000_000 == 750_000
+    MissionRepository(native_client.app.state.memory_store).create(
+        "owner", "Missão temporal sintética", "dom_synthetic_a", "mac00311-temporal-seed")
+    first = call("grants/mission-read", session_token=token, csrf_token=csrf, domain_id="dom_synthetic_a")
+    deadline = datetime.fromisoformat(first["expires_at"])
+    transmitted = int(first["expires_at_epoch_us"])
+    assert transmitted == _epoch_microseconds(deadline)
+    assert transmitted % 1_000_000 == 750_000
+    assert "expires_at_epoch" not in first
+
+    instant = deadline + timedelta(microseconds=offset_us)
+    # Same integer comparison as Rust's cache; precision matches the server.
+    cache_expired = transmitted <= _epoch_microseconds(instant)
+    read = call("missions/list", session_token=token, domain_id="dom_synthetic_a")
+    renewed = call("grants/mission-read", session_token=token, csrf_token=csrf, domain_id="dom_synthetic_a")
+    if offset_us < 0:
+        assert not cache_expired
+        assert read["ok"] == "true" and read["title"] == "Missão temporal sintética"
+        # This is a valid conflict, while UI/cache still retain the live grant.
+        assert renewed == {"ok": "false", "code": "grant_conflict"}
+    else:
+        assert cache_expired
+        assert read == {"ok": "false", "code": "grant_required"}
+        assert renewed["ok"] == "true"
+        assert renewed["grant_id"] != first["grant_id"]
+        assert call("missions/list", session_token=token, domain_id="dom_synthetic_a")["ok"] == "true"
+
+
+def test_epoch_microseconds_preserves_datetime_precision_without_float_rounding():
+    from datetime import timezone
+    from native_app_api import _epoch_microseconds
+
+    epoch = datetime(1970, 1, 1, tzinfo=timezone.utc)
+    value = datetime(2026, 10, 7, 12, 0, 0, 750_001, tzinfo=timezone.utc)
+    delta = value - epoch
+    assert _epoch_microseconds(value) == (delta.days * 86400 + delta.seconds) * 1_000_000 + 750_001

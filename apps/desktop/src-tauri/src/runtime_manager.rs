@@ -242,7 +242,7 @@ struct G5Session {
     token: SecretText,
     csrf_token: SecretText,
     expires_at: String,
-    expires_at_unix_seconds: u64,
+    expires_at_unix_microseconds: u64,
 }
 
 struct G5Grant {
@@ -250,7 +250,7 @@ struct G5Grant {
     id: String,
     domain_id: String,
     expires_at: String,
-    expires_at_unix_seconds: u64,
+    expires_at_unix_microseconds: u64,
 }
 
 struct SecretText(String);
@@ -527,7 +527,7 @@ impl RuntimeManager {
                 "principal",
                 "session_token",
                 "csrf_token",
-                "expires_at_epoch",
+                "expires_at_epoch_us",
                 "expires_at",
             ],
         ) || app_field(&fields, "ok") != Some("true")
@@ -549,10 +549,10 @@ impl RuntimeManager {
             }
             _ => return g5_error_json("protocol_failure"),
         };
-        let expires_at_unix_seconds = match take_app_secret(&mut fields, "expires_at_epoch")
+        let expires_at_unix_microseconds = match take_app_secret(&mut fields, "expires_at_epoch_us")
             .and_then(|value| value.as_str().parse::<u64>().ok())
         {
-            Some(value) if value > unix_time_seconds() => value,
+            Some(value) if value > unix_time_microseconds() => value,
             _ => return g5_error_json("protocol_failure"),
         };
         let mut inner = lock_inner(&self.shared);
@@ -571,7 +571,7 @@ impl RuntimeManager {
             token,
             csrf_token,
             expires_at: expires_at.clone(),
-            expires_at_unix_seconds,
+            expires_at_unix_microseconds,
         });
         format!(
             "{{\"ok\":true,\"session_active\":true,\"expires_at\":{}}}",
@@ -625,7 +625,7 @@ impl RuntimeManager {
                 "ok",
                 "grant_id",
                 "domain_id",
-                "expires_at_epoch",
+                "expires_at_epoch_us",
                 "expires_at",
             ],
         ) || app_field(&fields, "ok") != Some("true")
@@ -643,10 +643,10 @@ impl RuntimeManager {
             }
             _ => return g5_error_json("protocol_failure"),
         };
-        let expires_at_unix_seconds = match take_app_secret(&mut fields, "expires_at_epoch")
+        let expires_at_unix_microseconds = match take_app_secret(&mut fields, "expires_at_epoch_us")
             .and_then(|value| value.as_str().parse::<u64>().ok())
         {
-            Some(value) if value > unix_time_seconds() => value,
+            Some(value) if value > unix_time_microseconds() => value,
             _ => return g5_error_json("protocol_failure"),
         };
         let mut inner = lock_inner(&self.shared);
@@ -663,7 +663,7 @@ impl RuntimeManager {
             id: grant_id,
             domain_id: "dom_synthetic_a".to_owned(),
             expires_at: expires_at.clone(),
-            expires_at_unix_seconds,
+            expires_at_unix_microseconds,
         });
         format!(
             "{{\"ok\":true,\"grant_active\":true,\"domain_id\":\"dom_synthetic_a\",\"expires_at\":{}}}",
@@ -2071,28 +2071,31 @@ fn unix_time_ms() -> u128 {
         .as_millis()
 }
 
-fn unix_time_seconds() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
+fn unix_time_microseconds() -> u64 {
+    u64::try_from(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_micros(),
+    )
+    .unwrap_or(u64::MAX)
 }
 
 fn expire_cached_authorization(inner: &mut Inner) {
-    expire_cached_authorization_at(inner, unix_time_seconds());
+    expire_cached_authorization_at(inner, unix_time_microseconds());
 }
 
 fn expire_cached_authorization_at(inner: &mut Inner, now: u64) {
     if inner
         .g5_session
         .as_ref()
-        .is_some_and(|session| session.expires_at_unix_seconds <= now)
+        .is_some_and(|session| session.expires_at_unix_microseconds <= now)
     {
         inner.g5_session = None;
         inner.g5_grant = None;
     }
     if inner.g5_grant.as_ref().is_some_and(|grant| {
-        grant.expires_at_unix_seconds <= now
+        grant.expires_at_unix_microseconds <= now
             || inner
                 .g5_session
                 .as_ref()
@@ -2845,14 +2848,14 @@ mod tests {
             token: SecretText::new("S1".to_owned()),
             csrf_token: SecretText::new("synthetic-csrf".to_owned()),
             expires_at: "synthetic-expiry".to_owned(),
-            expires_at_unix_seconds: 100,
+            expires_at_unix_microseconds: 100,
         });
         inner.g5_grant = Some(G5Grant {
             session_token: SecretText::new("S1".to_owned()),
             id: "synthetic-grant".to_owned(),
             domain_id: "dom_synthetic_a".to_owned(),
             expires_at: "synthetic-expiry".to_owned(),
-            expires_at_unix_seconds: 200,
+            expires_at_unix_microseconds: 200,
         });
         expire_cached_authorization_at(&mut inner, 99);
         assert!(inner.g5_session.is_some() && inner.g5_grant.is_some());
@@ -2864,7 +2867,7 @@ mod tests {
             id: "synthetic-expiring-grant".to_owned(),
             domain_id: "dom_synthetic_a".to_owned(),
             expires_at: "synthetic-expiry".to_owned(),
-            expires_at_unix_seconds: 99,
+            expires_at_unix_microseconds: 99,
         });
         expire_cached_authorization_at(&mut inner, 98);
         assert!(inner.g5_session.is_some() && inner.g5_grant.is_some());
@@ -2875,10 +2878,46 @@ mod tests {
             id: "synthetic-grant-2".to_owned(),
             domain_id: "dom_synthetic_a".to_owned(),
             expires_at: "synthetic-expiry".to_owned(),
-            expires_at_unix_seconds: 200,
+            expires_at_unix_microseconds: 200,
         });
         expire_cached_authorization_at(&mut inner, 100);
         assert!(inner.g5_session.is_none() && inner.g5_grant.is_none());
+    }
+
+    #[test]
+    fn fractional_grant_deadline_keeps_750ms_and_expires_without_grace() {
+        let manager = manager();
+        let mut inner = lock_inner(&manager.shared);
+        let fields = parse_application_response(b"ok=true\nexpires_at_epoch_us=1750000\n").unwrap();
+        let deadline = app_field(&fields, "expires_at_epoch_us")
+            .unwrap()
+            .parse::<u64>()
+            .unwrap();
+        assert_eq!(deadline, 1_750_000);
+        inner.g5_session = Some(G5Session {
+            runtime_instance_id: "synthetic-generation".to_owned(),
+            token: SecretText::new("synthetic-session".to_owned()),
+            csrf_token: SecretText::new("synthetic-csrf".to_owned()),
+            expires_at: "synthetic-expiry".to_owned(),
+            expires_at_unix_microseconds: 3_750_000,
+        });
+        inner.g5_grant = Some(G5Grant {
+            session_token: SecretText::new("synthetic-session".to_owned()),
+            id: "synthetic-grant".to_owned(),
+            domain_id: "dom_synthetic_a".to_owned(),
+            expires_at: "synthetic-expiry".to_owned(),
+            expires_at_unix_microseconds: deadline,
+        });
+        expire_cached_authorization_at(&mut inner, 1_000_000);
+        assert!(inner.g5_session.is_some() && inner.g5_grant.is_some());
+        expire_cached_authorization_at(&mut inner, deadline - 1);
+        assert!(inner.g5_session.is_some() && inner.g5_grant.is_some());
+        expire_cached_authorization_at(&mut inner, deadline);
+        assert!(inner.g5_session.is_some() && inner.g5_grant.is_none());
+        expire_cached_authorization_at(&mut inner, 3_750_000 - 1);
+        assert!(inner.g5_session.is_some());
+        expire_cached_authorization_at(&mut inner, 3_750_000);
+        assert!(inner.g5_session.is_none());
     }
 
     struct FastApiChild {
