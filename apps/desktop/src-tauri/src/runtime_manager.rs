@@ -324,8 +324,10 @@ enum SupervisorMessage {
     StdoutClosed,
     StdoutFailed,
     Stop(Sender<RuntimeSnapshot>),
-    #[cfg(test)]
+    #[cfg(any(test, feature = "mac003-production-supervisor-test"))]
     CloseControl(Sender<()>),
+    #[cfg(feature = "mac003-production-supervisor-test")]
+    CrashChildForIntegration(Sender<bool>),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -979,11 +981,11 @@ impl RuntimeManager {
         lock_inner(&self.shared).transport_snapshot.clone()
     }
 
-    fn start_test(&self) -> Result<RuntimeSnapshot, ManagerError> {
+    fn start_runtime(&self) -> Result<RuntimeSnapshot, ManagerError> {
         self.start_mode(HelperMode::Normal, false)
     }
 
-    fn restart_test(&self) -> Result<RuntimeSnapshot, ManagerError> {
+    fn restart_runtime(&self) -> Result<RuntimeSnapshot, ManagerError> {
         self.start_mode(HelperMode::Normal, true)
     }
 
@@ -1278,7 +1280,7 @@ impl RuntimeManager {
         self.start_mode_with_stale_id(HelperMode::StaleReadiness, false, Some(stale_instance_id))
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "mac003-production-supervisor-test"))]
     fn wait_for_state(&self, target: RuntimeState, timeout: Duration) -> RuntimeSnapshot {
         let deadline = Instant::now() + timeout;
         let mut inner = lock_inner(&self.shared);
@@ -1306,7 +1308,7 @@ impl RuntimeManager {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "mac003-production-supervisor-test"))]
     fn wait_for_transport_state(
         &self,
         target: TransportState,
@@ -1338,7 +1340,7 @@ impl RuntimeManager {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "mac003-production-supervisor-test"))]
     fn transport_session_for_test(&self) -> Arc<TransportSession> {
         lock_inner(&self.shared)
             .transport_session
@@ -1346,14 +1348,14 @@ impl RuntimeManager {
             .expect("active generation has a transport session")
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "mac003-production-supervisor-test"))]
     fn close_control_for_test(&self) {
         self.queue_control_close_for_test()
             .recv_timeout(Duration::from_secs(1))
             .expect("supervisor closed the control pipe");
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "mac003-production-supervisor-test"))]
     fn queue_control_close_for_test(&self) -> Receiver<()> {
         let sender = lock_inner(&self.shared)
             .supervisor
@@ -1366,9 +1368,58 @@ impl RuntimeManager {
         received
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "mac003-production-supervisor-test"))]
     fn has_supervisor(&self) -> bool {
         lock_inner(&self.shared).supervisor.is_some()
+    }
+
+    #[cfg(feature = "mac003-production-supervisor-test")]
+    fn crash_child_for_integration_test(&self) -> Result<(), &'static str> {
+        let sender = lock_inner(&self.shared)
+            .supervisor
+            .clone()
+            .ok_or("supervisor unavailable for crash injection")?;
+        let (reply, received) = mpsc::channel();
+        sender
+            .send(SupervisorMessage::CrashChildForIntegration(reply))
+            .map_err(|_| "supervisor rejected crash injection")?;
+        if received
+            .recv_timeout(Duration::from_secs(2))
+            .map_err(|_| "supervisor did not acknowledge crash injection")?
+        {
+            Ok(())
+        } else {
+            Err("supervisor could not inject child crash")
+        }
+    }
+
+    #[cfg(feature = "mac003-production-supervisor-test")]
+    fn g5_missions_list_server_probe_for_integration_test(&self) -> String {
+        let _operation = self
+            .g5_operation
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let (_instance_id, transport, token, _csrf_token) = match self.g5_credentials_for_active() {
+            Ok(value) => value,
+            Err(error) => return g5_error_json(error),
+        };
+        let body = SecretBytes::new(encode_application_fields(&[
+            ("session_token", token.as_str()),
+            ("domain_id", "dom_synthetic_a"),
+        ]));
+        let response = match transport.call_g5_application("/v1/app/missions/list", body.as_slice())
+        {
+            Ok(value) => SecretBytes::new(value),
+            Err(_) => return g5_error_json("transport_failure"),
+        };
+        let fields = match parse_application_response(response.as_slice()) {
+            Ok(value) => value,
+            Err(()) => return g5_error_json("protocol_failure"),
+        };
+        if let Some(error) = app_response_error(&fields) {
+            return g5_error_json(error);
+        }
+        g5_error_json("operation_failed")
     }
 }
 
@@ -1382,6 +1433,344 @@ impl Drop for RuntimeManager {
     fn drop(&mut self) {
         let _ = self.stop_and_wait();
     }
+}
+
+#[cfg(feature = "mac003-production-supervisor-test")]
+struct ProductionSupervisorTestCleanup {
+    scratch: PathBuf,
+    transport_directories: Vec<PathBuf>,
+}
+
+#[cfg(feature = "mac003-production-supervisor-test")]
+impl Drop for ProductionSupervisorTestCleanup {
+    fn drop(&mut self) {
+        for directory in &self.transport_directories {
+            let _ = std::fs::remove_dir(directory);
+        }
+        for suffix in ["", "-wal", "-shm"] {
+            let path = PathBuf::from(format!(
+                "{}{}",
+                self.scratch.join("synthetic.sqlite3").display(),
+                suffix
+            ));
+            let _ = std::fs::remove_file(path);
+        }
+        let _ = std::fs::remove_dir(&self.scratch);
+        env::remove_var("JARVIS_LOCAL_PASSPHRASE");
+        env::remove_var("JARVIS_DATABASE_PATH");
+    }
+}
+
+/// Integration entrypoint compiled into the library dependency without `cfg(test)`.
+/// The manager therefore selects the same Python/serve.py launcher as the Tauri release build.
+#[cfg(feature = "mac003-production-supervisor-test")]
+pub fn run_production_supervisor_integration() -> Result<(), &'static str> {
+    let api_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../api")
+        .canonicalize()
+        .map_err(|_| "API source root is unavailable")?;
+    let python = api_root.join(".venv/bin/python");
+    if !python.is_file() {
+        return Err("API virtualenv is unavailable; no dependencies were installed");
+    }
+
+    let scratch = env::temp_dir().join(format!(
+        "mac003-production-supervisor-{}-{}",
+        std::process::id(),
+        unix_time_microseconds()
+    ));
+    std::fs::create_dir(&scratch).map_err(|_| "synthetic test directory could not be created")?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&scratch, std::fs::Permissions::from_mode(0o700))
+            .map_err(|_| "synthetic test directory permissions could not be set")?;
+    }
+    let mut cleanup = ProductionSupervisorTestCleanup {
+        scratch: scratch.clone(),
+        transport_directories: Vec::new(),
+    };
+    let database = scratch.join("synthetic.sqlite3");
+    let passphrase = format!("synthetic-supervisor-{}", unix_time_microseconds());
+    env::set_var("JARVIS_LOCAL_PASSPHRASE", &passphrase);
+    env::set_var("JARVIS_DATABASE_PATH", &database);
+
+    let seed = std::process::Command::new(&python)
+        .arg("-B")
+        .arg("-c")
+        .arg("from memory_store import SQLiteMemoryStore; from mission_repository import MissionRepository; import os; store=SQLiteMemoryStore(os.environ['JARVIS_DATABASE_PATH']); store.initialize(); MissionRepository(store).create('owner', 'MAC003 synthetic supervisor mission', 'dom_synthetic_a', 'mac003-production-supervisor-seed')")
+        .current_dir(&api_root)
+        .env_clear()
+        .env("JARVIS_DATABASE_PATH", &database)
+        .env("PYTHONDONTWRITEBYTECODE", "1")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map_err(|_| "synthetic database seeder could not start")?;
+    if !seed.success() {
+        return Err("synthetic database seeder failed");
+    }
+
+    let manager = RuntimeManager::new();
+    let result = (|| {
+        let first_start = manager
+            .start_runtime()
+            .map_err(|_| "production RuntimeManager failed to spawn FastAPI")?;
+        let first_id = first_start
+            .runtime_instance_id
+            .clone()
+            .ok_or("production RuntimeManager omitted its generation ID")?;
+        let first_ready = manager.wait_for_state(RuntimeState::Ready, Duration::from_secs(30));
+        if first_ready.runtime_instance_id.as_deref() != Some(first_id.as_str()) {
+            return Err("FastAPI did not reach authenticated RuntimeManager READY");
+        }
+        let first_transport =
+            manager.wait_for_transport_state(TransportState::Ready, Duration::from_secs(30));
+        if first_transport.runtime_instance_id.as_deref() != Some(first_id.as_str()) {
+            return Err("FastAPI UDS proof did not reach transport READY");
+        }
+        let first_session = manager.transport_session_for_test();
+        cleanup
+            .transport_directories
+            .push(first_session.directory_path().to_owned());
+
+        if !manager
+            .g5_session_open(passphrase.clone())
+            .contains("\"session_active\":true")
+        {
+            return Err("synthetic passphrase did not open a G5 session");
+        }
+        if !manager
+            .g5_mission_read_grant_create()
+            .contains("\"grant_active\":true")
+        {
+            return Err("explicit mission:read grant creation failed");
+        }
+        let missions = manager.g5_missions_list();
+        if !missions.contains("MAC003 synthetic supervisor mission")
+            || !missions.contains("\"dataset\":\"api_synthetic\"")
+        {
+            return Err("G5 list did not return the synthetic mission");
+        }
+        eprintln!("production_supervisor stage=ready_g5_grant_read_revoke PASS");
+
+        let direct_probe = run_same_uid_uds_probe(&python, first_session.directory_path())?;
+        eprintln!("same_uid_uds_probe={direct_probe}");
+        if direct_probe.trim_end()
+            != "health=200;version=200;proof=200;open=credential_rejected;close=session_required;grant=session_required;revoke=session_required;read=session_required"
+        {
+            return Err("same-UID direct UDS probe crossed an unexpected authorization boundary");
+        }
+
+        if !manager
+            .g5_mission_read_grant_revoke()
+            .contains("\"grant_active\":false")
+        {
+            return Err("grant revocation failed");
+        }
+        let local_denial = manager.g5_missions_list();
+        if !local_denial.contains("concessão de leitura está ausente") {
+            return Err("Rust cache did not deny mission read after revocation");
+        }
+        let server_denial = manager.g5_missions_list_server_probe_for_integration_test();
+        if !server_denial.contains("concessão de leitura está ausente") {
+            return Err("FastAPI did not deny mission read after grant revocation");
+        }
+
+        if !manager
+            .g5_mission_read_grant_create()
+            .contains("\"grant_active\":true")
+            || !manager
+                .g5_session_close()
+                .contains("\"session_active\":false")
+            || !manager
+                .g5_session_open(passphrase.clone())
+                .contains("\"session_active\":true")
+            || !manager
+                .g5_session_status_json()
+                .contains("\"grant_active\":false")
+        {
+            return Err("closing and reopening a session did not clear its grant");
+        }
+
+        let first_pid = first_ready
+            .pid
+            .ok_or("READY omitted the supervised child PID")?;
+        let stopped = manager
+            .stop_and_wait()
+            .map_err(|_| "RuntimeManager STOP did not complete")?;
+        if stopped.state != RuntimeState::Stopped || stopped.exit_code != Some(0) {
+            return Err("RuntimeManager STOP did not produce normal STOPPED exit");
+        }
+        if manager.has_supervisor() || !first_session.is_clean_for_test() {
+            return Err("STOP left a supervisor, capability, or UDS socket active");
+        }
+        if !child_pid_is_reaped(first_pid) {
+            return Err("RuntimeManager STOP returned before the FastAPI child was reaped");
+        }
+        eprintln!("production_supervisor stage=STOP_reap_uds_cleanup PASS");
+
+        let eof_start = manager
+            .start_runtime()
+            .map_err(|_| "RuntimeManager failed to start the EOF generation")?;
+        let eof_id = eof_start
+            .runtime_instance_id
+            .clone()
+            .ok_or("EOF generation omitted its ID")?;
+        let eof_ready = manager.wait_for_state(RuntimeState::Ready, Duration::from_secs(30));
+        if eof_ready.runtime_instance_id.as_deref() != Some(eof_id.as_str()) {
+            return Err("EOF generation did not become READY");
+        }
+        manager.wait_for_transport_state(TransportState::Ready, Duration::from_secs(30));
+        let eof_session = manager.transport_session_for_test();
+        cleanup
+            .transport_directories
+            .push(eof_session.directory_path().to_owned());
+        let eof_pid = eof_ready.pid.ok_or("EOF READY omitted child PID")?;
+        manager.close_control_for_test();
+        let eof_exit = manager.wait_for_state(RuntimeState::Stopped, Duration::from_secs(15));
+        if eof_exit.failure_category != Some("supervisor_lost") || eof_exit.exit_code != Some(48) {
+            return Err("FastAPI stdin EOF did not produce supervisor_lost STOPPED");
+        }
+        if manager.has_supervisor() || !eof_session.is_clean_for_test() {
+            return Err("EOF left a supervisor, capability, or UDS socket active");
+        }
+        if !child_pid_is_reaped(eof_pid) {
+            return Err("RuntimeManager did not reap the FastAPI child after EOF");
+        }
+        eprintln!("production_supervisor stage=EOF_supervisor_lost_reap_cleanup PASS");
+
+        let crash_start = manager
+            .start_runtime()
+            .map_err(|_| "RuntimeManager failed to start the crash generation")?;
+        let crash_id = crash_start
+            .runtime_instance_id
+            .clone()
+            .ok_or("crash generation omitted its ID")?;
+        let crash_ready = manager.wait_for_state(RuntimeState::Ready, Duration::from_secs(30));
+        if crash_ready.runtime_instance_id.as_deref() != Some(crash_id.as_str()) {
+            return Err("crash generation did not become READY");
+        }
+        manager.wait_for_transport_state(TransportState::Ready, Duration::from_secs(30));
+        let crash_session = manager.transport_session_for_test();
+        cleanup
+            .transport_directories
+            .push(crash_session.directory_path().to_owned());
+        let crashed_pid = crash_ready.pid.ok_or("crash READY omitted child PID")?;
+        manager.crash_child_for_integration_test()?;
+        let crashed = manager.wait_for_state(RuntimeState::Crashed, Duration::from_secs(15));
+        if crashed.failure_category != Some("child_crash") {
+            return Err("supervisor did not classify the injected child crash");
+        }
+        if manager.has_supervisor() || !crash_session.is_clean_for_test() {
+            return Err("crash left a supervisor, capability, or UDS socket active");
+        }
+        if !child_pid_is_reaped(crashed_pid) {
+            return Err("RuntimeManager did not reap the crashed FastAPI child");
+        }
+        eprintln!("production_supervisor stage=crash_reap PASS");
+
+        let restart_start = manager
+            .restart_runtime()
+            .map_err(|_| "RuntimeManager explicit restart after crash failed")?;
+        let restart_id = restart_start
+            .runtime_instance_id
+            .as_deref()
+            .ok_or("restarted generation omitted its ID")?;
+        if restart_id == crash_id {
+            return Err("restart reused the crashed generation ID");
+        }
+        let restart_ready = manager.wait_for_state(RuntimeState::Ready, Duration::from_secs(30));
+        if restart_ready.runtime_instance_id.as_deref() != Some(restart_id) {
+            return Err("restarted FastAPI generation did not reach READY");
+        }
+        manager.wait_for_transport_state(TransportState::Ready, Duration::from_secs(30));
+        let restart_session = manager.transport_session_for_test();
+        cleanup
+            .transport_directories
+            .push(restart_session.directory_path().to_owned());
+        let restart_pid = restart_ready.pid.ok_or("restart READY omitted child PID")?;
+        let final_stop = manager
+            .stop_and_wait()
+            .map_err(|_| "RuntimeManager STOP after restart failed")?;
+        if final_stop.state != RuntimeState::Stopped
+            || final_stop.exit_code != Some(0)
+            || manager.has_supervisor()
+            || !restart_session.is_clean_for_test()
+            || !child_pid_is_reaped(restart_pid)
+        {
+            return Err("restarted FastAPI generation did not STOP and clean up");
+        }
+        eprintln!("production_supervisor stage=restart_READY_STOP_reap_cleanup PASS");
+        Ok(())
+    })();
+    drop(manager);
+    result
+}
+
+#[cfg(feature = "mac003-production-supervisor-test")]
+fn run_same_uid_uds_probe(python: &Path, directory: &Path) -> Result<String, &'static str> {
+    const PROBE: &str = r#"
+import secrets, socket, sys
+sock_path = sys.argv[1]
+def request(method, path, body=b""):
+    conn = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    conn.settimeout(3)
+    conn.connect(sock_path)
+    head = (f"{method} {path} HTTP/1.1\r\nHost: jarvis.local\r\nContent-Type: text/plain\r\nContent-Length: {len(body)}\r\nConnection: close\r\n\r\n").encode("ascii")
+    conn.sendall(head + body)
+    chunks = []
+    while True:
+        chunk = conn.recv(4096)
+        if not chunk:
+            break
+        chunks.append(chunk)
+    conn.close()
+    raw = b"".join(chunks)
+    head, _, body = raw.partition(b"\r\n\r\n")
+    status = int(head.split(b"\r\n", 1)[0].split()[1])
+    code = ""
+    for line in body.splitlines():
+        if line.startswith(b"code="):
+            candidate = line[5:].decode("ascii", errors="strict")
+            if candidate in {"credential_rejected", "session_required", "grant_required"}:
+                code = candidate
+    return status, code
+health, _ = request("GET", "/v1/health")
+version, _ = request("GET", "/v1/version")
+proof, _ = request("POST", "/v1/instance-proof", secrets.token_hex(32).encode("ascii"))
+opened = request("POST", "/v1/app/session/open", b"passphrase=wrong-synthetic-probe\n")
+closed = request("POST", "/v1/app/session/close", b"session_token=fake-session\ncsrf_token=fake-csrf\n")
+granted = request("POST", "/v1/app/grants/mission-read", b"session_token=fake-session\ncsrf_token=fake-csrf\ndomain_id=dom_synthetic_a\n")
+revoked = request("POST", "/v1/app/grants/mission-read/revoke", b"session_token=fake-session\ncsrf_token=fake-csrf\ngrant_id=fake-grant\n")
+listed = request("POST", "/v1/app/missions/list", b"session_token=fake-session\ndomain_id=dom_synthetic_a\n")
+print(f"health={health};version={version};proof={proof};open={opened[1]};close={closed[1]};grant={granted[1]};revoke={revoked[1]};read={listed[1]}")
+"#;
+    let output = std::process::Command::new(python)
+        .arg("-B")
+        .arg("-c")
+        .arg(PROBE)
+        .arg(directory.join("runtime.sock"))
+        .env_clear()
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()
+        .map_err(|_| "same-UID probe process could not start")?;
+    if !output.status.success() {
+        return Err("same-UID probe process failed");
+    }
+    String::from_utf8(output.stdout).map_err(|_| "same-UID probe returned invalid status text")
+}
+
+#[cfg(feature = "mac003-production-supervisor-test")]
+fn child_pid_is_reaped(pid: u32) -> bool {
+    std::process::Command::new("/bin/kill")
+        .arg("-0")
+        .arg(pid.to_string())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| !status.success())
 }
 
 fn lock_inner(shared: &Shared) -> MutexGuard<'_, Inner> {
@@ -1946,10 +2335,14 @@ fn supervise_child(
                     }
                 }
             }
-            #[cfg(test)]
+            #[cfg(any(test, feature = "mac003-production-supervisor-test"))]
             SupervisorMessage::CloseControl(reply) => {
                 drop(stdin.take());
                 let _ = reply.send(());
+            }
+            #[cfg(feature = "mac003-production-supervisor-test")]
+            SupervisorMessage::CrashChildForIntegration(reply) => {
+                let _ = reply.send(child.kill().is_ok());
             }
         }
     }
@@ -2736,7 +3129,7 @@ pub fn g5_missions_list(manager: tauri::State<'_, RuntimeManager>) -> String {
 
 #[tauri::command]
 pub fn runtime_start(manager: tauri::State<'_, RuntimeManager>) -> String {
-    let result = manager.start_test();
+    let result = manager.start_runtime();
     command_result(&manager, "start", result)
 }
 
@@ -2748,7 +3141,7 @@ pub fn runtime_stop(manager: tauri::State<'_, RuntimeManager>) -> String {
 
 #[tauri::command]
 pub fn runtime_restart(manager: tauri::State<'_, RuntimeManager>) -> String {
-    let result = manager.restart_test();
+    let result = manager.restart_runtime();
     command_result(&manager, "restart", result)
 }
 
@@ -3108,7 +3501,7 @@ mod tests {
     fn stopped_starting_ready_stopping_stopped() {
         let manager = manager();
         assert_eq!(manager.snapshot().state, RuntimeState::Stopped);
-        let started = manager.start_test().unwrap();
+        let started = manager.start_runtime().unwrap();
         assert_eq!(started.state, RuntimeState::Starting);
         let ready = manager.wait_for_state(RuntimeState::Ready, Duration::from_secs(2));
         assert_eq!(ready.runtime_instance_id, started.runtime_instance_id);
@@ -3142,8 +3535,8 @@ mod tests {
     fn separate_managers_and_stale_generations_cannot_cross_authenticate() {
         let manager_a = manager();
         let manager_b = manager();
-        manager_a.start_test().unwrap();
-        manager_b.start_test().unwrap();
+        manager_a.start_runtime().unwrap();
+        manager_b.start_runtime().unwrap();
         manager_a.wait_for_state(RuntimeState::Ready, Duration::from_secs(2));
         manager_b.wait_for_state(RuntimeState::Ready, Duration::from_secs(2));
         manager_a.wait_for_transport_state(TransportState::Ready, Duration::from_secs(2));
@@ -3168,7 +3561,7 @@ mod tests {
         assert!(session_a.is_clean_for_test());
         assert_eq!(manager_b.transport_status_json().contains("READY"), true);
 
-        let generation_b = manager_a.start_test().unwrap();
+        let generation_b = manager_a.start_runtime().unwrap();
         manager_a.wait_for_state(RuntimeState::Ready, Duration::from_secs(2));
         manager_a.wait_for_transport_state(TransportState::Ready, Duration::from_secs(2));
         let session_generation_b = manager_a.transport_session_for_test();
@@ -3193,7 +3586,7 @@ mod tests {
     #[test]
     fn concurrent_probes_are_serialized_and_publish_first_completed_result() {
         let manager = Arc::new(manager());
-        manager.start_test().unwrap();
+        manager.start_runtime().unwrap();
         manager.wait_for_state(RuntimeState::Ready, Duration::from_secs(2));
         manager.wait_for_transport_state(TransportState::Ready, Duration::from_secs(2));
 
@@ -3323,7 +3716,7 @@ mod tests {
         );
         assert_clean(&manager);
 
-        manager.start_test().unwrap();
+        manager.start_runtime().unwrap();
         manager.wait_for_state(RuntimeState::Ready, Duration::from_secs(2));
         assert_eq!(
             manager.stop_and_wait().unwrap().state,
@@ -3335,8 +3728,8 @@ mod tests {
     #[test]
     fn duplicate_start_is_rejected_without_second_child() {
         let manager = manager();
-        let first = manager.start_test().unwrap();
-        let second = manager.start_test();
+        let first = manager.start_runtime().unwrap();
+        let second = manager.start_runtime();
         assert_eq!(second.unwrap_err(), ManagerError::InvalidState);
         assert_eq!(
             manager.snapshot().runtime_instance_id,
@@ -3350,10 +3743,10 @@ mod tests {
     #[test]
     fn duplicate_start_while_ready_returns_existing_instance_error() {
         let manager = manager();
-        let first = manager.start_test().unwrap();
+        let first = manager.start_runtime().unwrap();
         manager.wait_for_state(RuntimeState::Ready, Duration::from_secs(2));
         assert_eq!(
-            manager.start_test().unwrap_err(),
+            manager.start_runtime().unwrap_err(),
             ManagerError::InvalidState
         );
         assert_eq!(
@@ -3368,7 +3761,7 @@ mod tests {
     #[test]
     fn duplicate_stop_is_idempotent() {
         let manager = manager();
-        manager.start_test().unwrap();
+        manager.start_runtime().unwrap();
         manager.wait_for_state(RuntimeState::Ready, Duration::from_secs(2));
         manager.request_stop().unwrap();
         assert_eq!(
@@ -3419,7 +3812,7 @@ mod tests {
         let crashed = manager.wait_for_state(RuntimeState::Crashed, Duration::from_secs(2));
         assert_eq!(crashed.runtime_instance_id, first.runtime_instance_id);
 
-        let restarted = manager.restart_test().unwrap();
+        let restarted = manager.restart_runtime().unwrap();
         assert_eq!(restarted.state, RuntimeState::Starting);
         assert_ne!(restarted.runtime_instance_id, first.runtime_instance_id);
         manager.wait_for_state(RuntimeState::Ready, Duration::from_secs(2));
@@ -3441,7 +3834,7 @@ mod tests {
     #[test]
     fn stale_readiness_is_ignored() {
         let manager = manager();
-        let previous = manager.start_test().unwrap();
+        let previous = manager.start_runtime().unwrap();
         manager.wait_for_state(RuntimeState::Ready, Duration::from_secs(2));
         manager.stop_and_wait().unwrap();
         let previous_id = previous.runtime_instance_id.unwrap();
@@ -3493,7 +3886,7 @@ mod tests {
     #[test]
     fn cleanup_on_normal_application_shutdown() {
         let manager = manager();
-        manager.start_test().unwrap();
+        manager.start_runtime().unwrap();
         manager.wait_for_state(RuntimeState::Ready, Duration::from_secs(2));
         assert_eq!(
             manager.stop_and_wait().unwrap().state,
@@ -3512,7 +3905,7 @@ mod tests {
         );
 
         let manager = RuntimeManager::with_test_helper_executable(executable);
-        let started = manager.start_test().unwrap();
+        let started = manager.start_runtime().unwrap();
         assert_eq!(started.state, RuntimeState::Starting);
         let ready = manager.wait_for_state(RuntimeState::Ready, Duration::from_secs(8));
         assert_eq!(ready.runtime_instance_id, started.runtime_instance_id);
@@ -3590,7 +3983,7 @@ mod tests {
         let mut external = ExternalHelper::start();
         let manager = manager();
 
-        manager.start_test().unwrap();
+        manager.start_runtime().unwrap();
         manager.wait_for_state(RuntimeState::Ready, Duration::from_secs(2));
         external.assert_alive();
         manager.stop_and_wait().unwrap();
@@ -3601,7 +3994,7 @@ mod tests {
             .unwrap();
         manager.wait_for_state(RuntimeState::Crashed, Duration::from_secs(2));
         external.assert_alive();
-        manager.restart_test().unwrap();
+        manager.restart_runtime().unwrap();
         manager.wait_for_state(RuntimeState::Ready, Duration::from_secs(2));
         external.assert_alive();
         manager.stop_and_wait().unwrap();
@@ -3638,7 +4031,7 @@ mod tests {
             let results = Arc::clone(&results);
             workers.push(thread::spawn(move || {
                 barrier.wait();
-                results.lock().unwrap().push(manager.start_test());
+                results.lock().unwrap().push(manager.start_runtime());
             }));
         }
         barrier.wait();
@@ -3662,7 +4055,7 @@ mod tests {
         let start_barrier = Arc::clone(&barrier);
         let starter = thread::spawn(move || {
             start_barrier.wait();
-            start_manager.start_test()
+            start_manager.start_runtime()
         });
         let stop_manager = Arc::clone(&manager);
         let stop_barrier = Arc::clone(&barrier);
@@ -3694,7 +4087,7 @@ mod tests {
         let restart_barrier = Arc::clone(&barrier);
         let restarter = thread::spawn(move || {
             restart_barrier.wait();
-            restart_manager.restart_test()
+            restart_manager.restart_runtime()
         });
         let stop_manager = Arc::clone(&manager);
         let stop_barrier = Arc::clone(&barrier);
@@ -3715,7 +4108,7 @@ mod tests {
     fn restart_after_manual_stop_is_not_implicit_start() {
         let manager = manager();
         assert_eq!(
-            manager.restart_test().unwrap_err(),
+            manager.restart_runtime().unwrap_err(),
             ManagerError::InvalidState
         );
         assert_eq!(manager.snapshot().state, RuntimeState::Stopped);
@@ -3740,7 +4133,7 @@ mod tests {
     #[test]
     fn supervisor_eof_after_ready_revokes_capability_and_reaps_child() {
         let manager = manager();
-        manager.start_test().unwrap();
+        manager.start_runtime().unwrap();
         let ready = manager.wait_for_state(RuntimeState::Ready, Duration::from_secs(2));
         let session = manager.transport_session_for_test();
         manager.wait_for_transport_state(TransportState::Ready, Duration::from_secs(2));
@@ -3770,7 +4163,7 @@ mod tests {
     #[test]
     fn eof_and_stop_race_is_idempotent() {
         let manager = manager();
-        manager.start_test().unwrap();
+        manager.start_runtime().unwrap();
         manager.wait_for_state(RuntimeState::Ready, Duration::from_secs(2));
         manager.wait_for_transport_state(TransportState::Ready, Duration::from_secs(2));
         let session = manager.transport_session_for_test();
@@ -3811,7 +4204,7 @@ mod tests {
     #[test]
     fn supervisor_eof_during_proof_request_closes_child_without_late_response() {
         let manager = manager();
-        manager.start_test().unwrap();
+        manager.start_runtime().unwrap();
         manager.wait_for_state(RuntimeState::Ready, Duration::from_secs(2));
         manager.wait_for_transport_state(TransportState::Ready, Duration::from_secs(2));
         let session = manager.transport_session_for_test();
@@ -3955,7 +4348,7 @@ mod tests {
         for round in 0..500 {
             let manager = manager();
             manager
-                .start_test()
+                .start_runtime()
                 .unwrap_or_else(|error| panic!("round {round}: start failed: {error:?}"));
             manager.wait_for_state(RuntimeState::Ready, Duration::from_secs(2));
             manager.wait_for_transport_state(TransportState::Ready, Duration::from_secs(2));
@@ -3980,7 +4373,7 @@ mod tests {
     fn stress_supervisor_eof_200_rounds() {
         for round in 0..200 {
             let manager = manager();
-            manager.start_test().unwrap();
+            manager.start_runtime().unwrap();
             manager.wait_for_state(RuntimeState::Ready, Duration::from_secs(2));
             manager.wait_for_transport_state(TransportState::Ready, Duration::from_secs(2));
             let session = manager.transport_session_for_test();

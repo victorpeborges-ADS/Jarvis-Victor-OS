@@ -77,7 +77,7 @@ fn stopped_stop_does_not_adopt_a_concurrent_future_start() {
     let stopper = thread::spawn(move || stop_manager.stop_and_wait());
 
     captured.wait();
-    let started = manager.start_test();
+    let started = manager.start_runtime();
     release_stop_hook(&manager, &resume);
     let stopped = stopper.join().unwrap().unwrap();
     let started = started.unwrap();
@@ -97,7 +97,7 @@ fn stopped_stop_does_not_adopt_a_concurrent_future_start() {
 #[test]
 fn stop_of_ready_generation_does_not_wait_for_or_stop_a_new_generation() {
     let manager = Arc::new(manager());
-    let started_a = manager.start_test().unwrap();
+    let started_a = manager.start_runtime().unwrap();
     let ready_a = manager.wait_for_state(RuntimeState::Ready, Duration::from_secs(2));
     let instance_a = ready_a.runtime_instance_id.clone().unwrap();
     let (captured, resume) = install_stop_hook(&manager);
@@ -110,7 +110,7 @@ fn stop_of_ready_generation_does_not_wait_for_or_stop_a_new_generation() {
         stopped_a.runtime_instance_id.as_deref(),
         Some(instance_a.as_str())
     );
-    let started_b = manager.start_test().unwrap();
+    let started_b = manager.start_runtime().unwrap();
     assert_ne!(started_b.runtime_instance_id, started_a.runtime_instance_id);
     let ready_b = manager.wait_for_state(RuntimeState::Ready, Duration::from_secs(2));
     release_stop_hook(&manager, &resume);
@@ -150,7 +150,7 @@ fn stop_of_starting_generation_does_not_wait_for_a_new_generation() {
         stopped_a.runtime_instance_id.as_deref(),
         Some(instance_a.as_str())
     );
-    let started_b = manager.start_test().unwrap();
+    let started_b = manager.start_runtime().unwrap();
     assert_ne!(started_b.runtime_instance_id, started_a.runtime_instance_id);
     let ready_b = manager.wait_for_state(RuntimeState::Ready, Duration::from_secs(2));
     release_stop_hook(&manager, &resume);
@@ -177,7 +177,7 @@ fn stop_of_starting_generation_does_not_wait_for_a_new_generation() {
 #[test]
 fn stop_result_stays_with_a_while_b_is_starting() {
     let manager = Arc::new(manager());
-    let a = manager.start_test().unwrap();
+    let a = manager.start_runtime().unwrap();
     manager.wait_for_state(RuntimeState::Ready, Duration::from_secs(2));
     let (captured, resume) = install_stop_hook(&manager);
     let stop_manager = Arc::clone(&manager);
@@ -202,7 +202,7 @@ fn stop_result_stays_with_a_while_b_is_starting() {
 #[test]
 fn stop_result_stays_with_a_after_b_crashes_and_status_reports_b() {
     let manager = Arc::new(manager());
-    let a = manager.start_test().unwrap();
+    let a = manager.start_runtime().unwrap();
     manager.wait_for_state(RuntimeState::Ready, Duration::from_secs(2));
     let (captured, resume) = install_stop_hook(&manager);
     let stop_manager = Arc::clone(&manager);
@@ -227,7 +227,7 @@ fn stop_result_stays_with_a_after_b_crashes_and_status_reports_b() {
 #[test]
 fn concurrent_stop_calls_wait_for_the_same_generation() {
     let manager = Arc::new(manager());
-    let started = manager.start_test().unwrap();
+    let started = manager.start_runtime().unwrap();
     manager.wait_for_state(RuntimeState::Ready, Duration::from_secs(2));
     let left_manager = Arc::clone(&manager);
     let right_manager = Arc::clone(&manager);
@@ -254,8 +254,8 @@ fn concurrent_start_calls_create_only_one_child() {
     let right_manager = Arc::clone(&manager);
 
     let (left, right) = race_pair(
-        move || left_manager.start_test(),
-        move || right_manager.start_test(),
+        move || left_manager.start_runtime(),
+        move || right_manager.start_runtime(),
     );
 
     assert_eq!(
@@ -290,7 +290,7 @@ fn restart_racing_stop_has_explicit_results_and_cleans_its_target() {
     let stop_manager = Arc::clone(&manager);
 
     let (restart, stop) = race_pair(
-        move || restart_manager.restart_test(),
+        move || restart_manager.restart_runtime(),
         move || stop_manager.stop_and_wait(),
     );
 
@@ -322,8 +322,8 @@ fn concurrent_restarts_allow_exactly_one_new_generation() {
     let right_manager = Arc::clone(&manager);
 
     let (left, right) = race_pair(
-        move || left_manager.restart_test(),
-        move || right_manager.restart_test(),
+        move || left_manager.restart_runtime(),
+        move || right_manager.restart_runtime(),
     );
 
     assert_eq!(
@@ -355,7 +355,7 @@ fn late_events_from_generation_a_cannot_change_generation_b() {
     let instance_a = crashed_a.runtime_instance_id.unwrap();
     manager.request_stop().unwrap();
 
-    let started_b = manager.start_test().unwrap();
+    let started_b = manager.start_runtime().unwrap();
     let instance_b = started_b.runtime_instance_id.clone().unwrap();
     assert_ne!(instance_a, instance_b);
     let before_late_events = manager.snapshot();
@@ -425,8 +425,8 @@ fn stop_timeout_remains_an_error_for_its_still_active_target() {
 fn stopping_one_manager_does_not_stop_another_managers_child() {
     let manager_a = manager();
     let manager_b = manager();
-    let started_a = manager_a.start_test().unwrap();
-    let started_b = manager_b.start_test().unwrap();
+    let started_a = manager_a.start_runtime().unwrap();
+    let started_b = manager_b.start_runtime().unwrap();
     let ready_a = manager_a.wait_for_state(RuntimeState::Ready, Duration::from_secs(2));
     let ready_b = manager_b.wait_for_state(RuntimeState::Ready, Duration::from_secs(2));
     assert_ne!(ready_a.pid, ready_b.pid);
@@ -458,7 +458,7 @@ fn stress_start_stop_race_1000_rounds() {
         let start_manager = Arc::clone(&manager);
         let stop_manager = Arc::clone(&manager);
         let (start, stop) = race_pair(
-            move || start_manager.start_test(),
+            move || start_manager.start_runtime(),
             move || stop_manager.stop_and_wait(),
         );
         let start = start.unwrap_or_else(|error| panic!("round {round}: start failed: {error:?}"));

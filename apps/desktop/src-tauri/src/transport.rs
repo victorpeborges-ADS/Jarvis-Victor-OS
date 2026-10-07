@@ -329,7 +329,7 @@ impl TransportSession {
         self.probe_endpoint(&other.socket_path)
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "mac003-production-supervisor-test"))]
     pub(crate) fn is_clean_for_test(&self) -> bool {
         !self.active.load(Ordering::Acquire)
             && lock(&self.secret).is_none()
