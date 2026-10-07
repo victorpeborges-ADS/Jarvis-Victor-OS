@@ -13,24 +13,41 @@ from pathlib import Path
 from urllib.parse import quote, unquote
 
 import pytest
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 
 from memory_store import SQLiteMemoryStore
 from mission_repository import MissionRepository
 
 PASSPHRASE = "senha-sintetica-processo-mac003"
 SERVE = Path(__file__).with_name("serve.py")
-PROTOCOL_VERSION = "1"
+PROTOCOL_VERSION = "2"
 RUNTIME_KIND = "jarvis-synthetic"
-BUILD_ID = "g6-mac-003-fastapi-g5-v1"
+BUILD_ID = "g6-mac-002-2-encrypted-uds-v2"
+ENVELOPE_ROUTE = "/v2/secure"
+ENVELOPE_VERSION = 2
+APP_PATHS = {
+    "/v1/app/session/open",
+    "/v1/app/session/close",
+    "/v1/app/grants/mission-read",
+    "/v1/app/grants/mission-read/revoke",
+    "/v1/app/missions/list",
+}
 
 
-def _request(runtime_dir: Path, method: str, route: str, body: bytes = b"") -> tuple[int, bytes]:
+def _request(
+    runtime_dir: Path,
+    method: str,
+    route: str,
+    body: bytes = b"",
+    *,
+    content_type: str = "text/plain",
+) -> tuple[int, bytes]:
     wire = (
         f"{method} {route} HTTP/1.1\r\n"
         "Host: jarvis.local\r\n"
         "Connection: close\r\n"
         f"Content-Length: {len(body)}\r\n"
-        "Content-Type: text/plain\r\n\r\n"
+        f"Content-Type: {content_type}\r\n\r\n"
     ).encode("ascii") + body
     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
         client.settimeout(2)
@@ -56,6 +73,103 @@ def _fields(payload: bytes) -> dict[str, str]:
 
 def _body(**fields: str) -> bytes:
     return "".join(f"{name}={quote(value, safe='-_.~')}\n" for name, value in fields.items()).encode("ascii")
+
+
+def _envelope_key(secret: bytes, purpose: bytes, direction: bytes, instance_id: str) -> bytes:
+    context = (
+        b"jarvis-local-envelope-v2\x00"
+        + purpose
+        + b"\x00"
+        + direction
+        + b"\x00"
+        + instance_id.encode("ascii")
+    )
+    return hmac.new(secret, context, hashlib.sha256).digest()
+
+
+def _envelope_mac_message(instance_id: str, direction: bytes, nonce: bytes, ciphertext: bytes) -> bytes:
+    return (
+        b"jarvis-local-envelope-v2\x00"
+        + instance_id.encode("ascii")
+        + b"\x00"
+        + direction
+        + b"\x00/v2/secure\x00"
+        + nonce
+        + ciphertext
+    )
+
+
+def _seal(secret: bytes, instance_id: str, direction: bytes, nonce: bytes, plaintext: bytes) -> bytes:
+    encryption_key = _envelope_key(secret, b"encryption", direction, instance_id)
+    authentication_key = _envelope_key(secret, b"authentication", direction, instance_id)
+    cipher = Cipher(algorithms.AES(encryption_key), modes.CTR(nonce)).encryptor()
+    ciphertext = cipher.update(plaintext) + cipher.finalize()
+    tag = hmac.new(
+        authentication_key,
+        _envelope_mac_message(instance_id, direction, nonce, ciphertext),
+        hashlib.sha256,
+    ).digest()
+    return nonce + ciphertext + tag
+
+
+def _open(secret: bytes, instance_id: str, direction: bytes, envelope: bytes) -> tuple[bytes, bytes]:
+    nonce, ciphertext, tag = envelope[:16], envelope[16:-32], envelope[-32:]
+    authentication_key = _envelope_key(secret, b"authentication", direction, instance_id)
+    expected = hmac.new(
+        authentication_key,
+        _envelope_mac_message(instance_id, direction, nonce, ciphertext),
+        hashlib.sha256,
+    ).digest()
+    assert hmac.compare_digest(tag, expected)
+    encryption_key = _envelope_key(secret, b"encryption", direction, instance_id)
+    cipher = Cipher(algorithms.AES(encryption_key), modes.CTR(nonce)).decryptor()
+    return nonce, cipher.update(ciphertext) + cipher.finalize()
+
+
+class _AuthenticatedRuntimeClient:
+    def __init__(self, runtime_dir: Path, secret: bytes, instance_id: str):
+        self.runtime_dir = runtime_dir
+        self.secret = secret
+        self.instance_id = instance_id
+        self.prefix = b"proc-v2!"
+        self.sequence = 0
+
+    def make_envelope(self, method: str, path: str, body: bytes = b"") -> bytes:
+        assert method == "POST" and path in APP_PATHS
+        self.sequence += 1
+        nonce = self.prefix + self.sequence.to_bytes(8, "big")
+        path_bytes = path.encode("ascii")
+        plaintext = (
+            bytes([ENVELOPE_VERSION, 1])
+            + len(path_bytes).to_bytes(2, "big")
+            + len(body).to_bytes(4, "big")
+            + path_bytes
+            + body
+        )
+        return _seal(self.secret, self.instance_id, b"request", nonce, plaintext)
+
+    def exchange_envelope(self, envelope: bytes) -> tuple[int, bytes]:
+        return _request(
+            self.runtime_dir,
+            "POST",
+            ENVELOPE_ROUTE,
+            envelope,
+            content_type="application/octet-stream",
+        )
+
+    def request(self, method: str, path: str, body: bytes = b"") -> tuple[int, bytes]:
+        status, envelope = self.exchange_envelope(self.make_envelope(method, path, body))
+        return self.decode_response(status, envelope)
+
+    def decode_response(self, status: int, envelope: bytes) -> tuple[int, bytes]:
+        if status != 200:
+            return status, envelope
+        nonce, plaintext = _open(self.secret, self.instance_id, b"response", envelope)
+        assert len(plaintext) >= 7 and plaintext[0] == ENVELOPE_VERSION
+        inner_status = int.from_bytes(plaintext[1:3], "big")
+        body_length = int.from_bytes(plaintext[3:7], "big")
+        assert len(plaintext) == body_length + 7
+        return inner_status, plaintext[7:]
 
 
 def _start_runtime(runtime_dir: Path, database_path: Path, instance_id: str) -> tuple[subprocess.Popen, bytes]:
@@ -129,7 +243,7 @@ def test_supervised_fastapi_g5_vertical_flow_and_stop(tmp_path):
         status, proof = _request(runtime_dir, "POST", "/v1/instance-proof", nonce.encode("ascii"))
         proof_fields = _fields(proof)
         message = (
-            "jarvis-local-transport-proof-v1\n"
+            "jarvis-local-transport-proof-v2\n"
             f"{PROTOCOL_VERSION}\n{RUNTIME_KIND}\n"
             "native-process-generation-1\n"
             f"{BUILD_ID}\n{nonce}\n"
@@ -140,8 +254,41 @@ def test_supervised_fastapi_g5_vertical_flow_and_stop(tmp_path):
             proof_fields["proof"], hmac.new(secret, message, hashlib.sha256).hexdigest()
         )
 
-        status, opened = _request(
+        # Plain same-UID clients cannot invoke application routes without the generation capability.
+        direct_status, _ = _request(
             runtime_dir,
+            "POST",
+            "/v1/app/session/open",
+            _body(passphrase=PASSPHRASE),
+        )
+        assert direct_status == 404
+        wrong_client = _AuthenticatedRuntimeClient(
+            runtime_dir, b"x" * 32, "native-process-generation-1"
+        )
+        wrong_status, _ = wrong_client.request(
+            "POST",
+            "/v1/app/session/open",
+            _body(passphrase="passphrase-sintetica-incorreta"),
+        )
+        assert wrong_status == 401
+
+        replay_client = _AuthenticatedRuntimeClient(
+            runtime_dir, secret, "native-process-generation-1"
+        )
+        replay_envelope = replay_client.make_envelope(
+            "POST",
+            "/v1/app/session/open",
+            _body(passphrase="passphrase-sintetica-incorreta"),
+        )
+        first_status, first_envelope = replay_client.exchange_envelope(replay_envelope)
+        assert first_status == 200
+        replay_client.decode_response(first_status, first_envelope)
+        replay_status, _ = replay_client.exchange_envelope(replay_envelope)
+        assert replay_status == 409
+
+        client = replay_client
+
+        status, opened = client.request(
             "POST",
             "/v1/app/session/open",
             _body(passphrase=PASSPHRASE),
@@ -151,16 +298,14 @@ def test_supervised_fastapi_g5_vertical_flow_and_stop(tmp_path):
         assert session["ok"] == "true" and session["principal"] == "owner"
         assert PASSPHRASE not in opened.decode("ascii")
 
-        status, denied = _request(
-            runtime_dir,
+        status, denied = client.request(
             "POST",
             "/v1/app/missions/list",
             _body(session_token=session["session_token"], domain_id="dom_synthetic_a"),
         )
         assert status == 200 and _fields(denied) == {"ok": "false", "code": "grant_required"}
 
-        status, grant_response = _request(
-            runtime_dir,
+        status, grant_response = client.request(
             "POST",
             "/v1/app/grants/mission-read",
             _body(
@@ -173,8 +318,7 @@ def test_supervised_fastapi_g5_vertical_flow_and_stop(tmp_path):
         assert status == 200 and grant["ok"] == "true"
         assert grant["domain_id"] == "dom_synthetic_a"
 
-        status, read_response = _request(
-            runtime_dir,
+        status, read_response = client.request(
             "POST",
             "/v1/app/missions/list",
             _body(session_token=session["session_token"], domain_id="dom_synthetic_a"),
@@ -192,8 +336,7 @@ def test_supervised_fastapi_g5_vertical_flow_and_stop(tmp_path):
             "revision": "1",
         }
 
-        status, revoked = _request(
-            runtime_dir,
+        status, revoked = client.request(
             "POST",
             "/v1/app/grants/mission-read/revoke",
             _body(
@@ -204,8 +347,7 @@ def test_supervised_fastapi_g5_vertical_flow_and_stop(tmp_path):
         )
         assert status == 200 and _fields(revoked) == {"ok": "true", "revoked": "true"}
 
-        status, closed = _request(
-            runtime_dir,
+        status, closed = client.request(
             "POST",
             "/v1/app/session/close",
             _body(session_token=session["session_token"], csrf_token=session["csrf_token"]),

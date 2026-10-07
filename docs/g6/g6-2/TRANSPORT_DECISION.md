@@ -2,6 +2,8 @@
 
 **Escolha:** WebView → Tauri IPC → cliente Rust limitado → HTTP/1.1 em UDS → runtime sintético. A decisão detalhada, incluindo opções A–D, está no [ADR-011](../../adr/011-local-desktop-runtime-transport.md).
 
+**Emenda MAC-002.2:** a prova HMAC do handshake autentica o runtime para o cliente, mas não protege uma requisição posterior se o pathname UDS for trocado. Antes de enviar qualquer byte por uma conexão, Rust agora valida `LOCAL_PEERPID` contra o child supervisionado. As operações G5 são envelopadas em AES-256-CTR + HMAC-SHA-256 por direção e por geração. A rota externa única `/v2/secure` falha fechada em versões incompatíveis; o protocolo está descrito em [MAC_002_2_ENCRYPTED_UDS.md](MAC_002_2_ENCRYPTED_UDS.md).
+
 | Pergunta | Resposta | Motivo |
 |---|---|---|
 | TRANSPORT SELECTED | Tauri IPC → UDS HTTP | Compatibiliza canal nativo sem TCP com HTTP/1.1 que Uvicorn pode servir futuramente. |
@@ -10,7 +12,7 @@
 | UDS | YES | Socket por geração em diretório privado, removido em stop/crash. |
 | RUNTIME SECRET EXPOSED TO WEBVIEW | NO | Capacidade vive somente em Rust e no processo filho. |
 | CORS REQUIRED | NO | WebView não faz HTTP ao runtime. O helper não instala middleware CORS. |
-| CSRF REQUIRED ON INTERNAL RUNTIME CHANNEL | NO | Não há requisição browser-originated ao canal interno. Clientes locais ainda precisam da prova HMAC; CORS/ausência de CSRF não os autoriza. |
+| CSRF REQUIRED ON INTERNAL RUNTIME CHANNEL | NO | Não há requisição browser-originated ao canal interno. Cada operação local exige envelope autenticado e cifrado; a WebView não recebe a capability. |
 | CSP CHANGE REQUIRED | NO | A CSP existente já permite Tauri IPC e não precisa de HTTP/UDS. |
 
 ## Auditoria do stack presente
@@ -27,7 +29,7 @@ Uma alternativa TCP precisaria bindar `127.0.0.1:0` e obter a porta efêmera dir
 
 ## Host, Origin, CORS e CSRF
 
-O cliente nativo envia `Host: jarvis.local`; o helper valida esse valor fixo e recusa qualquer `Origin`. A solicitação é HTTP apenas no framing e nas rotas tipadas sobre UDS. Não há CORS. CSRF não é o controle de autenticação deste canal: a capacidade HMAC de sessão autentica o helper também contra clientes nativos locais sem acesso à capacidade.
+O cliente nativo envia `Host: jarvis.local`; o helper valida esse valor fixo e recusa qualquer `Origin`. O framing HTTP leva health/version/proof de controle e um envelope opaco para operações; G5 só é despachado depois da autenticação do envelope. Não há CORS. A prova de handshake autentica o runtime para Rust; o envelope autentica cada solicitação para o servidor e cada resposta para Rust, e também cifra ambos os sentidos.
 
 ## CSP e superfície Tauri
 

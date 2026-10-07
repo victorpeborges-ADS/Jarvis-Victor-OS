@@ -4,16 +4,24 @@ import time
 from datetime import datetime
 from urllib.parse import quote, unquote
 
+import httpx
 import pytest
 from fastapi.testclient import TestClient
 
 from local_security import reset_state
 from main import create_native_app
 from mission_repository import MissionRepository
-from native_runtime import NativeRuntimeIdentity
+from native_runtime import (
+    ENVELOPE_ROUTE,
+    ENVELOPE_VERSION,
+    NativeRuntimeIdentity,
+    _open_application_envelope,
+    _seal_application_envelope,
+)
 
 PASSPHRASE = "senha-sintetica-mac003"
 HEADERS = {"content-type": "text/plain", "connection": "close"}
+ENVELOPE_HEADERS = {"content-type": "application/octet-stream", "connection": "close"}
 
 
 def body(**fields: str) -> str:
@@ -25,6 +33,68 @@ def fields(response) -> dict[str, str]:
         name: unquote(value, encoding="utf-8", errors="strict")
         for name, value in (line.split("=", 1) for line in response.text.splitlines())
     }
+
+
+class AuthenticatedNativeTestClient:
+    def __init__(self, raw: TestClient, identity: NativeRuntimeIdentity):
+        self.raw = raw
+        self.identity = identity
+        self.app = raw.app
+        self.prefix = b"testv2!!"
+        self.sequence = 0
+
+    def request(self, *args, **kwargs):
+        return self.raw.request(*args, **kwargs)
+
+    def post(self, path: str, *, content=b"", headers=None, **kwargs):
+        headers = headers or {}
+        if "?" in path or "origin" in {key.lower() for key in headers} or "x-forwarded-host" in {
+            key.lower() for key in headers
+        }:
+            return self.raw.post(path, content=content, headers=headers, **kwargs)
+        if not path.startswith("/v1/app/"):
+            return self.raw.post(path, content=content, headers=headers, **kwargs)
+        return self.secure_post(path, content, headers=headers)
+
+    def request_envelope(self, envelope: bytes):
+        return self.raw.post(ENVELOPE_ROUTE, content=envelope, headers=ENVELOPE_HEADERS)
+
+    def seal_request(self, path: str, body: bytes, *, nonce: bytes | None = None, version: int = ENVELOPE_VERSION):
+        if nonce is None:
+            self.sequence += 1
+            nonce = self.prefix + self.sequence.to_bytes(8, "big")
+        path_bytes = path.encode("ascii")
+        plaintext = (
+            bytes([version, 1])
+            + len(path_bytes).to_bytes(2, "big")
+            + len(body).to_bytes(4, "big")
+            + path_bytes
+            + body
+        )
+        return _seal_application_envelope(self.identity, b"request", nonce, plaintext)
+
+    def secure_post(self, path: str, body: bytes, *, headers=None):
+        if isinstance(body, str):
+            body = body.encode("utf-8")
+        envelope = self.seal_request(path, body)
+        outer = self.request_envelope(envelope)
+        if outer.status_code != 200:
+            return outer
+        try:
+            nonce, plaintext = _open_application_envelope(
+                self.identity, b"response", outer.content
+            )
+        except ValueError:
+            return httpx.Response(502, content=b"response authentication failed")
+        status = int.from_bytes(plaintext[1:3], "big")
+        body_length = int.from_bytes(plaintext[3:7], "big")
+        if plaintext[0] != ENVELOPE_VERSION or len(plaintext) != 7 + body_length:
+            return httpx.Response(502, content=b"response frame invalid")
+        return httpx.Response(
+            status,
+            content=plaintext[7:],
+            request=httpx.Request("POST", f"http://jarvis.local{path}"),
+        )
 
 
 @pytest.fixture
@@ -41,7 +111,7 @@ def native_client(tmp_path, monkeypatch):
     app = create_native_app(identity, database_path=tmp_path / "private" / "memory.sqlite3")
     with TestClient(app, base_url="http://jarvis.local", client=("127.0.0.1", 54001)) as client:
         client.headers.clear()
-        yield client
+        yield AuthenticatedNativeTestClient(client, identity)
     reset_state()
     identity.clear()
 
@@ -154,18 +224,74 @@ def test_native_surface_is_closed_and_does_not_mount_web_routes(native_client):
         "/v1/app/missions/list",
         content=body(session_token="x" * 43, domain_id="dom_synthetic_a"),
         headers={**HEADERS, "origin": "tauri://localhost"},
-    ).status_code == 400
+    ).status_code == 404
     assert native_client.post(
         "/v1/app/missions/list",
         content=body(session_token="x" * 43, domain_id="dom_synthetic_a"),
         headers={**HEADERS, "x-forwarded-host": "jarvis.local"},
-    ).status_code == 400
+    ).status_code == 404
     oversized = "x" * 1025
     assert native_client.post(
         "/v1/app/session/open",
         content=oversized,
         headers=HEADERS,
     ).status_code == 413
+
+
+def test_native_protocol_requires_encrypted_authenticated_v2_and_replay_rejection(native_client):
+    plain = native_client.raw.post(
+        "/v1/app/session/open",
+        content=body(passphrase=PASSPHRASE),
+        headers=HEADERS,
+    )
+    assert plain.status_code == 404
+
+    forged = native_client.request_envelope(b"not-an-authenticated-envelope")
+    assert forged.status_code == 401
+
+    stale_identity = NativeRuntimeIdentity(
+        instance_id=native_client.identity.instance_id,
+        secret=bytearray(b"x" * 32),
+        directory_dev=1,
+        directory_ino=1,
+    )
+    stale = AuthenticatedNativeTestClient(native_client.raw, stale_identity)
+    stale_response = stale.request_envelope(
+        stale.seal_request("/v1/app/session/open", body(passphrase="credencial-sintetica-incorreta").encode())
+    )
+    assert stale_response.status_code == 401
+    stale_identity.clear()
+
+    old_generation = NativeRuntimeIdentity(
+        instance_id="test-generation-old",
+        secret=bytearray(native_client.identity.secret),
+        directory_dev=1,
+        directory_ino=1,
+    )
+    old_client = AuthenticatedNativeTestClient(native_client.raw, old_generation)
+    old_response = old_client.request_envelope(
+        old_client.seal_request(
+            "/v1/app/session/open",
+            body(passphrase="credencial-sintetica-incorreta").encode(),
+        )
+    )
+    assert old_response.status_code == 401
+    old_generation.clear()
+
+    nonce = b"replay!!" + (1).to_bytes(8, "big")
+    envelope = native_client.seal_request(
+        "/v1/app/session/open",
+        body(passphrase="credencial-sintetica-incorreta").encode(),
+        nonce=nonce,
+    )
+    first = native_client.request_envelope(envelope)
+    assert first.status_code == 200
+    _, response_plaintext = _open_application_envelope(
+        native_client.identity, b"response", first.content
+    )
+    assert fields(httpx.Response(200, content=response_plaintext[7:]))["code"] == "credential_rejected"
+    replayed = native_client.request_envelope(envelope)
+    assert replayed.status_code == 409
 
 
 def test_native_grant_requires_csrf_and_rejects_other_domains(native_client):

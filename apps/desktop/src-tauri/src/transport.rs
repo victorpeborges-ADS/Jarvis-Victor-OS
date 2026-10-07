@@ -3,7 +3,7 @@ use std::{
     io::{BufRead, Read, Write},
     path::{Path, PathBuf},
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
         Arc, Mutex, MutexGuard,
     },
     time::{Duration, Instant},
@@ -22,12 +22,13 @@ use std::os::raw::{c_char, c_int, c_uint};
 
 const INIT_PREFIX: &[u8] = b"JARVIS_TRANSPORT_INIT ";
 const SOCKET_LEAF: &[u8] = b"runtime.sock\0";
-const PROTOCOL_VERSION: &str = "1";
+const PROTOCOL_VERSION: &str = "2";
 const RUNTIME_KIND: &str = "jarvis-synthetic";
-const BUILD_ID: &str = "g6-mac-003-fastapi-g5-v1";
+const BUILD_ID: &str = "g6-mac-002-2-encrypted-uds-v2";
 const HEALTH_ROUTE: &str = "/v1/health";
 const VERSION_ROUTE: &str = "/v1/version";
 const PROOF_ROUTE: &str = "/v1/instance-proof";
+const APPLICATION_ENVELOPE_ROUTE: &str = "/v2/secure";
 const APP_SESSION_OPEN_ROUTE: &str = "/v1/app/session/open";
 const APP_SESSION_CLOSE_ROUTE: &str = "/v1/app/session/close";
 const APP_GRANT_CREATE_ROUTE: &str = "/v1/app/grants/mission-read";
@@ -48,9 +49,17 @@ const MAX_REQUEST_BODY_BYTES: usize = 128;
 const MAX_APP_REQUEST_BODY_BYTES: usize = 1024;
 const MAX_RESPONSE_HEADER_BYTES: usize = 2048;
 const MAX_RESPONSE_BODY_BYTES: usize = 2048;
+const MAX_CONTROL_RESPONSE_BODY_BYTES: usize = 2048;
 const MAX_INIT_BYTES: usize = 1024;
 const SECRET_BYTES: usize = 32;
 const NONCE_BYTES: usize = 32;
+const ENVELOPE_NONCE_BYTES: usize = 16;
+const ENVELOPE_PREFIX_BYTES: usize = 8;
+const ENVELOPE_TAG_BYTES: usize = 32;
+const ENVELOPE_VERSION: u8 = 2;
+const MAX_ENVELOPE_REQUEST_BYTES: usize = MAX_APP_REQUEST_BODY_BYTES + 256;
+const MAX_ENVELOPE_RESPONSE_BYTES: usize =
+    MAX_RESPONSE_BODY_BYTES + ENVELOPE_NONCE_BYTES + ENVELOPE_TAG_BYTES + 7;
 
 #[cfg(unix)]
 #[link(name = "System")]
@@ -149,6 +158,7 @@ pub(crate) enum TransportError {
     ApplicationRequestTooLarge,
     HttpRejected,
     ProofRejected,
+    PeerRejected,
     IncompatibleVersion,
     OsCryptoUnavailable,
     SetupFailed,
@@ -165,6 +175,7 @@ impl TransportError {
             Self::ApplicationRequestTooLarge => "application_request_too_large",
             Self::HttpRejected => "http_rejected",
             Self::ProofRejected => "proof_rejected",
+            Self::PeerRejected => "peer_rejected",
             Self::IncompatibleVersion => "incompatible_version",
             Self::OsCryptoUnavailable => "os_crypto_unavailable",
             Self::SetupFailed => "transport_setup_failed",
@@ -184,6 +195,9 @@ pub(crate) struct TransportSession {
     directory_handle: fs::File,
     directory_identity: DirectoryIdentity,
     secret: Mutex<Option<[u8; SECRET_BYTES]>>,
+    expected_peer_pid: AtomicU32,
+    envelope_nonce_prefix: [u8; ENVELOPE_PREFIX_BYTES],
+    envelope_sequence: AtomicU64,
     active: AtomicBool,
     cleanup_done: AtomicBool,
     request_lock: Mutex<()>,
@@ -193,9 +207,15 @@ impl TransportSession {
     pub(crate) fn create(instance_id: &str) -> Result<Arc<Self>, TransportError> {
         let mut secret = [0_u8; SECRET_BYTES];
         let mut name = [0_u8; 16];
+        let mut envelope_nonce_prefix = [0_u8; ENVELOPE_PREFIX_BYTES];
         os_random(&mut secret)?;
         if let Err(error) = os_random(&mut name) {
             secret.fill(0);
+            return Err(error);
+        }
+        if let Err(error) = os_random(&mut envelope_nonce_prefix) {
+            secret.fill(0);
+            name.fill(0);
             return Err(error);
         }
 
@@ -236,6 +256,9 @@ impl TransportSession {
             directory_handle,
             directory_identity,
             secret: Mutex::new(Some(secret)),
+            expected_peer_pid: AtomicU32::new(test_default_peer_pid()),
+            envelope_nonce_prefix,
+            envelope_sequence: AtomicU64::new(0),
             active: AtomicBool::new(true),
             cleanup_done: AtomicBool::new(false),
             request_lock: Mutex::new(()),
@@ -267,6 +290,14 @@ impl TransportSession {
 
     pub(crate) fn probe(&self) -> Result<(), TransportError> {
         self.probe_endpoint(&self.socket_path)
+    }
+
+    pub(crate) fn set_expected_peer_pid(&self, pid: u32) -> Result<(), TransportError> {
+        if pid == 0 {
+            return Err(TransportError::PeerRejected);
+        }
+        self.expected_peer_pid.store(pid, Ordering::Release);
+        Ok(())
     }
 
     fn probe_endpoint(&self, endpoint: &std::path::Path) -> Result<(), TransportError> {
@@ -308,6 +339,25 @@ impl TransportSession {
         route: &'static str,
         body: &[u8],
     ) -> Result<Vec<u8>, TransportError> {
+        self.call_g5_application_after_probe(route, body, || {})
+    }
+
+    #[cfg(feature = "mac003-production-supervisor-test")]
+    pub(crate) fn call_g5_application_after_probe_for_test(
+        &self,
+        route: &'static str,
+        body: &[u8],
+        after_probe: impl FnOnce(),
+    ) -> Result<Vec<u8>, TransportError> {
+        self.call_g5_application_after_probe(route, body, after_probe)
+    }
+
+    fn call_g5_application_after_probe(
+        &self,
+        route: &'static str,
+        body: &[u8],
+        after_probe: impl FnOnce(),
+    ) -> Result<Vec<u8>, TransportError> {
         if !APP_ROUTES.contains(&route) {
             return Err(TransportError::HttpRejected);
         }
@@ -316,7 +366,16 @@ impl TransportSession {
         }
         let _serial = lock(&self.request_lock);
         self.probe_endpoint_locked(&self.socket_path)?;
-        let result = self.exchange_at(&self.socket_path, Verb::Post, route, body)?;
+        after_probe();
+        let nonce = self.next_envelope_nonce()?;
+        let envelope = self.seal_application_request(route, body, &nonce)?;
+        let response = self.exchange_at(
+            &self.socket_path,
+            Verb::Post,
+            APPLICATION_ENVELOPE_ROUTE,
+            &envelope,
+        )?;
+        let result = self.open_application_response(&response, &nonce)?;
         self.ensure_active()?;
         Ok(result)
     }
@@ -366,6 +425,7 @@ impl TransportSession {
 
     pub(crate) fn deactivate(&self) {
         self.active.store(false, Ordering::Release);
+        self.envelope_sequence.store(0, Ordering::Release);
         if let Some(mut secret) = lock(&self.secret).take() {
             secret.fill(0);
             std::hint::black_box(secret);
@@ -403,6 +463,7 @@ impl TransportSession {
             );
             error
         })?;
+        self.verify_peer_pid(&stream)?;
         let request_deadline = Instant::now() + REQUEST_TIMEOUT;
         stream
             .set_read_timeout(Some(REQUEST_TIMEOUT))
@@ -421,8 +482,13 @@ impl TransportSession {
             Verb::Get => "GET",
             Verb::Post => "POST",
         };
+        let content_type = if route == APPLICATION_ENVELOPE_ROUTE {
+            "application/octet-stream"
+        } else {
+            "text/plain"
+        };
         let request = format!(
-            "{method} {route} HTTP/1.1\r\nHost: jarvis.local\r\nConnection: close\r\nContent-Length: {}\r\nContent-Type: text/plain\r\n\r\n",
+            "{method} {route} HTTP/1.1\r\nHost: jarvis.local\r\nConnection: close\r\nContent-Length: {}\r\nContent-Type: {content_type}\r\n\r\n",
             body.len()
         );
         stream
@@ -438,7 +504,7 @@ impl TransportSession {
                 );
                 map_io_error(error)
             })?;
-        read_http_response(&mut stream, request_deadline).map_err(|error| {
+        read_http_response(&mut stream, request_deadline, content_type).map_err(|error| {
             eprintln!(
                 "transport exchange failed instance_id={} route={route} phase=response_read category={}",
                 self.instance_id,
@@ -446,6 +512,130 @@ impl TransportSession {
             );
             error
         })
+    }
+
+    fn verify_peer_pid(&self, stream: &UnixStream) -> Result<(), TransportError> {
+        let expected = self.expected_peer_pid.load(Ordering::Acquire);
+        let actual = unix_peer_pid(stream)?;
+        if expected == 0 || expected != actual {
+            return Err(TransportError::PeerRejected);
+        }
+        self.ensure_active()
+    }
+
+    fn next_envelope_nonce(&self) -> Result<[u8; ENVELOPE_NONCE_BYTES], TransportError> {
+        self.ensure_active()?;
+        let mut current = self.envelope_sequence.load(Ordering::Acquire);
+        let sequence = loop {
+            let next = current
+                .checked_add(1)
+                .ok_or(TransportError::OsCryptoUnavailable)?;
+            match self.envelope_sequence.compare_exchange_weak(
+                current,
+                next,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => break next,
+                Err(observed) => current = observed,
+            }
+        };
+        let mut nonce = [0_u8; ENVELOPE_NONCE_BYTES];
+        nonce[..ENVELOPE_PREFIX_BYTES].copy_from_slice(&self.envelope_nonce_prefix);
+        nonce[ENVELOPE_PREFIX_BYTES..].copy_from_slice(&sequence.to_be_bytes());
+        Ok(nonce)
+    }
+
+    fn seal_application_request(
+        &self,
+        route: &str,
+        body: &[u8],
+        nonce: &[u8; ENVELOPE_NONCE_BYTES],
+    ) -> Result<Vec<u8>, TransportError> {
+        let path = route.as_bytes();
+        let path_len = u16::try_from(path.len()).map_err(|_| TransportError::HttpRejected)?;
+        let body_len =
+            u32::try_from(body.len()).map_err(|_| TransportError::ApplicationRequestTooLarge)?;
+        let mut plaintext = Vec::with_capacity(8 + path.len() + body.len());
+        plaintext.push(ENVELOPE_VERSION);
+        plaintext.push(1); // POST
+        plaintext.extend_from_slice(&path_len.to_be_bytes());
+        plaintext.extend_from_slice(&body_len.to_be_bytes());
+        plaintext.extend_from_slice(path);
+        plaintext.extend_from_slice(body);
+        let (mut encryption_key, mut authentication_key) = self.envelope_keys(b"request")?;
+        let result = seal_message(
+            &self.instance_id,
+            b"request",
+            &encryption_key,
+            &authentication_key,
+            nonce,
+            &plaintext,
+        );
+        plaintext.fill(0);
+        encryption_key.fill(0);
+        authentication_key.fill(0);
+        if result
+            .as_ref()
+            .is_ok_and(|envelope| envelope.len() > MAX_ENVELOPE_REQUEST_BYTES)
+        {
+            return Err(TransportError::ApplicationRequestTooLarge);
+        }
+        result
+    }
+
+    fn open_application_response(
+        &self,
+        envelope: &[u8],
+        expected_nonce: &[u8; ENVELOPE_NONCE_BYTES],
+    ) -> Result<Vec<u8>, TransportError> {
+        if envelope.len() > MAX_ENVELOPE_RESPONSE_BYTES
+            || envelope.len() < ENVELOPE_NONCE_BYTES + ENVELOPE_TAG_BYTES
+            || &envelope[..ENVELOPE_NONCE_BYTES] != expected_nonce
+        {
+            return Err(TransportError::ProofRejected);
+        }
+        let (mut encryption_key, mut authentication_key) = self.envelope_keys(b"response")?;
+        let opened = open_message(
+            &self.instance_id,
+            b"response",
+            &encryption_key,
+            &authentication_key,
+            envelope,
+        );
+        encryption_key.fill(0);
+        authentication_key.fill(0);
+        let mut plaintext = opened?;
+        if plaintext.len() < 7 || plaintext[0] != ENVELOPE_VERSION {
+            plaintext.fill(0);
+            return Err(TransportError::MalformedResponse);
+        }
+        let status = u16::from_be_bytes([plaintext[1], plaintext[2]]);
+        let body_len =
+            u32::from_be_bytes([plaintext[3], plaintext[4], plaintext[5], plaintext[6]]) as usize;
+        if body_len != plaintext.len() - 7 || status != 200 {
+            plaintext.fill(0);
+            return Err(TransportError::HttpRejected);
+        }
+        let response = plaintext[7..].to_vec();
+        plaintext.fill(0);
+        Ok(response)
+    }
+
+    fn envelope_keys(&self, direction: &[u8]) -> Result<([u8; 32], [u8; 32]), TransportError> {
+        let secret = lock(&self.secret);
+        let Some(secret) = secret.as_ref() else {
+            return Err(TransportError::Inactive);
+        };
+        let mut encryption_context =
+            envelope_key_context(b"encryption", direction, &self.instance_id);
+        let mut authentication_context =
+            envelope_key_context(b"authentication", direction, &self.instance_id);
+        let encryption_key = hmac_sha256(secret, &encryption_context)?;
+        let authentication_key = hmac_sha256(secret, &authentication_context)?;
+        encryption_context.fill(0);
+        authentication_context.fill(0);
+        Ok((encryption_key, authentication_key))
     }
 
     fn verify_proof(
@@ -549,7 +739,7 @@ fn parse_fields<'a>(
 
 fn proof_message(version: &Version, nonce_hex: &str, operation_result: &str) -> String {
     format!(
-        "jarvis-local-transport-proof-v1\n{}\n{}\n{}\n{}\n{}\n{}",
+        "jarvis-local-transport-proof-v2\n{}\n{}\n{}\n{}\n{}\n{}",
         version.protocol,
         version.runtime_kind,
         version.instance_id,
@@ -676,7 +866,13 @@ fn unlink_socket_at(directory: &fs::File) {
 fn read_http_response(
     stream: &mut UnixStream,
     deadline: Instant,
+    expected_content_type: &str,
 ) -> Result<Vec<u8>, TransportError> {
+    let body_limit = if expected_content_type == "application/octet-stream" {
+        MAX_ENVELOPE_RESPONSE_BYTES
+    } else {
+        MAX_CONTROL_RESPONSE_BODY_BYTES
+    };
     let mut wire = Vec::new();
     let mut buffer = [0_u8; 512];
     let header_end = loop {
@@ -690,7 +886,7 @@ fn read_http_response(
             return Err(TransportError::MalformedResponse);
         }
         wire.extend_from_slice(&buffer[..count]);
-        if wire.len() > MAX_RESPONSE_HEADER_BYTES + MAX_RESPONSE_BODY_BYTES {
+        if wire.len() > MAX_RESPONSE_HEADER_BYTES + body_limit {
             return Err(TransportError::ResponseTooLarge);
         }
         if let Some(index) = wire.windows(4).position(|window| window == b"\r\n\r\n") {
@@ -715,6 +911,8 @@ fn read_http_response(
         return Err(TransportError::HttpRejected);
     }
     let mut content_length = None;
+    let mut content_type_ok = false;
+    let mut content_type_seen = false;
     for line in lines.filter(|line| !line.is_empty()) {
         let (name, value) = line
             .split_once(':')
@@ -729,13 +927,34 @@ fn read_http_response(
                     .parse::<usize>()
                     .map_err(|_| TransportError::MalformedResponse)?,
             );
+        } else if name.eq_ignore_ascii_case("content-type") {
+            if content_type_seen {
+                return Err(TransportError::MalformedResponse);
+            }
+            content_type_seen = true;
+            let value = value.trim();
+            content_type_ok = value.eq_ignore_ascii_case(expected_content_type)
+                || (expected_content_type == "text/plain"
+                    && value.eq_ignore_ascii_case("text/plain; charset=utf-8"));
         } else if name.eq_ignore_ascii_case("transfer-encoding") {
+            return Err(TransportError::MalformedResponse);
+        } else if name.eq_ignore_ascii_case("connection") {
+            if !value.trim().eq_ignore_ascii_case("close") {
+                return Err(TransportError::MalformedResponse);
+            }
+        } else if name.eq_ignore_ascii_case("date") || name.eq_ignore_ascii_case("server") {
+            // Uvicorn may add harmless standard headers; they do not affect the envelope.
+        } else {
             return Err(TransportError::MalformedResponse);
         }
     }
     let content_length = content_length.ok_or(TransportError::MalformedResponse)?;
-    if content_length > MAX_RESPONSE_BODY_BYTES {
+    if content_length > body_limit {
         return Err(TransportError::ResponseTooLarge);
+    }
+    let secure_envelope = expected_content_type == "application/octet-stream";
+    if (secure_envelope && !content_type_seen) || (content_type_seen && !content_type_ok) {
+        return Err(TransportError::HttpRejected);
     }
     let mut body = wire[header_end..].to_vec();
     if body.len() > content_length {
@@ -1238,6 +1457,200 @@ fn os_random(bytes: &mut [u8]) -> Result<(), TransportError> {
     Err(TransportError::OsCryptoUnavailable)
 }
 
+fn test_default_peer_pid() -> u32 {
+    #[cfg(test)]
+    {
+        std::process::id()
+    }
+    #[cfg(not(test))]
+    {
+        0
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn unix_peer_pid(stream: &UnixStream) -> Result<u32, TransportError> {
+    #[link(name = "System")]
+    unsafe extern "C" {
+        fn getsockopt(
+            socket: c_int,
+            level: c_int,
+            option: c_int,
+            value: *mut i32,
+            length: *mut u32,
+        ) -> c_int;
+    }
+
+    let mut pid = 0_i32;
+    let mut length = std::mem::size_of::<i32>() as u32;
+    // Darwin's SOL_LOCAL / LOCAL_PEERPID values are 0 and 2 in sys/un.h.
+    let result = unsafe { getsockopt(stream.as_raw_fd(), 0, 2, &mut pid, &mut length) };
+    if result != 0 || length as usize != std::mem::size_of::<i32>() || pid <= 0 {
+        return Err(TransportError::PeerRejected);
+    }
+    Ok(pid as u32)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn unix_peer_pid(_stream: &UnixStream) -> Result<u32, TransportError> {
+    Err(TransportError::PeerRejected)
+}
+
+fn envelope_key_context(purpose: &[u8], direction: &[u8], instance_id: &str) -> Vec<u8> {
+    let mut context = b"jarvis-local-envelope-v2\0".to_vec();
+    context.extend_from_slice(purpose);
+    context.push(0);
+    context.extend_from_slice(direction);
+    context.push(0);
+    context.extend_from_slice(instance_id.as_bytes());
+    context
+}
+
+fn envelope_mac_message(
+    instance_id: &str,
+    direction: &[u8],
+    nonce: &[u8; ENVELOPE_NONCE_BYTES],
+    ciphertext: &[u8],
+) -> Vec<u8> {
+    let mut message = b"jarvis-local-envelope-v2\0".to_vec();
+    message.extend_from_slice(instance_id.as_bytes());
+    message.push(0);
+    message.extend_from_slice(direction);
+    message.push(0);
+    message.extend_from_slice(APPLICATION_ENVELOPE_ROUTE.as_bytes());
+    message.push(0);
+    message.extend_from_slice(nonce);
+    message.extend_from_slice(ciphertext);
+    message
+}
+
+fn seal_message(
+    instance_id: &str,
+    direction: &[u8],
+    encryption_key: &[u8; 32],
+    authentication_key: &[u8; 32],
+    nonce: &[u8; ENVELOPE_NONCE_BYTES],
+    plaintext: &[u8],
+) -> Result<Vec<u8>, TransportError> {
+    let mut ciphertext = aes_ctr_xor(encryption_key, nonce, plaintext)?;
+    let mut mac_message = envelope_mac_message(instance_id, direction, nonce, &ciphertext);
+    let tag = hmac_sha256(authentication_key, &mac_message)?;
+    let mut envelope = Vec::with_capacity(ENVELOPE_NONCE_BYTES + ciphertext.len() + tag.len());
+    envelope.extend_from_slice(nonce);
+    envelope.append(&mut ciphertext);
+    envelope.extend_from_slice(&tag);
+    mac_message.fill(0);
+    Ok(envelope)
+}
+
+fn open_message(
+    instance_id: &str,
+    direction: &[u8],
+    encryption_key: &[u8; 32],
+    authentication_key: &[u8; 32],
+    envelope: &[u8],
+) -> Result<Vec<u8>, TransportError> {
+    if envelope.len() < ENVELOPE_NONCE_BYTES + ENVELOPE_TAG_BYTES {
+        return Err(TransportError::MalformedResponse);
+    }
+    let nonce: &[u8; ENVELOPE_NONCE_BYTES] = envelope[..ENVELOPE_NONCE_BYTES]
+        .try_into()
+        .map_err(|_| TransportError::MalformedResponse)?;
+    let tag_start = envelope.len() - ENVELOPE_TAG_BYTES;
+    let ciphertext = &envelope[ENVELOPE_NONCE_BYTES..tag_start];
+    let received_tag = &envelope[tag_start..];
+    let mut mac_message = envelope_mac_message(instance_id, direction, nonce, ciphertext);
+    let expected_tag = hmac_sha256(authentication_key, &mac_message)?;
+    mac_message.fill(0);
+    if !constant_time_equal(received_tag, &expected_tag) {
+        return Err(TransportError::ProofRejected);
+    }
+    aes_ctr_xor(encryption_key, nonce, ciphertext)
+}
+
+fn aes_ctr_xor(
+    key: &[u8; 32],
+    nonce: &[u8; ENVELOPE_NONCE_BYTES],
+    input: &[u8],
+) -> Result<Vec<u8>, TransportError> {
+    #[cfg(target_os = "macos")]
+    {
+        use std::ffi::c_void;
+        #[link(name = "System")]
+        unsafe extern "C" {
+            fn CCCryptorCreateWithMode(
+                operation: u32,
+                mode: u32,
+                algorithm: u32,
+                padding: u32,
+                iv: *const c_void,
+                key: *const c_void,
+                key_length: usize,
+                tweak: *const c_void,
+                tweak_length: usize,
+                rounds: i32,
+                options: u32,
+                cryptor: *mut *mut c_void,
+            ) -> i32;
+            fn CCCryptorUpdate(
+                cryptor: *mut c_void,
+                input: *const c_void,
+                input_length: usize,
+                output: *mut c_void,
+                output_capacity: usize,
+                output_length: *mut usize,
+            ) -> i32;
+            fn CCCryptorRelease(cryptor: *mut c_void) -> i32;
+        }
+
+        let mut cryptor = std::ptr::null_mut();
+        // CommonCrypto: kCCEncrypt=0, kCCModeCTR=4, kCCAlgorithmAES=0,
+        // ccNoPadding=0. CTR is symmetric, so this operation encrypts and decrypts.
+        let created = unsafe {
+            CCCryptorCreateWithMode(
+                0,
+                4,
+                0,
+                0,
+                nonce.as_ptr().cast(),
+                key.as_ptr().cast(),
+                key.len(),
+                std::ptr::null(),
+                0,
+                0,
+                0,
+                &mut cryptor,
+            )
+        };
+        if created != 0 || cryptor.is_null() {
+            return Err(TransportError::OsCryptoUnavailable);
+        }
+        let mut output = vec![0_u8; input.len()];
+        let mut output_length = 0_usize;
+        let updated = unsafe {
+            CCCryptorUpdate(
+                cryptor,
+                input.as_ptr().cast(),
+                input.len(),
+                output.as_mut_ptr().cast(),
+                output.len(),
+                &mut output_length,
+            )
+        };
+        let released = unsafe { CCCryptorRelease(cryptor) };
+        if updated != 0 || released != 0 || output_length != input.len() {
+            output.fill(0);
+            return Err(TransportError::OsCryptoUnavailable);
+        }
+        Ok(output)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (key, nonce, input);
+        Err(TransportError::OsCryptoUnavailable)
+    }
+}
+
 fn hmac_sha256(key: &[u8], message: &[u8]) -> Result<[u8; 32], TransportError> {
     #[cfg(target_os = "macos")]
     {
@@ -1348,6 +1761,7 @@ mod tests {
     }
 
     fn fake_listener(session: &TransportSession) -> UnixListener {
+        session.set_expected_peer_pid(std::process::id()).unwrap();
         let listener = UnixListener::bind(&session.socket_path).unwrap();
         fs::set_permissions(&session.socket_path, fs::Permissions::from_mode(0o600)).unwrap();
         listener
@@ -1409,7 +1823,7 @@ mod tests {
 
     fn write_fake_response(stream: &mut UnixStream, status: &str, body: &[u8]) {
         let header = format!(
-            "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\nContent-Type: text/plain\r\n\r\n",
             body.len()
         );
         let _ = stream
@@ -1524,6 +1938,7 @@ mod tests {
             .stderr(Stdio::null())
             .spawn()
             .unwrap();
+        session.set_expected_peer_pid(child.id()).unwrap();
         let mut fake = FakeProcess(child);
         let stdout = fake.0.stdout.take().unwrap();
         let (ready_sender, ready_receiver) = std::sync::mpsc::channel();
@@ -1581,6 +1996,99 @@ mod tests {
             hex(&result),
             "b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7"
         );
+    }
+
+    #[test]
+    fn commoncrypt_aes256_ctr_matches_nist_vector() {
+        let key = decode_hex_array::<32>(
+            b"603deb1015ca71be2b73aef0857d7781\
+              1f352c073b6108d72d9810a30914dff4"
+                .iter()
+                .copied()
+                .filter(|byte| !byte.is_ascii_whitespace())
+                .collect::<Vec<_>>()
+                .as_slice(),
+        )
+        .unwrap();
+        let nonce =
+            decode_hex_array::<ENVELOPE_NONCE_BYTES>(b"f0f1f2f3f4f5f6f7f8f9fafbfcfdfeff").unwrap();
+        let plaintext = decode_hex_array::<16>(b"6bc1bee22e409f96e93d7e117393172a").unwrap();
+        let ciphertext = aes_ctr_xor(&key, &nonce, &plaintext).unwrap();
+        assert_eq!(hex(&ciphertext), "601ec313775789a5b7a7f504bbf3d228");
+    }
+
+    #[test]
+    fn application_envelope_encrypts_sensitive_request_fields() {
+        let session = TransportSession::create("envelope-confidentiality").unwrap();
+        let body = b"passphrase=synthetic-passphrase-never-send-plain\nsession_token=synthetic-session-token-secret\ncsrf_token=synthetic-csrf-secret\ngrant_id=synthetic-grant-secret\nmission_title=synthetic-mission-secret\n";
+        let mut nonce = [0_u8; ENVELOPE_NONCE_BYTES];
+        nonce[..ENVELOPE_PREFIX_BYTES].copy_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8]);
+        nonce[ENVELOPE_PREFIX_BYTES..].copy_from_slice(&7_u64.to_be_bytes());
+        let envelope = session
+            .seal_application_request(APP_SESSION_OPEN_ROUTE, body, &nonce)
+            .unwrap();
+        for secret in [
+            b"synthetic-passphrase-never-send-plain".as_slice(),
+            b"synthetic-session-token-secret".as_slice(),
+            b"synthetic-csrf-secret".as_slice(),
+            b"synthetic-grant-secret".as_slice(),
+            b"synthetic-mission-secret".as_slice(),
+        ] {
+            assert!(!envelope
+                .windows(secret.len())
+                .any(|window| window == secret));
+        }
+        session.revoke();
+    }
+
+    #[test]
+    fn encrypted_response_tampering_and_generation_replay_are_rejected() {
+        let session = TransportSession::create("envelope-generation-a").unwrap();
+        let mut nonce = [0_u8; ENVELOPE_NONCE_BYTES];
+        nonce[ENVELOPE_PREFIX_BYTES..].copy_from_slice(&1_u64.to_be_bytes());
+        let frame = [ENVELOPE_VERSION, 0, 200, 0, 0, 0, 2, b'o', b'k'];
+        let (mut encryption_key, mut authentication_key) =
+            session.envelope_keys(b"response").unwrap();
+        let mut envelope = seal_message(
+            &session.instance_id,
+            b"response",
+            &encryption_key,
+            &authentication_key,
+            &nonce,
+            &frame,
+        )
+        .unwrap();
+        let final_index = envelope.len() - 1;
+        envelope[final_index] ^= 1;
+        assert_eq!(
+            open_message(
+                &session.instance_id,
+                b"response",
+                &encryption_key,
+                &authentication_key,
+                &envelope,
+            ),
+            Err(TransportError::ProofRejected)
+        );
+        let other_generation = TransportSession::create("envelope-generation-b").unwrap();
+        let (mut other_encryption, mut other_authentication) =
+            other_generation.envelope_keys(b"response").unwrap();
+        assert_eq!(
+            open_message(
+                &other_generation.instance_id,
+                b"response",
+                &other_encryption,
+                &other_authentication,
+                &envelope,
+            ),
+            Err(TransportError::ProofRejected)
+        );
+        encryption_key.fill(0);
+        authentication_key.fill(0);
+        other_encryption.fill(0);
+        other_authentication.fill(0);
+        session.revoke();
+        other_generation.revoke();
     }
 
     #[test]

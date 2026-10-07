@@ -1064,6 +1064,18 @@ impl RuntimeManager {
             }
         };
         let pid = child.id();
+        if transport_session.set_expected_peer_pid(pid).is_err() {
+            drop(inner);
+            let _ = child.kill();
+            let status = child.wait().ok();
+            finish_start_failure(
+                &self.shared,
+                &instance_id,
+                "transport_peer_setup_failed",
+                status,
+            );
+            return Err(ManagerError::TransportSetupFailed);
+        }
         inner.snapshot.pid = Some(pid);
         eprintln!("runtime child started instance_id={instance_id} pid={pid}");
 
@@ -1534,6 +1546,37 @@ pub fn run_production_supervisor_integration() -> Result<(), &'static str> {
             .transport_directories
             .push(first_session.directory_path().to_owned());
 
+        let session_open_body = SecretBytes::new(encode_application_fields(&[(
+            "passphrase",
+            passphrase.as_str(),
+        )]));
+        let create_grant_body = SecretBytes::new(encode_application_fields(&[
+            ("session_token", "synthetic-session-token-for-peer-probe"),
+            ("csrf_token", "synthetic-csrf-token-for-peer-probe"),
+            ("domain_id", "dom_synthetic_a"),
+        ]));
+        let revoke_grant_body = SecretBytes::new(encode_application_fields(&[
+            ("session_token", "synthetic-session-token-for-peer-probe"),
+            ("csrf_token", "synthetic-csrf-token-for-peer-probe"),
+            ("grant_id", "0123456789abcdef0123456789abcdef"),
+        ]));
+        let list_missions_body = SecretBytes::new(encode_application_fields(&[
+            ("session_token", "synthetic-session-token-for-peer-probe"),
+            ("domain_id", "dom_synthetic_a"),
+        ]));
+        for (route, body) in [
+            ("/v1/app/session/open", session_open_body.as_slice()),
+            ("/v1/app/grants/mission-read", create_grant_body.as_slice()),
+            (
+                "/v1/app/grants/mission-read/revoke",
+                revoke_grant_body.as_slice(),
+            ),
+            ("/v1/app/missions/list", list_missions_body.as_slice()),
+        ] {
+            assert_replacement_peer_rejected(&python, &first_session, route, body)?;
+        }
+        eprintln!("mac002_2 stage=real_fastapi_proof_then_socket_swap_rejected PASS");
+
         if !manager
             .g5_session_open(passphrase.clone())
             .contains("\"session_active\":true")
@@ -1557,7 +1600,7 @@ pub fn run_production_supervisor_integration() -> Result<(), &'static str> {
         let direct_probe = run_same_uid_uds_probe(&python, first_session.directory_path())?;
         eprintln!("same_uid_uds_probe={direct_probe}");
         if direct_probe.trim_end()
-            != "health=200;version=200;proof=200;open=credential_rejected;close=session_required;grant=session_required;revoke=session_required;read=session_required"
+            != "health=200;version=200;proof=200;open=404;close=404;grant=404;revoke=404;read=404"
         {
             return Err("same-UID direct UDS probe crossed an unexpected authorization boundary");
         }
@@ -1709,17 +1752,135 @@ pub fn run_production_supervisor_integration() -> Result<(), &'static str> {
 }
 
 #[cfg(feature = "mac003-production-supervisor-test")]
+fn assert_replacement_peer_rejected(
+    python: &Path,
+    transport: &Arc<TransportSession>,
+    route: &'static str,
+    body: &[u8],
+) -> Result<(), &'static str> {
+    use std::io::Read;
+
+    const FAKE_PEER: &str = r#"
+import os, socket, sys
+path = sys.argv[1]
+ready_path = sys.argv[2]
+listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+listener.bind(path)
+os.chmod(path, 0o600)
+listener.listen(1)
+with open(ready_path, "wb") as marker:
+    marker.write(b"ready")
+connection, _ = listener.accept()
+try:
+    connection.sendall(b"HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: 1\r\nConnection: close\r\n\r\nx")
+except OSError:
+    pass
+received = bytearray()
+connection.settimeout(1)
+try:
+    while True:
+        chunk = connection.recv(1024)
+        if not chunk:
+            break
+        received.extend(chunk)
+except OSError:
+    pass
+print("payload=" + ("1" if received else "0"), flush=True)
+connection.close()
+listener.close()
+"#;
+
+    let socket_path = transport.directory_path().join("runtime.sock");
+    let saved_path = transport.directory_path().join("runtime.genuine.sock");
+    let ready_path = transport
+        .directory_path()
+        .join("replacement-listener.ready");
+    if saved_path.exists() {
+        return Err("replacement probe found an unexpected saved socket");
+    }
+
+    let mut fake_peer = None;
+    let mut setup_ok = true;
+    let result = transport.call_g5_application_after_probe_for_test(route, body, || {
+        if std::fs::rename(&socket_path, &saved_path).is_err() {
+            setup_ok = false;
+            return;
+        }
+        let child = std::process::Command::new(python)
+            .arg("-B")
+            .arg("-c")
+            .arg(FAKE_PEER)
+            .arg(&socket_path)
+            .arg(&ready_path)
+            .env_clear()
+            .env("PYTHONDONTWRITEBYTECODE", "1")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn();
+        match child {
+            Ok(child) => {
+                fake_peer = Some(child);
+                let deadline = Instant::now() + Duration::from_secs(2);
+                while !ready_path.exists() && Instant::now() < deadline {
+                    thread::sleep(Duration::from_millis(5));
+                }
+                setup_ok = socket_path.exists() && ready_path.exists();
+            }
+            Err(_) => setup_ok = false,
+        }
+    });
+
+    let mut payload_marker = String::new();
+    let fake_status_ok = if let Some(mut child) = fake_peer {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while child.try_wait().ok().flatten().is_none() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(5));
+        }
+        if child.try_wait().ok().flatten().is_none() {
+            let _ = child.kill();
+        }
+        let status = child.wait().ok();
+        if let Some(mut stdout) = child.stdout.take() {
+            let _ = stdout.read_to_string(&mut payload_marker);
+        }
+        status.is_some_and(|status| status.success())
+    } else {
+        false
+    };
+
+    if socket_path.exists() {
+        let _ = std::fs::remove_file(&socket_path);
+    }
+    if ready_path.exists() {
+        let _ = std::fs::remove_file(&ready_path);
+    }
+    let restored = saved_path.exists() && std::fs::rename(&saved_path, &socket_path).is_ok();
+    if !setup_ok || !fake_status_ok || !restored {
+        return Err("socket replacement probe did not complete and restore the genuine endpoint");
+    }
+    if result != Err(TransportError::PeerRejected) || payload_marker.trim() != "payload=0" {
+        return Err("replacement peer received data or its response was not rejected");
+    }
+    Ok(())
+}
+
+#[cfg(feature = "mac003-production-supervisor-test")]
 fn run_same_uid_uds_probe(python: &Path, directory: &Path) -> Result<String, &'static str> {
     const PROBE: &str = r#"
 import secrets, socket, sys
 sock_path = sys.argv[1]
+probe_step = "start"
 def request(method, path, body=b""):
+    global probe_step
+    probe_step = "connect"
     conn = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     conn.settimeout(3)
     conn.connect(sock_path)
+    probe_step = "send"
     head = (f"{method} {path} HTTP/1.1\r\nHost: jarvis.local\r\nContent-Type: text/plain\r\nContent-Length: {len(body)}\r\nConnection: close\r\n\r\n").encode("ascii")
     conn.sendall(head + body)
     chunks = []
+    probe_step = "receive"
     while True:
         chunk = conn.recv(4096)
         if not chunk:
@@ -1727,24 +1888,31 @@ def request(method, path, body=b""):
         chunks.append(chunk)
     conn.close()
     raw = b"".join(chunks)
+    probe_step = "parse_status"
     head, _, body = raw.partition(b"\r\n\r\n")
     status = int(head.split(b"\r\n", 1)[0].split()[1])
-    code = ""
-    for line in body.splitlines():
-        if line.startswith(b"code="):
-            candidate = line[5:].decode("ascii", errors="strict")
-            if candidate in {"credential_rejected", "session_required", "grant_required"}:
-                code = candidate
-    return status, code
-health, _ = request("GET", "/v1/health")
-version, _ = request("GET", "/v1/version")
-proof, _ = request("POST", "/v1/instance-proof", secrets.token_hex(32).encode("ascii"))
-opened = request("POST", "/v1/app/session/open", b"passphrase=wrong-synthetic-probe\n")
-closed = request("POST", "/v1/app/session/close", b"session_token=fake-session\ncsrf_token=fake-csrf\n")
-granted = request("POST", "/v1/app/grants/mission-read", b"session_token=fake-session\ncsrf_token=fake-csrf\ndomain_id=dom_synthetic_a\n")
-revoked = request("POST", "/v1/app/grants/mission-read/revoke", b"session_token=fake-session\ncsrf_token=fake-csrf\ngrant_id=fake-grant\n")
-listed = request("POST", "/v1/app/missions/list", b"session_token=fake-session\ndomain_id=dom_synthetic_a\n")
-print(f"health={health};version={version};proof={proof};open={opened[1]};close={closed[1]};grant={granted[1]};revoke={revoked[1]};read={listed[1]}")
+    return status
+stage = "health"
+try:
+    health = request("GET", "/v1/health")
+    stage = "version"
+    version = request("GET", "/v1/version")
+    stage = "proof"
+    proof = request("POST", "/v1/instance-proof", secrets.token_hex(32).encode("ascii"))
+    stage = "open"
+    opened = request("POST", "/v1/app/session/open", b"passphrase=wrong-synthetic-probe\n")
+    stage = "close"
+    closed = request("POST", "/v1/app/session/close", b"session_token=fake-session\ncsrf_token=fake-csrf\n")
+    stage = "grant"
+    granted = request("POST", "/v1/app/grants/mission-read", b"session_token=fake-session\ncsrf_token=fake-csrf\ndomain_id=dom_synthetic_a\n")
+    stage = "revoke"
+    revoked = request("POST", "/v1/app/grants/mission-read/revoke", b"session_token=fake-session\ncsrf_token=fake-csrf\ngrant_id=fake-grant\n")
+    stage = "read"
+    listed = request("POST", "/v1/app/missions/list", b"session_token=fake-session\ndomain_id=dom_synthetic_a\n")
+    print(f"health={health};version={version};proof={proof};open={opened};close={closed};grant={granted};revoke={revoked};read={listed}")
+except Exception as exc:
+    print("probe_error=" + type(exc).__name__ + ";stage=" + stage + ";step=" + probe_step)
+    raise SystemExit(2)
 "#;
     let output = std::process::Command::new(python)
         .arg("-B")
@@ -1757,6 +1925,10 @@ print(f"health={health};version={version};proof={proof};open={opened[1]};close={
         .output()
         .map_err(|_| "same-UID probe process could not start")?;
     if !output.status.success() {
+        let diagnostic = String::from_utf8_lossy(&output.stdout);
+        if let Some(line) = diagnostic.lines().next() {
+            eprintln!("same_uid_uds_probe diagnostic={line}");
+        }
         return Err("same-UID probe process failed");
     }
     String::from_utf8(output.stdout).map_err(|_| "same-UID probe returned invalid status text")
@@ -1845,7 +2017,7 @@ fn mark_ready_after_transport(
         state: TransportState::Ready,
         runtime_instance_id: Some(instance_id.to_owned()),
         endpoint_type: Some("uds"),
-        protocol_version: Some("1".to_owned()),
+        protocol_version: Some("2".to_owned()),
         error_category: None,
     };
     if !transition_locked(&mut inner, RuntimeState::Ready, instance_id) {
@@ -1879,11 +2051,11 @@ fn complete_transport_probe(shared: &Shared, instance_id: &str, session: Arc<Tra
                 state: TransportState::Ready,
                 runtime_instance_id: Some(instance_id.to_owned()),
                 endpoint_type: Some("uds"),
-                protocol_version: Some("1".to_owned()),
+                protocol_version: Some("2".to_owned()),
                 error_category: None,
             };
             eprintln!(
-                "transport ready instance_id={instance_id} endpoint_type=uds protocol_version=1"
+                "transport ready instance_id={instance_id} endpoint_type=uds protocol_version=2"
             );
         }
         Err(error) => {
@@ -2226,7 +2398,7 @@ fn supervise_child(
                             continue;
                         }
                         eprintln!(
-                            "runtime authenticated and ready instance_id={instance_id} endpoint_type=uds protocol_version=1"
+                            "runtime authenticated and ready instance_id={instance_id} endpoint_type=uds protocol_version=2"
                         );
                     }
                     result => {
@@ -3434,7 +3606,7 @@ mod tests {
                 state: TransportState::Ready,
                 runtime_instance_id: Some(instance_id.clone()),
                 endpoint_type: Some("uds"),
-                protocol_version: Some("1".to_owned()),
+                protocol_version: Some("2".to_owned()),
                 error_category: None,
             };
             inner.transport_session = Some(Arc::clone(&session));
@@ -3511,7 +3683,7 @@ mod tests {
             manager.wait_for_transport_state(TransportState::Ready, Duration::from_secs(2));
         assert_eq!(transport.runtime_instance_id, ready.runtime_instance_id);
         assert_eq!(transport.endpoint_type, Some("uds"));
-        assert_eq!(transport.protocol_version.as_deref(), Some("1"));
+        assert_eq!(transport.protocol_version.as_deref(), Some("2"));
         let transport_session = manager.transport_session_for_test();
         assert_eq!(
             fs::symlink_metadata(transport_session.socket_path_for_test())
@@ -3546,11 +3718,11 @@ mod tests {
         let session_b = manager_b.transport_session_for_test();
         assert_eq!(
             session_a.probe_other_session_for_test(&session_b),
-            Err(crate::transport::TransportError::ProofRejected)
+            Err(crate::transport::TransportError::PeerRejected)
         );
         assert_eq!(
             session_b.probe_other_session_for_test(&session_a),
-            Err(crate::transport::TransportError::ProofRejected)
+            Err(crate::transport::TransportError::PeerRejected)
         );
 
         manager_a.stop_and_wait().unwrap();
@@ -3912,7 +4084,7 @@ mod tests {
         let transport =
             manager.wait_for_transport_state(TransportState::Ready, Duration::from_secs(8));
         assert_eq!(transport.runtime_instance_id, ready.runtime_instance_id);
-        assert_eq!(transport.protocol_version.as_deref(), Some("1"));
+        assert_eq!(transport.protocol_version.as_deref(), Some("2"));
         assert_eq!(
             manager.stop_and_wait().unwrap().state,
             RuntimeState::Stopped
