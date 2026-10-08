@@ -406,7 +406,14 @@ impl TransportSession {
             APPLICATION_ENVELOPE_ROUTE,
             &envelope,
         )?;
+        // Response bytes are local and the transaction lock is still held.
+        // Production builds omit this pause.
+        #[cfg(test)]
+        self.pause_transaction_for_test("received");
         let result = self.open_application_response(&response, &nonce)?;
+        // Records that opening finished before the guard drops. Not a wait.
+        #[cfg(test)]
+        self.pause_transaction_for_test("opened");
         self.ensure_active()?;
         Ok(result)
     }
@@ -2411,6 +2418,140 @@ mod tests {
         assert_eq!(blocked.envelope_sequence.load(Ordering::Acquire), u64::MAX);
         assert!(blocked.next_envelope_nonce().is_err());
         blocked.revoke();
+
+        let session = TransportSession::create("send-lifecycle-response-open").unwrap();
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let entered = Arc::new(Mutex::new(Some(entered_tx)));
+        let release = Arc::new(std::sync::Barrier::new(2));
+        let entered_hook = Arc::clone(&entered);
+        let release_hook = Arc::clone(&release);
+        let order_hook = Arc::clone(&order);
+        {
+            let mut hook = lock(&session.transaction_barrier);
+            *hook = Some(Arc::new(move |phase: &str| {
+                if phase == "received" {
+                    if let Some(sender) = entered_hook.lock().unwrap().take() {
+                        sender.send(()).unwrap();
+                    }
+                    release_hook.wait();
+                } else if phase == "opened" {
+                    order_hook.lock().unwrap().push("opened");
+                }
+            }));
+        }
+        let accepts = Arc::new(AtomicUsize::new(0));
+        let stop = Arc::new(AtomicBool::new(false));
+        let server = serve_openable_response(&session, Arc::clone(&accepts), Arc::clone(&stop));
+        let worker = Arc::clone(&session);
+        let call =
+            thread::spawn(move || worker.call_g5_application(APP_SESSION_OPEN_ROUTE, b"k=v\n"));
+        entered_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("response was not paused after the read and before open");
+        assert!(order.lock().unwrap().is_empty());
+        let deactivated = Arc::new(AtomicBool::new(false));
+        let deactivated_flag = Arc::clone(&deactivated);
+        let order_retirement = Arc::clone(&order);
+        let retiring = Arc::clone(&session);
+        let retirement = thread::spawn(move || {
+            retiring.deactivate();
+            order_retirement.lock().unwrap().push("deactivated");
+            deactivated_flag.store(true, Ordering::Release);
+        });
+        session.wait_until_request_contended_for_test();
+        assert!(
+            !deactivated.load(Ordering::Acquire),
+            "deactivate returned while the response was paused before open"
+        );
+        assert!(order.lock().unwrap().is_empty());
+        release.wait();
+        assert_eq!(call.join().unwrap(), Ok(b"ok".to_vec()));
+        retirement.join().unwrap();
+        assert_eq!(order.lock().unwrap().as_slice(), ["opened", "deactivated"]);
+        assert!(deactivated.load(Ordering::Acquire));
+        let accepts_after_open = accepts.load(Ordering::Acquire);
+        assert_eq!(accepts_after_open, 4);
+        {
+            let mut hook = lock(&session.transaction_barrier);
+            *hook = None;
+        }
+        assert_eq!(
+            session.call_g5_application(APP_SESSION_OPEN_ROUTE, b"k=v\n"),
+            Err(TransportError::Inactive)
+        );
+        assert_eq!(accepts.load(Ordering::Acquire), accepts_after_open);
+        assert!(lock(&session.secret).is_none());
+        assert_eq!(session.envelope_sequence.load(Ordering::Acquire), u64::MAX);
+        assert!(session.next_envelope_nonce().is_err());
+        stop.store(true, Ordering::Release);
+        server.join().unwrap();
+        session.revoke();
+    }
+
+    fn serve_openable_response(
+        session: &TransportSession,
+        accepts: Arc<AtomicUsize>,
+        stop: Arc<AtomicBool>,
+    ) -> JoinHandle<()> {
+        let instance_id = session.instance_id.clone();
+        let mut secret = lock(&session.secret).as_ref().unwrap().to_owned();
+        let (mut encryption_key, mut authentication_key) =
+            derive_envelope_keys(&secret, &instance_id, b"response").unwrap();
+        let listener = fake_listener(session);
+        listener.set_nonblocking(true).unwrap();
+        thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while !stop.load(Ordering::Acquire) && Instant::now() < deadline {
+                let mut stream = match listener.accept() {
+                    Ok((stream, _)) => stream,
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(5));
+                        continue;
+                    }
+                    Err(_) => break,
+                };
+                stream.set_nonblocking(false).unwrap();
+                accepts.fetch_add(1, Ordering::Release);
+                let (start, body) = read_fake_request(&mut stream);
+                let route = start.split_whitespace().nth(1).unwrap_or_default();
+                if route == APPLICATION_ENVELOPE_ROUTE {
+                    let nonce: [u8; ENVELOPE_NONCE_BYTES] =
+                        body[..ENVELOPE_NONCE_BYTES].try_into().unwrap();
+                    let frame = [ENVELOPE_VERSION, 0, 200, 0, 0, 0, 2, b'o', b'k'];
+                    let envelope = seal_message(
+                        &instance_id,
+                        b"response",
+                        &encryption_key,
+                        &authentication_key,
+                        &nonce,
+                        &frame,
+                    )
+                    .unwrap();
+                    let header = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\nContent-Type: application/octet-stream\r\n\r\n",
+                        envelope.len()
+                    );
+                    let _ = stream.write_all(header.as_bytes());
+                    let _ = stream.write_all(&envelope);
+                } else {
+                    let response = if route == HEALTH_ROUTE {
+                        b"ok\n".to_vec()
+                    } else if route == VERSION_ROUTE {
+                        version_body(&instance_id, PROTOCOL_VERSION)
+                    } else if route == PROOF_ROUTE {
+                        let nonce = std::str::from_utf8(&body).unwrap();
+                        proof_body(&instance_id, nonce, &secret)
+                    } else {
+                        b"no\n".to_vec()
+                    };
+                    write_fake_response(&mut stream, "200 OK", &response);
+                }
+            }
+            secret.fill(0);
+            encryption_key.fill(0);
+            authentication_key.fill(0);
+        })
     }
 
     #[test]

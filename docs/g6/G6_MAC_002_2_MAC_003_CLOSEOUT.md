@@ -11,9 +11,13 @@ Este documento registra o estado da branch `feat/jarvis-g6-final-closeout`. Não
 
 ## Corrida de envio
 
-`deactivate` adquire o lock da transação G5 antes do mutex da capability. A transação segura esse lock desde `ensure_active` até a escrita e a abertura da resposta. Quem chega depois da desativação falha antes de conectar. O teste `g5_transaction_barriers_cover_admission_seal_and_prewrite_check` para em `admitted` e em `sealed`; `inflight_send_finishes_before_deactivate_and_later_send_writes_nothing` para em `checked`, imediatamente antes do `write_all`. Os dois ordenamentos passam. Depois que `deactivate` retorna, o segredo está vazio, a sequência fica em `u64::MAX` e não há nova conexão.
+`deactivate` adquire o lock da transação G5 antes do mutex da capability. A transação segura esse lock desde `ensure_active` até a escrita e a abertura da resposta. Quem chega depois da desativação falha antes de conectar. O teste `g5_transaction_barriers_cover_admission_seal_and_prewrite_check` para em `admitted` e em `sealed`; `inflight_send_finishes_before_deactivate_and_later_send_writes_nothing` para em `checked`, imediatamente antes do `write_all`, e em `received`, depois que a resposta HTTP já foi lida e antes de `open_application_response`. Os dois ordenamentos passam. Depois que `deactivate` retorna, o segredo está vazio, a sequência fica em `u64::MAX` e não há nova conexão.
 
 Uma execução intermediária travou: a chamada de controle depois da desativação reentrou na barreira de admissão no mesmo fio. A checagem de atividade passou a ocorrer antes dessa barreira, e o gancho é removido antes da chamada de controle. A repetição passou em 0,06 s.
+
+## Intervalo pós-leitura
+
+A reauditoria de `149f927` não encontrou defeito nesse intervalo, e apontou que nenhuma barreira segurava o fio depois da leitura e antes de `open_application_response`. A branch `feat/jarvis-g6-final-response-barrier` parte desse SHA e acrescenta só o gancho de teste `received`. Ele dispara com `request_lock` ainda seguro, filtra a fase e não espera nas fases `admitted`, `sealed` ou `checked`. O marcador `opened` registra o fim da abertura sem esperar, ainda dentro do mesmo guard. O teste `inflight_send_finishes_before_deactivate_and_later_send_writes_nothing` observa `deactivate` bloqueado enquanto a resposta está pausada, a ordem `opened` e só então `deactivated`, e uma chamada seguinte que retorna `Inactive` sem novo `accept` no listener que continua vivo. O gancho é removido antes dessa chamada. Isso não altera o formato v3 nem o caminho de produção. O smoke da WebView continua aberto e sem aceite formal.
 
 ## Gates ainda abertos
 
@@ -22,7 +26,7 @@ Uma execução intermediária travou: a chamada de controle depois da desativaç
 | P1 de keystream CTR v3 | Fechado antes; regressão repetida | `test_native_ctr_partition.py`; testes Rust de partição e interoperabilidade |
 | P3 de replay antes do CTR | Fechado em `2cd1661` | reserva antes da cifra; suíte nativa |
 | P3 de sequência viva na desativação | Fechado em `2cd1661` | `deactivation_is_synchronized_and_concurrent_seals_do_not_reuse_sequence` |
-| P3 de envio depois da checagem | Fechado nesta branch | barreiras `admitted`, `sealed` e `checked` |
+| P3 de envio depois da checagem | Fechado nesta branch | barreiras `admitted`, `sealed`, `checked` e `received` |
 | HMAC antes de descriptografar, replay e overflow | Fechado | suítes Python e Rust |
 | Substituição same-UID e `LOCAL_PEERPID` | Fechado no supervisor | sonda `health=200;version=200;proof=200;open=404;...;read=404` |
 | Isolamento por geração, sessão e grant | Fechado no supervisor e nos testes de cache | STOP, EOF, crash, restart e nova sessão sem grant |
