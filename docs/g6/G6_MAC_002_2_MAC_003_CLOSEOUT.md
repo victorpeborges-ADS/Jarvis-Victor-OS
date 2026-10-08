@@ -1,6 +1,6 @@
 # Fechamento local G6 — MAC-002.2 e MAC-003
 
-Este documento registra o estado da branch `feat/jarvis-g6-final-closeout`. Não é aceite formal, não autoriza merge, push, tag ou deploy, e a revisão feita em seguida no mesmo trabalho é interna.
+Este documento registra o fechamento de engenharia. O aceite local do proprietário está em `docs/g6/G6_MAC_002_2_MAC_003_ACEITE.md`. Esse aceite não autoriza push, tag, deploy nem distribuição.
 
 ## Baseline
 
@@ -17,7 +17,7 @@ Uma execução intermediária travou: a chamada de controle depois da desativaç
 
 ## Intervalo pós-leitura
 
-A reauditoria de `149f927` não encontrou defeito nesse intervalo, e apontou que nenhuma barreira segurava o fio depois da leitura e antes de `open_application_response`. A branch `feat/jarvis-g6-final-response-barrier` parte desse SHA e acrescenta só o gancho de teste `received`. Ele dispara com `request_lock` ainda seguro, filtra a fase e não espera nas fases `admitted`, `sealed` ou `checked`. O marcador `opened` registra o fim da abertura sem esperar, ainda dentro do mesmo guard. O teste `inflight_send_finishes_before_deactivate_and_later_send_writes_nothing` observa `deactivate` bloqueado enquanto a resposta está pausada, a ordem `opened` e só então `deactivated`, e uma chamada seguinte que retorna `Inactive` sem novo `accept` no listener que continua vivo. O gancho é removido antes dessa chamada. Isso não altera o formato v3 nem o caminho de produção. O smoke da WebView continua aberto e sem aceite formal.
+A reauditoria de `149f927` não encontrou defeito nesse intervalo, e apontou que nenhuma barreira segurava o fio depois da leitura e antes de `open_application_response`. A branch `feat/jarvis-g6-final-response-barrier` parte desse SHA e acrescenta só o gancho de teste `received`. Ele dispara com `request_lock` ainda seguro, filtra a fase e não espera nas fases `admitted`, `sealed` ou `checked`. O marcador `opened` registra o fim da abertura sem esperar, ainda dentro do mesmo guard. O teste `inflight_send_finishes_before_deactivate_and_later_send_writes_nothing` observa `deactivate` bloqueado enquanto a resposta está pausada, a ordem `opened` e só então `deactivated`, e uma chamada seguinte que retorna `Inactive` sem novo `accept` no listener que continua vivo. O gancho é removido antes dessa chamada. Isso não altera o formato v3 nem o caminho de produção. O commit funcional auditado é `4bd65d3fb53256141a5067ec40c47b3778e22efa`.
 
 ## Gates ainda abertos
 
@@ -32,9 +32,9 @@ A reauditoria de `149f927` não encontrou defeito nesse intervalo, e apontou que
 | Isolamento por geração, sessão e grant | Fechado no supervisor e nos testes de cache | STOP, EOF, crash, restart e nova sessão sem grant |
 | Autorização G5, consentimento e revogação | Fechado no manager e no FastAPI | leitura sintética, revogação, negativa local e negativa do servidor |
 | Listener TCP | Ausente no launcher e no transporte | UDS `runtime.sock`; sem bind TCP no caminho desktop |
-| Smoke Tauri/WebView | **BLOCKED** | `System Events` retornou `UI elements enabled = false` |
-| Empacotamento distribuível | **BLOCKED** | o launcher de release usa `CARGO_MANIFEST_DIR` e a passphrase do ambiente |
-| Aceite formal, merge, push, tag, deploy | Não feitos | — |
+| Smoke Tauri/WebView | Executado manualmente pelo proprietário | jornada real na janela; ver a seção abaixo. A automação do agente permanece bloqueada |
+| Empacotamento distribuível | **Deferido** | o launcher de release usa `CARGO_MANIFEST_DIR` e a passphrase do ambiente |
+| Aceite local | Registrado pelo proprietário | `G6_MAC_002_2_MAC_003_ACEITE.md`; sem push, tag ou deploy |
 
 ## Smoke manual
 
@@ -91,6 +91,22 @@ Isso é marco local no checkout. Não é pacote distribuível: `helper_command` 
 
 Ignorados de propósito: stresses de MAC-001.2 e MAC-002.1, entrypoints de processo filho e o teste de release na suíte principal (executado depois, à parte, quando o binário existia).
 
+## Smoke executado pelo proprietário
+
+A observação automática da janela ficou bloqueada: `System Events` respondeu `UI elements enabled = false`. Nenhuma permissão foi alterada e o agente não leu a janela. O proprietário executou a jornada na aplicação Tauri real e confirmou o resultado. Isto não é automação independente nem observação do agente.
+
+Resultado registrado, sem credencial, token ou caminho de socket:
+
+- runtime **Pronto**, canal **Autenticado**, protocolo 3;
+- sessão local aberta;
+- consentimento explícito e concessão `mission:read` em `dom_synthetic_a`;
+- missão **Missão sintética MAC-003** exibida;
+- concessão revogada e leitura negada;
+- sessão encerrada e reaberta sem herdar concessão; leitura novamente negada;
+- sessão encerrada e runtime parado.
+
+A frase vista no botão de leitura sem concessão continua sendo a negativa do cache Rust. A negativa correspondente do FastAPI permanece a evidência do supervisor de produção, não uma segunda ida observada nesta janela.
+
 ## Limites
 
-Não houve aceite formal. O smoke da janela continua dependente da execução manual acima. Distribuição, OAuth, dados reais e serviços externos continuam fora deste marco.
+O aceite local cobre o marco MAC-002.2 / MAC-003 no checkout. Distribuição, Keychain, runner embutido, OAuth, dados reais e serviços externos continuam fora. Os P3 ainda abertos estão deferidos no registro de aceite e não foram apagados.
