@@ -247,7 +247,10 @@ function App() {
             </div>
           </> : <>
             <label className="confirm"><input type="checkbox" checked={grantConfirmed} onChange={(event) => setGrantConfirmed(event.currentTarget.checked)} /> Confirmo leitura somente de Missões sintéticas em <code>dom_synthetic_a</code> por até 60 minutos.</label>
-            <button className="action" type="button" disabled={g5Busy || !grantConfirmed} onClick={() => void runG5Command("create-grant")}>Conceder leitura</button>
+            <div className="g5-actions">
+              <button className="action" type="button" disabled={g5Busy || !grantConfirmed} onClick={() => void runG5Command("create-grant")}>Conceder leitura</button>
+              <button className="action secondary" type="button" disabled={g5Busy} onClick={() => void runG5Command("list-missions")}>Tentar leitura sem concessão</button>
+            </div>
           </>}
           <button className="action secondary" type="button" disabled={g5Busy} onClick={() => void runG5Command("close-session")}>Encerrar sessão e invalidar concessão</button>
         </section>}
