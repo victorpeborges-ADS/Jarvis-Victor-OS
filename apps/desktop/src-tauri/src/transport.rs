@@ -3,8 +3,8 @@ use std::{
     io::{BufRead, Read, Write},
     path::{Path, PathBuf},
     sync::{
-        atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
-        Arc, Mutex, MutexGuard,
+        atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering},
+        Arc, Condvar, Mutex, MutexGuard,
     },
     time::{Duration, Instant},
 };
@@ -187,6 +187,26 @@ impl TransportError {
     }
 }
 
+struct RequestLockState {
+    held: bool,
+    waiters: usize,
+}
+
+struct RequestLockGuard<'a> {
+    session: &'a TransportSession,
+}
+
+impl Drop for RequestLockGuard<'_> {
+    fn drop(&mut self) {
+        let mut state = lock(&self.session.request_state);
+        self.session
+            .request_lock_depth
+            .fetch_sub(1, Ordering::AcqRel);
+        state.held = false;
+        self.session.request_cv.notify_all();
+    }
+}
+
 /// Native-only transport capability. The endpoint and key are never serialized to Tauri IPC.
 pub(crate) struct TransportSession {
     instance_id: String,
@@ -199,7 +219,13 @@ pub(crate) struct TransportSession {
     envelope_sequence: AtomicU64,
     active: AtomicBool,
     cleanup_done: AtomicBool,
-    request_lock: Mutex<()>,
+    /// Logical transaction lock. The mutex is not held across socket IO; `held`
+    /// stays true until the guard drops, and waiters block on `request_cv`.
+    request_state: Mutex<RequestLockState>,
+    request_cv: Condvar,
+    request_lock_depth: AtomicUsize,
+    #[cfg(test)]
+    before_socket_write: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
 }
 
 impl TransportSession {
@@ -253,11 +279,19 @@ impl TransportSession {
             envelope_sequence: AtomicU64::new(0),
             active: AtomicBool::new(true),
             cleanup_done: AtomicBool::new(false),
-            request_lock: Mutex::new(()),
+            request_state: Mutex::new(RequestLockState {
+                held: false,
+                waiters: 0,
+            }),
+            request_cv: Condvar::new(),
+            request_lock_depth: AtomicUsize::new(0),
+            #[cfg(test)]
+            before_socket_write: Mutex::new(None),
         }))
     }
 
     pub(crate) fn write_child_init(&self, writer: &mut impl Write) -> Result<(), TransportError> {
+        let _request = self.lock_request();
         let secret = lock(&self.secret);
         let Some(secret) = secret.as_ref() else {
             return Err(TransportError::Inactive);
@@ -293,7 +327,7 @@ impl TransportSession {
     }
 
     fn probe_endpoint(&self, endpoint: &std::path::Path) -> Result<(), TransportError> {
-        let _serial = lock(&self.request_lock);
+        let _serial = self.lock_request();
         self.probe_endpoint_locked(endpoint)
     }
 
@@ -356,11 +390,11 @@ impl TransportSession {
         if body.len() > MAX_APP_REQUEST_BODY_BYTES {
             return Err(TransportError::ApplicationRequestTooLarge);
         }
-        let _serial = lock(&self.request_lock);
+        let _serial = self.lock_request();
         self.probe_endpoint_locked(&self.socket_path)?;
         after_probe();
-        let nonce = self.next_envelope_nonce()?;
-        let envelope = self.seal_application_request(route, body, &nonce)?;
+        let nonce = self.next_envelope_nonce_locked()?;
+        let envelope = self.seal_application_request_locked(route, body, &nonce)?;
         let response = self.exchange_at(
             &self.socket_path,
             Verb::Post,
@@ -416,8 +450,18 @@ impl TransportSession {
     }
 
     pub(crate) fn deactivate(&self) {
-        // One critical section covers inactivity, secret destruction, and sequence
-        // retirement. The counter is parked at u64::MAX so it cannot be reissued.
+        // Wait for an in-flight probe or G5 transaction before retiring the
+        // capability. Callers of this method do not already hold `request_lock`;
+        // acquiring it here cannot deadlock with `call_g5_application` or `probe`,
+        // which release the manager lock before taking this one. The wait is
+        // bounded by the connect and request timeouts of the transaction.
+        let _request = self.lock_request();
+        self.deactivate_locked();
+    }
+
+    fn deactivate_locked(&self) {
+        // Inactivity, secret destruction, and sequence retirement stay in one
+        // capability critical section. The counter is parked at u64::MAX.
         let mut secret = lock(&self.secret);
         self.active.store(false, Ordering::Release);
         if let Some(mut secret) = secret.take() {
@@ -449,6 +493,11 @@ impl TransportSession {
         route: &'static str,
         body: &[u8],
     ) -> Result<Vec<u8>, TransportError> {
+        // The caller holds the G5 transaction lock from this check through the
+        // write below. `deactivate` takes that same lock first, so it cannot
+        // return while this send is still running, and a later caller fails here
+        // before connecting or writing.
+        debug_assert!(self.request_lock_depth.load(Ordering::Acquire) > 0);
         self.ensure_active()?;
         let mut stream = connect_bounded(endpoint, CONNECT_TIMEOUT).map_err(|error| {
             eprintln!(
@@ -487,6 +536,10 @@ impl TransportSession {
             body.len()
         );
         self.ensure_active()?;
+        #[cfg(test)]
+        self.pause_before_socket_write_for_test();
+        self.ensure_active()?;
+        debug_assert!(self.request_lock_depth.load(Ordering::Acquire) > 0);
         stream
             .write_all(request.as_bytes())
             .and_then(|_| stream.write_all(body))
@@ -519,7 +572,14 @@ impl TransportSession {
         self.ensure_active()
     }
 
+    #[cfg(test)]
     fn next_envelope_nonce(&self) -> Result<[u8; ENVELOPE_NONCE_BYTES], TransportError> {
+        let _request = self.lock_request();
+        self.next_envelope_nonce_locked()
+    }
+
+    fn next_envelope_nonce_locked(&self) -> Result<[u8; ENVELOPE_NONCE_BYTES], TransportError> {
+        debug_assert!(self.request_lock_depth.load(Ordering::Acquire) > 0);
         let secret = lock(&self.secret);
         if !self.active.load(Ordering::Acquire) || secret.is_none() {
             return Err(TransportError::Inactive);
@@ -535,12 +595,24 @@ impl TransportSession {
         Ok(nonce)
     }
 
+    #[cfg(test)]
     fn seal_application_request(
         &self,
         route: &str,
         body: &[u8],
         nonce: &[u8; ENVELOPE_NONCE_BYTES],
     ) -> Result<Vec<u8>, TransportError> {
+        let _request = self.lock_request();
+        self.seal_application_request_locked(route, body, nonce)
+    }
+
+    fn seal_application_request_locked(
+        &self,
+        route: &str,
+        body: &[u8],
+        nonce: &[u8; ENVELOPE_NONCE_BYTES],
+    ) -> Result<Vec<u8>, TransportError> {
+        debug_assert!(self.request_lock_depth.load(Ordering::Acquire) > 0);
         let path = route.as_bytes();
         let path_len = u16::try_from(path.len()).map_err(|_| TransportError::HttpRejected)?;
         let body_len =
@@ -585,13 +657,15 @@ impl TransportSession {
         envelope: &[u8],
         expected_nonce: &[u8; ENVELOPE_NONCE_BYTES],
     ) -> Result<Vec<u8>, TransportError> {
+        debug_assert!(self.request_lock_depth.load(Ordering::Acquire) > 0);
         if envelope.len() > MAX_ENVELOPE_RESPONSE_BYTES
             || envelope.len() < ENVELOPE_NONCE_BYTES + ENVELOPE_TAG_BYTES
             || &envelope[..ENVELOPE_NONCE_BYTES] != expected_nonce
         {
             return Err(TransportError::ProofRejected);
         }
-        let (mut encryption_key, mut authentication_key) = self.envelope_keys(b"response")?;
+        let (mut encryption_key, mut authentication_key) =
+            self.envelope_keys_locked(b"response")?;
         let opened = open_message(
             &self.instance_id,
             b"response",
@@ -618,7 +692,17 @@ impl TransportSession {
         Ok(response)
     }
 
+    #[cfg(test)]
     fn envelope_keys(&self, direction: &[u8]) -> Result<([u8; 32], [u8; 32]), TransportError> {
+        let _request = self.lock_request();
+        self.envelope_keys_locked(direction)
+    }
+
+    fn envelope_keys_locked(
+        &self,
+        direction: &[u8],
+    ) -> Result<([u8; 32], [u8; 32]), TransportError> {
+        debug_assert!(self.request_lock_depth.load(Ordering::Acquire) > 0);
         let secret = lock(&self.secret);
         if !self.active.load(Ordering::Acquire) {
             return Err(TransportError::Inactive);
@@ -658,6 +742,43 @@ impl TransportSession {
             return Err(TransportError::ProofRejected);
         }
         self.ensure_active()
+    }
+
+    /// Serializes probe, seal, send, and response open. The state mutex is not
+    /// held during socket IO; `held` remains true until the guard drops.
+    fn lock_request(&self) -> RequestLockGuard<'_> {
+        let mut state = lock(&self.request_state);
+        while state.held {
+            state.waiters += 1;
+            self.request_cv.notify_all();
+            state = self
+                .request_cv
+                .wait(state)
+                .unwrap_or_else(|error| error.into_inner());
+            state.waiters -= 1;
+        }
+        state.held = true;
+        self.request_lock_depth.fetch_add(1, Ordering::Release);
+        RequestLockGuard { session: self }
+    }
+
+    #[cfg(test)]
+    fn pause_before_socket_write_for_test(&self) {
+        let hook = lock(&self.before_socket_write).clone();
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+
+    #[cfg(test)]
+    fn wait_until_request_contended_for_test(&self) {
+        let mut state = lock(&self.request_state);
+        while state.waiters == 0 {
+            state = self
+                .request_cv
+                .wait(state)
+                .unwrap_or_else(|error| error.into_inner());
+        }
     }
 }
 
@@ -2149,17 +2270,139 @@ mod tests {
             .seal_application_request(APP_SESSION_OPEN_ROUTE, b"k=v\n", &first)
             .is_err());
         assert_eq!(
-            session.exchange_at(
-                &session.socket_path,
-                Verb::Post,
-                APPLICATION_ENVELOPE_ROUTE,
-                b""
-            ),
+            {
+                let _request = session.lock_request();
+                session.exchange_at(
+                    &session.socket_path,
+                    Verb::Post,
+                    APPLICATION_ENVELOPE_ROUTE,
+                    b"",
+                )
+            },
             Err(TransportError::Inactive)
         );
         assert!(lock(&session.secret).is_none());
         assert_eq!(session.envelope_sequence.load(Ordering::Acquire), u64::MAX);
         session.revoke();
+    }
+
+    #[test]
+    fn inflight_send_finishes_before_deactivate_and_later_send_writes_nothing() {
+        use std::sync::mpsc;
+
+        let session = TransportSession::create("send-lifecycle-inflight").unwrap();
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let entered = Arc::new(Mutex::new(Some(entered_tx)));
+        let release = Arc::new(std::sync::Barrier::new(2));
+        let entered_hook = Arc::clone(&entered);
+        let release_hook = Arc::clone(&release);
+        {
+            let mut hook = lock(&session.before_socket_write);
+            *hook = Some(Arc::new(move || {
+                if let Some(sender) = entered_hook.lock().unwrap().take() {
+                    sender.send(()).unwrap();
+                }
+                release_hook.wait();
+            }));
+        }
+
+        let received = Arc::new(AtomicUsize::new(0));
+        let received_server = Arc::clone(&received);
+        let listener = fake_listener(&session);
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let mut payload = Vec::new();
+            let mut buffer = [0_u8; 1024];
+            loop {
+                match stream.read(&mut buffer) {
+                    Ok(0) => break,
+                    Ok(count) => {
+                        payload.extend_from_slice(&buffer[..count]);
+                        if payload.windows(4).any(|window| window == b"\r\n\r\n") {
+                            break;
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+            received_server.store(payload.len(), Ordering::Release);
+            let body = b"ok\n";
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            let _ = stream.write_all(response.as_bytes());
+            let _ = stream.write_all(body);
+        });
+
+        let sending = Arc::clone(&session);
+        let sender = thread::spawn(move || {
+            let _request = sending.lock_request();
+            sending.exchange_at(&sending.socket_path, Verb::Get, HEALTH_ROUTE, b"")
+        });
+        entered_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("send reached the barrier between the activity check and the socket write");
+
+        let deactivated = Arc::new(AtomicBool::new(false));
+        let deactivated_flag = Arc::clone(&deactivated);
+        let retiring = Arc::clone(&session);
+        let retirement = thread::spawn(move || {
+            retiring.deactivate();
+            deactivated_flag.store(true, Ordering::Release);
+        });
+        session.wait_until_request_contended_for_test();
+        assert!(
+            !deactivated.load(Ordering::Acquire),
+            "deactivate returned while the in-flight send still held the transaction"
+        );
+        release.wait();
+
+        assert!(sender.join().unwrap().is_ok());
+        retirement.join().unwrap();
+        server.join().unwrap();
+        let inflight_bytes = received.load(Ordering::Acquire);
+        assert!(inflight_bytes > 0, "in-flight send wrote no bytes");
+
+        {
+            let mut hook = lock(&session.before_socket_write);
+            *hook = None;
+        }
+        let after = {
+            let _request = session.lock_request();
+            session.exchange_at(&session.socket_path, Verb::Get, HEALTH_ROUTE, b"")
+        };
+        assert_eq!(after, Err(TransportError::Inactive));
+        assert_eq!(received.load(Ordering::Acquire), inflight_bytes);
+        assert!(lock(&session.secret).is_none());
+        assert_eq!(session.envelope_sequence.load(Ordering::Acquire), u64::MAX);
+        assert!(session.next_envelope_nonce().is_err());
+        assert!(session
+            .seal_application_request(APP_SESSION_OPEN_ROUTE, b"k=v\n", &[0; 16])
+            .is_err());
+        session.revoke();
+
+        let blocked = TransportSession::create("send-lifecycle-deactivate-first").unwrap();
+        blocked.deactivate();
+        let listener = fake_listener(&blocked);
+        listener.set_nonblocking(true).unwrap();
+        let rejected = {
+            let _request = blocked.lock_request();
+            blocked.exchange_at(&blocked.socket_path, Verb::Get, HEALTH_ROUTE, b"")
+        };
+        assert_eq!(rejected, Err(TransportError::Inactive));
+        match listener.accept() {
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+            Ok(_) => panic!("deactivate-first send connected"),
+            Err(error) => panic!("deactivate-first accept failed: {error}"),
+        }
+        assert!(lock(&blocked.secret).is_none());
+        assert_eq!(blocked.envelope_sequence.load(Ordering::Acquire), u64::MAX);
+        assert!(blocked.next_envelope_nonce().is_err());
+        blocked.revoke();
     }
 
     #[test]

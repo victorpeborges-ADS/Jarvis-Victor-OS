@@ -100,3 +100,22 @@ Evidência desta correção, executada na worktree nova:
 | `cargo test --locked --features mac003-production-supervisor-test --test mac003_production_supervisor -- --test-threads=1` | PASS: 1; supervisor real/FastAPI, G5, STOP/EOF/crash/restart |
 
 Não houve falha intermediária nesta correção. A suíte completa do crate e os stresses ignorados não foram repetidos. O smoke Tauri/WebView não foi executado. Nenhum aceite formal é declarado. Próximo passo: reauditoria focada deste commit. Merge, push, tag e deploy continuam não autorizados.
+
+## Correção da corrida de envio
+
+Branch `feat/jarvis-g6-mac-002-2-send-lifecycle-fix`, worktree `/Users/vic/.codex/worktrees/jarvis-g6-mac-002-2-send-lifecycle-fix/Jarvis-Victor-OS`, derivada de `2cd1661d1e43cb73630cfd0e62f50704fec0ef40`. Não muda o wire format v3, a partição CTR, os limites, as chaves, UDS-only, PID, lockfiles, migrations, SQLite ou controles G5.
+
+`deactivate` agora espera o `request_lock` antes do mutex da capability. Probe, init do child, alocação, seal, envio e abertura de resposta usam a mesma ordem. A transação G5 segura o lock desde a verificação de atividade até a escrita no socket e a validação da resposta. O mutex de estado não fica preso durante o IO: a flag `held` permanece verdadeira até o fim da transação, e a desativação bloqueia nessa espera. Quando `deactivate` retorna, o envio em curso já terminou e o segredo e a sequência foram retirados. Quem obtém o lock depois falha antes de conectar ou escrever.
+
+Os chamadores de `deactivate` e `revoke` — `begin_stop`, `revoke_transport_locked`, `Drop` e os testes — não seguram `request_lock`. As operações G5 soltam o lock do manager antes de adquirir o lock da transação, então a espera não forma ciclo. Ela fica limitada aos timeouts já existentes de conexão e pedido.
+
+O teste `inflight_send_finishes_before_deactivate_and_later_send_writes_nothing` coloca uma barreira entre a checagem de atividade e o `write_all`. Com o envio parado nessa barreira, observa a desativação bloqueada e só então libera a escrita. O envio em curso conclui; a desativação retorna depois; um envio seguinte não escreve. No outro sentido, `deactivate` obtém o lock primeiro e a operação posterior não conecta.
+
+| Comando | Resultado |
+|---|---|
+| `uv sync --locked --python 3.12` em `apps/api` | PASS; lockfile preservado |
+| `cargo fmt --all -- --check` e `git diff --check` | PASS |
+| `cargo test --locked --features mac003-production-supervisor-test --lib transport::tests -- --test-threads=1` | PASS: 26; 3 ignorados (entrypoint subordinado e dois stresses MAC-002.1); 62 filtrados |
+| `cargo test --locked --features mac003-production-supervisor-test --test mac003_production_supervisor -- --test-threads=1` | PASS: 1; supervisor real/FastAPI, G5, STOP/EOF/crash/restart |
+
+A primeira compilação do teste de integração, antes de restringir os wrappers de teste com `cfg(test)`, avisou que `next_envelope_nonce`, `seal_application_request` e `envelope_keys` não eram usados fora dos unitários. A repetição final compilou sem esse aviso. A suíte completa do crate e os três testes ignorados não foram executados. O smoke Tauri/WebView não foi executado. Nenhum aceite formal é declarado. Merge, push, tag e deploy continuam não autorizados.
