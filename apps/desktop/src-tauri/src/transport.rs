@@ -22,13 +22,13 @@ use std::os::raw::{c_char, c_int, c_uint};
 
 const INIT_PREFIX: &[u8] = b"JARVIS_TRANSPORT_INIT ";
 const SOCKET_LEAF: &[u8] = b"runtime.sock\0";
-const PROTOCOL_VERSION: &str = "2";
+pub(crate) const PROTOCOL_VERSION: &str = "3";
 const RUNTIME_KIND: &str = "jarvis-synthetic";
-const BUILD_ID: &str = "g6-mac-002-2-encrypted-uds-v2";
+const BUILD_ID: &str = "g6-mac-002-2-encrypted-uds-v3";
 const HEALTH_ROUTE: &str = "/v1/health";
 const VERSION_ROUTE: &str = "/v1/version";
 const PROOF_ROUTE: &str = "/v1/instance-proof";
-const APPLICATION_ENVELOPE_ROUTE: &str = "/v2/secure";
+const APPLICATION_ENVELOPE_ROUTE: &str = "/v3/secure";
 const APP_SESSION_OPEN_ROUTE: &str = "/v1/app/session/open";
 const APP_SESSION_CLOSE_ROUTE: &str = "/v1/app/session/close";
 const APP_GRANT_CREATE_ROUTE: &str = "/v1/app/grants/mission-read";
@@ -54,9 +54,9 @@ const MAX_INIT_BYTES: usize = 1024;
 const SECRET_BYTES: usize = 32;
 const NONCE_BYTES: usize = 32;
 const ENVELOPE_NONCE_BYTES: usize = 16;
-const ENVELOPE_PREFIX_BYTES: usize = 8;
+const ENVELOPE_SEQUENCE_BYTES: usize = 8;
 const ENVELOPE_TAG_BYTES: usize = 32;
-const ENVELOPE_VERSION: u8 = 2;
+const ENVELOPE_VERSION: u8 = 3;
 const MAX_ENVELOPE_REQUEST_BYTES: usize = MAX_APP_REQUEST_BODY_BYTES + 256;
 const MAX_ENVELOPE_RESPONSE_BYTES: usize =
     MAX_RESPONSE_BODY_BYTES + ENVELOPE_NONCE_BYTES + ENVELOPE_TAG_BYTES + 7;
@@ -196,7 +196,6 @@ pub(crate) struct TransportSession {
     directory_identity: DirectoryIdentity,
     secret: Mutex<Option<[u8; SECRET_BYTES]>>,
     expected_peer_pid: AtomicU32,
-    envelope_nonce_prefix: [u8; ENVELOPE_PREFIX_BYTES],
     envelope_sequence: AtomicU64,
     active: AtomicBool,
     cleanup_done: AtomicBool,
@@ -207,15 +206,9 @@ impl TransportSession {
     pub(crate) fn create(instance_id: &str) -> Result<Arc<Self>, TransportError> {
         let mut secret = [0_u8; SECRET_BYTES];
         let mut name = [0_u8; 16];
-        let mut envelope_nonce_prefix = [0_u8; ENVELOPE_PREFIX_BYTES];
         os_random(&mut secret)?;
         if let Err(error) = os_random(&mut name) {
             secret.fill(0);
-            return Err(error);
-        }
-        if let Err(error) = os_random(&mut envelope_nonce_prefix) {
-            secret.fill(0);
-            name.fill(0);
             return Err(error);
         }
 
@@ -257,7 +250,6 @@ impl TransportSession {
             directory_identity,
             secret: Mutex::new(Some(secret)),
             expected_peer_pid: AtomicU32::new(test_default_peer_pid()),
-            envelope_nonce_prefix,
             envelope_sequence: AtomicU64::new(0),
             active: AtomicBool::new(true),
             cleanup_done: AtomicBool::new(false),
@@ -541,8 +533,7 @@ impl TransportSession {
             }
         };
         let mut nonce = [0_u8; ENVELOPE_NONCE_BYTES];
-        nonce[..ENVELOPE_PREFIX_BYTES].copy_from_slice(&self.envelope_nonce_prefix);
-        nonce[ENVELOPE_PREFIX_BYTES..].copy_from_slice(&sequence.to_be_bytes());
+        nonce[..ENVELOPE_SEQUENCE_BYTES].copy_from_slice(&sequence.to_be_bytes());
         Ok(nonce)
     }
 
@@ -739,7 +730,7 @@ fn parse_fields<'a>(
 
 fn proof_message(version: &Version, nonce_hex: &str, operation_result: &str) -> String {
     format!(
-        "jarvis-local-transport-proof-v2\n{}\n{}\n{}\n{}\n{}\n{}",
+        "jarvis-local-transport-proof-v3\n{}\n{}\n{}\n{}\n{}\n{}",
         version.protocol,
         version.runtime_kind,
         version.instance_id,
@@ -1497,7 +1488,7 @@ fn unix_peer_pid(_stream: &UnixStream) -> Result<u32, TransportError> {
 }
 
 fn envelope_key_context(purpose: &[u8], direction: &[u8], instance_id: &str) -> Vec<u8> {
-    let mut context = b"jarvis-local-envelope-v2\0".to_vec();
+    let mut context = b"jarvis-local-envelope-v3\0".to_vec();
     context.extend_from_slice(purpose);
     context.push(0);
     context.extend_from_slice(direction);
@@ -1512,7 +1503,7 @@ fn envelope_mac_message(
     nonce: &[u8; ENVELOPE_NONCE_BYTES],
     ciphertext: &[u8],
 ) -> Vec<u8> {
-    let mut message = b"jarvis-local-envelope-v2\0".to_vec();
+    let mut message = b"jarvis-local-envelope-v3\0".to_vec();
     message.extend_from_slice(instance_id.as_bytes());
     message.push(0);
     message.extend_from_slice(direction);
@@ -1524,6 +1515,24 @@ fn envelope_mac_message(
     message
 }
 
+// Sequence s owns counters s*2^64 through s*2^64 + ceil(size/16)-1.
+// Payload caps use at most 129 blocks, so the low half never carries into s.
+fn validate_counter_partition(
+    direction: &[u8],
+    nonce: &[u8; 16],
+    size: usize,
+) -> Result<(), TransportError> {
+    let limit = match direction {
+        b"request" => MAX_ENVELOPE_REQUEST_BYTES - ENVELOPE_NONCE_BYTES - ENVELOPE_TAG_BYTES,
+        b"response" => MAX_RESPONSE_BODY_BYTES + 7,
+        _ => return Err(TransportError::HttpRejected),
+    };
+    if size > limit || nonce[..8] == [0_u8; 8] || nonce[8..] != [0_u8; 8] {
+        return Err(TransportError::HttpRejected);
+    }
+    Ok(())
+}
+
 fn seal_message(
     instance_id: &str,
     direction: &[u8],
@@ -1532,6 +1541,7 @@ fn seal_message(
     nonce: &[u8; ENVELOPE_NONCE_BYTES],
     plaintext: &[u8],
 ) -> Result<Vec<u8>, TransportError> {
+    validate_counter_partition(direction, nonce, plaintext.len())?;
     let mut ciphertext = aes_ctr_xor(encryption_key, nonce, plaintext)?;
     let mut mac_message = envelope_mac_message(instance_id, direction, nonce, &ciphertext);
     let tag = hmac_sha256(authentication_key, &mac_message)?;
@@ -1565,6 +1575,7 @@ fn open_message(
     if !constant_time_equal(received_tag, &expected_tag) {
         return Err(TransportError::ProofRejected);
     }
+    validate_counter_partition(direction, nonce, ciphertext.len())?;
     aes_ctr_xor(encryption_key, nonce, ciphertext)
 }
 
@@ -1618,7 +1629,7 @@ fn aes_ctr_xor(
                 std::ptr::null(),
                 0,
                 0,
-                0,
+                2, // kCCModeOptionCTR_BE
                 &mut cryptor,
             )
         };
@@ -1999,6 +2010,178 @@ mod tests {
     }
 
     #[test]
+    fn consecutive_multiblock_messages_do_not_reuse_keystream() {
+        let session = TransportSession::create("ctr-regression").unwrap();
+        let first = session.next_envelope_nonce().unwrap();
+        let second = session.next_envelope_nonce().unwrap();
+        for direction in [b"request".as_slice(), b"response".as_slice()] {
+            let (mut encryption, mut authentication) = session.envelope_keys(direction).unwrap();
+            let mut unknown = [0_u8; 96];
+            os_random(&mut unknown).unwrap();
+            let known = [0_u8; 96];
+            let a = seal_message(
+                &session.instance_id,
+                direction,
+                &encryption,
+                &authentication,
+                &first,
+                &unknown,
+            )
+            .unwrap();
+            let b = seal_message(
+                &session.instance_id,
+                direction,
+                &encryption,
+                &authentication,
+                &second,
+                &known,
+            )
+            .unwrap();
+            // Audit attack: known plaintext from message 2 must not recover message 1.
+            let recovered = (0..80).all(|i| a[32 + i] ^ b[16 + i] ^ known[i] == unknown[16 + i]);
+            unknown.fill(0);
+            encryption.fill(0);
+            authentication.fill(0);
+            assert!(!recovered, "consecutive messages reused CTR keystream");
+        }
+    }
+
+    #[test]
+    fn ctr_partition_bounds_sequence_wrap_and_real_block_progression() {
+        let session = TransportSession::create("ctr-boundary").unwrap();
+        for sequence in [1_u64, 2, u64::MAX - 1, u64::MAX] {
+            let mut nonce = [0_u8; 16];
+            nonce[..8].copy_from_slice(&sequence.to_be_bytes());
+            for (direction, limit) in [
+                (b"request".as_slice(), MAX_ENVELOPE_REQUEST_BYTES - 48),
+                (b"response".as_slice(), MAX_RESPONSE_BODY_BYTES + 7),
+            ] {
+                let start = u128::from_be_bytes(nonce);
+                let last = start + limit.div_ceil(16) as u128 - 1;
+                assert_eq!(last >> 64, sequence as u128);
+                assert!(validate_counter_partition(direction, &nonce, limit).is_ok());
+                let (mut ek, mut ak) = session.envelope_keys(direction).unwrap();
+                let sealed = seal_message(
+                    &session.instance_id,
+                    direction,
+                    &ek,
+                    &ak,
+                    &nonce,
+                    &vec![0; limit],
+                )
+                .unwrap();
+                assert!(open_message(&session.instance_id, direction, &ek, &ak, &sealed).is_ok());
+                assert!(seal_message(
+                    &session.instance_id,
+                    direction,
+                    &ek,
+                    &ak,
+                    &nonce,
+                    &vec![0; limit + 1]
+                )
+                .is_err());
+                // A valid MAC cannot bypass the size limit in the production opener.
+                let ciphertext = aes_ctr_xor(&ek, &nonce, &vec![0; limit + 1]).unwrap();
+                let tag = hmac_sha256(
+                    &ak,
+                    &envelope_mac_message(&session.instance_id, direction, &nonce, &ciphertext),
+                )
+                .unwrap();
+                let mut oversized = nonce.to_vec();
+                oversized.extend_from_slice(&ciphertext);
+                oversized.extend_from_slice(&tag);
+                assert!(
+                    open_message(&session.instance_id, direction, &ek, &ak, &oversized).is_err()
+                );
+                let stream = aes_ctr_xor(&ek, &nonce, &vec![0; 16 * 129]).unwrap();
+                for block in [0_usize, 1, 77, 128] {
+                    let mut counter = nonce;
+                    counter[8..].copy_from_slice(&(block as u64).to_be_bytes());
+                    let independent = aes_ctr_xor(&ek, &counter, &[0; 16]).unwrap();
+                    assert!(stream[block * 16..(block + 1) * 16] == independent);
+                }
+                ek.fill(0);
+                ak.fill(0);
+            }
+        }
+        assert!(validate_counter_partition(b"request", &[0; 16], 32).is_err());
+        let mut invalid = [0_u8; 16];
+        invalid[7] = 1;
+        invalid[15] = 1;
+        assert!(validate_counter_partition(b"request", &invalid, 32).is_err());
+        session
+            .envelope_sequence
+            .store(u64::MAX - 1, Ordering::Release);
+        let last = session.next_envelope_nonce().unwrap();
+        assert!(last[..8] == u64::MAX.to_be_bytes());
+        assert!(session.next_envelope_nonce().is_err());
+        assert_eq!(session.envelope_sequence.load(Ordering::Acquire), u64::MAX);
+    }
+
+    #[test]
+    fn production_crypto_interoperates_with_python_in_both_directions() {
+        use std::process::{Command, Stdio};
+        let api = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../api");
+        let script = r#"
+import sys
+import native_runtime as n
+raw = sys.stdin.buffer.read()
+identity = n.NativeRuntimeIdentity('ctr-interop', bytearray(raw[:32]), 1, 1)
+direction = sys.argv[1].encode('ascii')
+nonce = raw[32:48]
+envelope = raw[48:]
+_, plaintext = n._open_application_envelope(identity, direction, envelope)
+limit = n.CTR_REQUEST_MAX_BYTES if direction == b'request' else n.CTR_RESPONSE_MAX_BYTES
+if plaintext != bytes(i % 251 for i in range(limit)): raise SystemExit(2)
+python_envelope = n._seal_application_envelope(identity, direction, nonce, plaintext)
+if python_envelope != envelope: raise SystemExit(3)
+identity.clear()
+sys.stdout.buffer.write(python_envelope)
+"#;
+        let session = TransportSession::create("ctr-interop").unwrap();
+        for (direction, size) in [
+            (b"request".as_slice(), MAX_ENVELOPE_REQUEST_BYTES - 48),
+            (b"response".as_slice(), MAX_RESPONSE_BODY_BYTES + 7),
+        ] {
+            let nonce = session.next_envelope_nonce().unwrap();
+            let (mut ek, mut ak) = session.envelope_keys(direction).unwrap();
+            let plaintext: Vec<u8> = (0..size).map(|i| (i % 251) as u8).collect();
+            let envelope = seal_message(
+                &session.instance_id,
+                direction,
+                &ek,
+                &ak,
+                &nonce,
+                &plaintext,
+            )
+            .unwrap();
+            let mut child = Command::new(api.join(".venv/bin/python"))
+                .args(["-B", "-c", script, std::str::from_utf8(direction).unwrap()])
+                .current_dir(&api)
+                .env_clear()
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap();
+            {
+                let mut input = child.stdin.take().unwrap();
+                let secret = lock(&session.secret);
+                input.write_all(secret.as_ref().unwrap()).unwrap();
+                input.write_all(&nonce).unwrap();
+                input.write_all(&envelope).unwrap();
+            }
+            let output = child.wait_with_output().unwrap();
+            assert!(output.status.success(), "cross-language crypto failed");
+            let opened =
+                open_message(&session.instance_id, direction, &ek, &ak, &output.stdout).unwrap();
+            assert!(opened == plaintext, "Python to Rust decryption failed");
+            ek.fill(0);
+            ak.fill(0);
+        }
+    }
+
+    #[test]
     fn commoncrypt_aes256_ctr_matches_nist_vector() {
         let key = decode_hex_array::<32>(
             b"603deb1015ca71be2b73aef0857d7781\
@@ -2022,8 +2205,7 @@ mod tests {
         let session = TransportSession::create("envelope-confidentiality").unwrap();
         let body = b"passphrase=synthetic-passphrase-never-send-plain\nsession_token=synthetic-session-token-secret\ncsrf_token=synthetic-csrf-secret\ngrant_id=synthetic-grant-secret\nmission_title=synthetic-mission-secret\n";
         let mut nonce = [0_u8; ENVELOPE_NONCE_BYTES];
-        nonce[..ENVELOPE_PREFIX_BYTES].copy_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8]);
-        nonce[ENVELOPE_PREFIX_BYTES..].copy_from_slice(&7_u64.to_be_bytes());
+        nonce[..ENVELOPE_SEQUENCE_BYTES].copy_from_slice(&7_u64.to_be_bytes());
         let envelope = session
             .seal_application_request(APP_SESSION_OPEN_ROUTE, body, &nonce)
             .unwrap();
@@ -2045,7 +2227,7 @@ mod tests {
     fn encrypted_response_tampering_and_generation_replay_are_rejected() {
         let session = TransportSession::create("envelope-generation-a").unwrap();
         let mut nonce = [0_u8; ENVELOPE_NONCE_BYTES];
-        nonce[ENVELOPE_PREFIX_BYTES..].copy_from_slice(&1_u64.to_be_bytes());
+        nonce[..ENVELOPE_SEQUENCE_BYTES].copy_from_slice(&1_u64.to_be_bytes());
         let frame = [ENVELOPE_VERSION, 0, 200, 0, 0, 0, 2, b'o', b'k'];
         let (mut encryption_key, mut authentication_key) =
             session.envelope_keys(b"response").unwrap();
@@ -2058,18 +2240,18 @@ mod tests {
             &frame,
         )
         .unwrap();
-        let final_index = envelope.len() - 1;
-        envelope[final_index] ^= 1;
-        assert_eq!(
-            open_message(
+        for position in [0, 16, envelope.len() - 1] {
+            envelope[position] ^= 1;
+            assert!(open_message(
                 &session.instance_id,
                 b"response",
                 &encryption_key,
                 &authentication_key,
-                &envelope,
-            ),
-            Err(TransportError::ProofRejected)
-        );
+                &envelope
+            )
+            .is_err());
+            envelope[position] ^= 1;
+        }
         let other_generation = TransportSession::create("envelope-generation-b").unwrap();
         let (mut other_encryption, mut other_authentication) =
             other_generation.envelope_keys(b"response").unwrap();
@@ -2189,7 +2371,7 @@ mod tests {
             &session,
             vec![
                 FakeReply::Body(b"ok\n".to_vec()),
-                FakeReply::Body(version_body("version-instance", "99")),
+                FakeReply::Body(version_body("version-instance", "2")),
             ],
         );
         assert_eq!(session.probe(), Err(TransportError::IncompatibleVersion));

@@ -14,10 +14,10 @@
 3. O helper vincula `runtime.sock` relativamente ao diretório aberto, com `umask(0177)` para criar o socket em modo 0600, e só anuncia readiness depois do bind. O supervisor verifica que o nome da sessão ainda aponta para o handle original antes de aceitar readiness.
 4. Depois do ACK de readiness, o native client consulta `health` e `version`; ambas são evidências informativas.
 5. O native client gera nonce novo de 32 bytes com o CSPRNG do macOS e envia o nonce em corpo de `POST /v1/instance-proof`.
-6. O helper retorna protocol, runtime kind, instance ID, build, resultado sintético e HMAC-SHA-256. A mensagem assinada agora tem domínio `jarvis-local-transport-proof-v2`, versão, tipo, ID, build, nonce e resultado `pong:<instance_id>`.
+6. O helper retorna protocol, runtime kind, instance ID, build, resultado sintético e HMAC-SHA-256. A mensagem assinada agora tem domínio `jarvis-local-transport-proof-v3`, versão, tipo, ID, build, nonce e resultado `pong:<instance_id>`.
 7. Rust valida campos, compatibilidade, identidade esperada e HMAC usando CommonCrypto. Um resultado só marca `TransportState.READY` depois disso.
 
-Health e version são consultas independentes e não autenticam. A prova HMAC autentica o runtime para o cliente, mas, sozinha, não autentica pedidos subsequentes nem cifra respostas. A versão 2 corrige essa lacuna: cada conexão verifica o PID do peer UDS antes de enviar bytes; toda operação G5 usa envelope AES-256-CTR + HMAC-SHA-256 por direção e propósito, e resposta sem tag válido é rejeitada. Ver o protocolo MAC-002.2 em [MAC_002_2_ENCRYPTED_UDS.md](MAC_002_2_ENCRYPTED_UDS.md).
+Health e version são consultas independentes e não autenticam. A prova HMAC autentica o runtime para o cliente, mas, sozinha, não autentica pedidos subsequentes nem cifra respostas. A versão 3 mantém a proteção por PID e corrige a partição CTR: cada conexão verifica o PID do peer UDS antes de enviar bytes; toda operação G5 usa envelope AES-256-CTR + HMAC-SHA-256 por direção e propósito, e resposta sem tag válido é rejeitada. Ver o protocolo MAC-002.2 em [MAC_002_2_ENCRYPTED_UDS.md](MAC_002_2_ENCRYPTED_UDS.md).
 
 ## Isolamento da WebView e managers
 

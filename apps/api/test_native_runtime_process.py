@@ -20,11 +20,11 @@ from mission_repository import MissionRepository
 
 PASSPHRASE = "senha-sintetica-processo-mac003"
 SERVE = Path(__file__).with_name("serve.py")
-PROTOCOL_VERSION = "2"
+PROTOCOL_VERSION = "3"
 RUNTIME_KIND = "jarvis-synthetic"
-BUILD_ID = "g6-mac-002-2-encrypted-uds-v2"
-ENVELOPE_ROUTE = "/v2/secure"
-ENVELOPE_VERSION = 2
+BUILD_ID = "g6-mac-002-2-encrypted-uds-v3"
+ENVELOPE_ROUTE = "/v3/secure"
+ENVELOPE_VERSION = 3
 APP_PATHS = {
     "/v1/app/session/open",
     "/v1/app/session/close",
@@ -77,7 +77,7 @@ def _body(**fields: str) -> bytes:
 
 def _envelope_key(secret: bytes, purpose: bytes, direction: bytes, instance_id: str) -> bytes:
     context = (
-        b"jarvis-local-envelope-v2\x00"
+        b"jarvis-local-envelope-v3\x00"
         + purpose
         + b"\x00"
         + direction
@@ -89,11 +89,11 @@ def _envelope_key(secret: bytes, purpose: bytes, direction: bytes, instance_id: 
 
 def _envelope_mac_message(instance_id: str, direction: bytes, nonce: bytes, ciphertext: bytes) -> bytes:
     return (
-        b"jarvis-local-envelope-v2\x00"
+        b"jarvis-local-envelope-v3\x00"
         + instance_id.encode("ascii")
         + b"\x00"
         + direction
-        + b"\x00/v2/secure\x00"
+        + b"\x00/v3/secure\x00"
         + nonce
         + ciphertext
     )
@@ -131,13 +131,12 @@ class _AuthenticatedRuntimeClient:
         self.runtime_dir = runtime_dir
         self.secret = secret
         self.instance_id = instance_id
-        self.prefix = b"proc-v2!"
         self.sequence = 0
 
     def make_envelope(self, method: str, path: str, body: bytes = b"") -> bytes:
         assert method == "POST" and path in APP_PATHS
         self.sequence += 1
-        nonce = self.prefix + self.sequence.to_bytes(8, "big")
+        nonce = self.sequence.to_bytes(8, "big") + bytes(8)
         path_bytes = path.encode("ascii")
         plaintext = (
             bytes([ENVELOPE_VERSION, 1])
@@ -243,7 +242,7 @@ def test_supervised_fastapi_g5_vertical_flow_and_stop(tmp_path):
         status, proof = _request(runtime_dir, "POST", "/v1/instance-proof", nonce.encode("ascii"))
         proof_fields = _fields(proof)
         message = (
-            "jarvis-local-transport-proof-v2\n"
+            "jarvis-local-transport-proof-v3\n"
             f"{PROTOCOL_VERSION}\n{RUNTIME_KIND}\n"
             "native-process-generation-1\n"
             f"{BUILD_ID}\n{nonce}\n"

@@ -16,9 +16,9 @@ from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import PlainTextResponse
 
-PROTOCOL_VERSION = "2"
+PROTOCOL_VERSION = "3"
 RUNTIME_KIND = "jarvis-synthetic"
-BUILD_ID = "g6-mac-002-2-encrypted-uds-v2"
+BUILD_ID = "g6-mac-002-2-encrypted-uds-v3"
 INIT_PREFIX = b"JARVIS_TRANSPORT_INIT "
 INIT_MAX_BYTES = 1024
 APP_REQUEST_MAX_BYTES = 1024
@@ -27,11 +27,13 @@ ENVELOPE_REQUEST_MAX_BYTES = APP_REQUEST_MAX_BYTES + 256
 CONTROL_REQUEST_MAX_BYTES = 128
 MAX_REQUEST_HEADER_BYTES = 1024
 REQUEST_BODY_TIMEOUT_SECONDS = 0.9
-ENVELOPE_VERSION = 2
+ENVELOPE_VERSION = 3
 ENVELOPE_NONCE_BYTES = 16
-ENVELOPE_PREFIX_BYTES = 8
+ENVELOPE_SEQUENCE_BYTES = 8
 ENVELOPE_TAG_BYTES = 32
-ENVELOPE_ROUTE = "/v2/secure"
+CTR_REQUEST_MAX_BYTES = ENVELOPE_REQUEST_MAX_BYTES - ENVELOPE_NONCE_BYTES - ENVELOPE_TAG_BYTES
+CTR_RESPONSE_MAX_BYTES = APP_RESPONSE_MAX_BYTES + 7
+ENVELOPE_ROUTE = "/v3/secure"
 ENVELOPE_RESPONSE_MAX_BYTES = APP_RESPONSE_MAX_BYTES + ENVELOPE_NONCE_BYTES + ENVELOPE_TAG_BYTES + 7
 APP_PATHS = frozenset(
     {
@@ -61,13 +63,11 @@ class NativeRuntimeIdentity:
     directory_ino: int
     acknowledged: Event = field(default_factory=Event, repr=False)
     replay_lock: Lock = field(default_factory=Lock, repr=False)
-    request_nonce_prefix: bytes | None = field(default=None, repr=False)
     last_request_sequence: int = field(default=0, repr=False)
 
     def clear(self) -> None:
         self.secret[:] = b"\x00" * len(self.secret)
         with self.replay_lock:
-            self.request_nonce_prefix = None
             self.last_request_sequence = 0
 
 
@@ -112,7 +112,7 @@ def read_child_init(record: bytearray, expected_instance_id: str) -> NativeRunti
 def proof_message(instance_id: str, nonce_hex: str) -> bytes:
     operation_result = f"pong:{instance_id}"
     return (
-        "jarvis-local-transport-proof-v2\n"
+        "jarvis-local-transport-proof-v3\n"
         f"{PROTOCOL_VERSION}\n{RUNTIME_KIND}\n{instance_id}\n{BUILD_ID}\n"
         f"{nonce_hex}\n{operation_result}"
     ).encode("ascii")
@@ -120,7 +120,7 @@ def proof_message(instance_id: str, nonce_hex: str) -> bytes:
 
 def _key_context(purpose: bytes, direction: bytes, instance_id: str) -> bytes:
     return (
-        b"jarvis-local-envelope-v2\x00"
+        b"jarvis-local-envelope-v3\x00"
         + purpose
         + b"\x00"
         + direction
@@ -139,7 +139,7 @@ def _derive_key(identity: NativeRuntimeIdentity, purpose: bytes, direction: byte
 
 def _mac_message(identity: NativeRuntimeIdentity, direction: bytes, nonce: bytes, ciphertext: bytes) -> bytes:
     return (
-        b"jarvis-local-envelope-v2\x00"
+        b"jarvis-local-envelope-v3\x00"
         + identity.instance_id.encode("ascii")
         + b"\x00"
         + direction
@@ -149,6 +149,20 @@ def _mac_message(identity: NativeRuntimeIdentity, direction: bytes, nonce: bytes
         + nonce
         + ciphertext
     )
+
+
+def _validate_counter_partition(direction: bytes, nonce: bytes, size: int) -> None:
+    limit = {b"request": CTR_REQUEST_MAX_BYTES, b"response": CTR_RESPONSE_MAX_BYTES}.get(direction)
+    # Each sequence owns [sequence * 2**64, sequence * 2**64 + ceil(size/16) - 1].
+    if (
+        limit is None
+        or size < 0
+        or size > limit
+        or len(nonce) != 16
+        or int.from_bytes(nonce[:8], "big") == 0
+        or nonce[8:] != bytes(8)
+    ):
+        raise ValueError("invalid counter partition")
 
 
 def _aes_ctr(key: bytes, nonce: bytes, data: bytes) -> bytes:
@@ -162,7 +176,8 @@ def _seal_application_envelope(
     nonce: bytes,
     plaintext: bytes,
 ) -> bytes:
-    """Serialize one authenticated, encrypted protocol-v2 message."""
+    """Serialize one authenticated, encrypted protocol-v3 message."""
+    _validate_counter_partition(direction, nonce, len(plaintext))
     encryption_key = _derive_key(identity, b"encryption", direction)
     authentication_key = _derive_key(identity, b"authentication", direction)
     ciphertext = _aes_ctr(encryption_key, nonce, plaintext)
@@ -192,6 +207,7 @@ def _open_application_envelope(
     ).digest()
     if not hmac.compare_digest(tag, expected):
         raise ValueError("invalid envelope")
+    _validate_counter_partition(direction, nonce, len(ciphertext))
     encryption_key = _derive_key(identity, b"encryption", direction)
     return nonce, _aes_ctr(encryption_key, nonce, ciphertext)
 
@@ -199,16 +215,11 @@ def _open_application_envelope(
 def _accept_request_nonce(identity: NativeRuntimeIdentity, nonce: bytes) -> bool:
     if len(nonce) != ENVELOPE_NONCE_BYTES:
         return False
-    prefix = nonce[:ENVELOPE_PREFIX_BYTES]
-    sequence = int.from_bytes(nonce[ENVELOPE_PREFIX_BYTES:], "big")
-    if sequence == 0:
+    sequence = int.from_bytes(nonce[:ENVELOPE_SEQUENCE_BYTES], "big")
+    if sequence == 0 or nonce[ENVELOPE_SEQUENCE_BYTES:] != bytes(8):
         return False
     with identity.replay_lock:
-        if identity.request_nonce_prefix is None:
-            identity.request_nonce_prefix = prefix
-            identity.last_request_sequence = sequence
-            return True
-        if identity.request_nonce_prefix != prefix or sequence <= identity.last_request_sequence:
+        if sequence <= identity.last_request_sequence:
             return False
         identity.last_request_sequence = sequence
         return True

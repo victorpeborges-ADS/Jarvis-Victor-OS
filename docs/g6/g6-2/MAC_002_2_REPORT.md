@@ -1,53 +1,79 @@
-# MAC-002.2 — Relatório da correção do transporte UDS
+# MAC-002.2 — Correção exclusiva da reutilização CTR
 
-## Estado e base
+## BASELINE e objetivo
 
-- Branch: `feat/jarvis-g6-mac-002-2-aead-uds-remediation`.
-- Base exata: `5dd976e94acff09316381e455d4bd5ac1543ce38`.
-- A candidata permanece em revisão independente; este relatório não declara aceite, integração à `main` nem fechamento do smoke Tauri/WebView.
-- A especificação normativa desta implementação está em [MAC_002_2_ENCRYPTED_UDS.md](MAC_002_2_ENCRYPTED_UDS.md).
+- Branch nova: `feat/jarvis-g6-mac-002-2-ctr-fix`.
+- Worktree: `/Users/vic/.codex/worktrees/jarvis-g6-mac-002-2-ctr-fix/Jarvis-Victor-OS`.
+- Base auditada: `d898ea287338613ec4adb546dcd9952e400964a5`, branch preservada `feat/jarvis-g6-mac-002-2-aead-uds-remediation`.
+- Base anterior `5dd976e94acff09316381e455d4bd5ac1543ce38` confirmada ancestral da base auditada. Worktree nova limpa antes das edições.
+- Regras: AGENTS.md, RTK, Blueprint e PromptPack lidos. Nenhuma regra adicional em subdiretórios.
+- Objetivo: corrigir exclusivamente o P1 de keystream AES-CTR, sem mudar controles G5, SQLite, migrations, bootstrap privado, proteção por PID ou UDS-only.
 
-## Achado e correção
+A auditoria independente demonstrou reutilização de blocos de contador entre mensagens multibloco consecutivas e recuperação de plaintext com outro plaintext conhecido. Não demonstrou captura desses ciphertexts pelo atacante same-UID após a proteção por PID, nem falsificação de HMAC. A proteção contra substituição de listener havia bloqueado as cinco operações com zero bytes enviados ao peer falso. Esse limite de evidência permanece explícito.
 
-O probe anterior mostrou que a prova HMAC autenticava o servidor apenas naquela conexão; reconectar pelo pathname deixava uma janela para um listener do mesmo UID receber dados G5 e falsificar a resposta. MAC-002.2 fecha a janela em duas camadas: Rust consulta `LOCAL_PEERPID` de cada conexão e exige o PID exato do child supervisionado antes de escrever cabeçalhos ou corpo; cada operação G5 também usa envelope externo v2 com confidencialidade AES-256-CTR e autenticação HMAC-SHA-256. O servidor autentica cada envelope antes do dispatch, e Rust verifica nonce, geração e tag antes de expor uma resposta.
+A especificação normativa é [MAC_002_2_ENCRYPTED_UDS.md](MAC_002_2_ENCRYPTED_UDS.md). O histórico anterior, incluindo testes e falhas da candidata v2, permanece no SHA auditado; seus resultados não são considerados prova da correção atual.
 
-Após uma prova genuína do FastAPI, o teste de integração renomeia o socket real e liga um listener falso do mesmo UID ao pathname original. O listener falso envia uma resposta HTTP forjada, aceita a conexão e recebe `payload=0`; Rust retorna `peer_rejected` antes de enviar o pedido. O teste repete a substituição antes de abrir sessão, criar grant, revogar grant e listar missão. A chamada seguinte ocorre contra o FastAPI real e confirma que operação legítima segue funcionando.
+## DECISÕES e limites
 
-Um processo same-UID sem capability não acessa operações por rotas G5 em texto claro: a prova direta executada no UDS obteve 404 para abrir/fechar sessão, criar/revogar grant e listar missão. Testes de envelope recusam tag inválido (401), geração antiga e replay (409). A prova de handshake continua autenticando o runtime para o cliente; não é chamada de autenticação mútua sozinha.
+Mantido Encrypt-then-MAC: não há adapter AEAD seguro e interoperável já implementado entre Rust e Python. Não foram adicionadas dependências nem alterados lockfiles.
 
-## Evidência executada
+O protocolo v3 usa `sequence_be64 || zero_be64` como nonce e contador inicial. Cada sequência reserva uma faixa de `2^64` contadores. Ciphertexts são limitados a 1232 bytes request (77 blocos) e 2055 bytes response (129 blocos). Os limites anteriores de corpos G5 e envelopes externos são preservados. Nunca há carry do contador de bloco para a sequência; incremento da sequência é checked, zero e metade baixa não zero são recusados, e sequência máxima não permite wrap. HMAC é validado antes de descriptografar; tamanho e nonce canônico também são verificados antes de chamar a cifra no opener.
 
-| Comando | Resultado |
+A prova MAC-002 permanece, com domínio de versão v3. Versão/build/rota/framing/KDF/MAC estão alinhados em Rust e Python, sem fallback v2. O RuntimeManager utiliza a constante do transporte nos estados e logs. Gerações recebem capability nova e contexto de derivação próprio; direção e propósito permanecem separados. Nunca reiniciar sequência sob uma capability/contexto reutilizados. Cada pedido aceito produz no máximo uma resposta sob sua chave de response.
+
+A implementação CommonCrypto usa explicitamente `kCCModeOptionCTR_BE=2`. Testes reais verificam progressão de blocos 0, 1, 77 e 128, inclusive sequências próximas de `u64::MAX`, e o cálculo formal de não sobreposição. O cálculo completo está na especificação.
+
+## ARQUIVOS ALTERADOS
+
+- `apps/api/native_runtime.py`: v3, partição/limites e replay monotônico.
+- `apps/api/test_native_ctr_partition.py`: nova regressão de plaintext conhecido, intervalos, limites, counter real, tag/ciphertext alterados e nenhuma descriptografia em rejeições, inclusive MAC válido com nonce/tamanho inválidos.
+- `apps/api/test_native_app_api.py`: codec v3 e fixture de replay.
+- `apps/api/test_native_runtime_process.py`: codec de referência v3 e fluxo de processo.
+- `apps/desktop/src-tauri/src/transport.rs`: contador v3, guards antes da cifra, CommonCrypto explícito e regressões/interoperabilidade.
+- `apps/desktop/src-tauri/src/runtime_manager.rs`: constante de versão compartilhada e PID correto na fixture de integração de teste; controles G5 intactos.
+- `docs/g6/g6-2/MAC_002_2_ENCRYPTED_UDS.md`: contrato v3 e prova de não sobreposição.
+- `docs/g6/g6-2/MAC_002_2_REPORT.md`: este handoff.
+- `docs/g6/g6-2/RUNTIME_AUTHENTICITY.md`, `docs/g6/g6-2/TRANSPORT_DECISION.md`, `docs/g6/g6-3/MAC_003_APPLICATION_PROTOCOL.md`: referências de versão/rota alinhadas, sem alteração dos DTOs ou controles G5.
+
+## COMANDOS EXECUTADOS e TESTES
+
+Comandos com prefixo `rtk`; API executada em `apps/api` e Cargo em `apps/desktop/src-tauri`, salvo uso explícito de `--directory`/`--manifest-path`.
+
+| Comando | Resultado efetivamente observado |
 |---|---|
-| `uv run --locked --python 3.12 pytest -q test_native_app_api.py test_native_runtime_process.py` em `apps/api` | PASS — 16 aprovados; um aviso de depreciação do `starlette.testclient`/`httpx`. |
-| `rtk proxy cargo test --locked --features mac003-production-supervisor-test transport::tests -- --test-threads=1` em `apps/desktop/src-tauri` | PASS — 21 aprovados, 0 falhos, 3 ignorados (entrypoint subordinado e stresses explicitamente marcados), 62 filtrados. Inclui vetor AES-CTR, ocultação dos campos sensíveis, alteração de resposta e geração distinta. |
-| `rtk proxy cargo test --locked --features mac003-production-supervisor-test separate_managers_and_stale_generations_cannot_cross_authenticate -- --test-threads=1` | PASS — uma regressão de geração obsoleta/manager distinto aprovada; peer de outro PID é recusado antes do HMAC. |
-| `rtk proxy cargo test --locked --features mac003-production-supervisor-test --test mac003_production_supervisor -- --nocapture` | PASS — compila a biblioteca como dependência, sem `cfg(test)`, e percorre o launcher real do RuntimeManager. Prova v2/READY, quatro trocas pós-prova com listener falso e zero bytes recebidos, G5 legítimo, bloqueio de operações same-UID sem envelope, STOP/reap/UDS cleanup, EOF/reap, crash/reap e restart/READY/STOP. |
-| `rtk proxy cargo fmt --all -- --check` | PASS. |
-| `rtk proxy cargo build --locked` | PASS — build nativo debug. |
-| `rtk proxy git diff --check` | PASS. |
+| `git rev-parse`, `git merge-base --is-ancestor BASE_ANTERIOR SHA_AUDITADO`, `git status --short`, `git worktree list` | PASS: SHA, ancestralidade, worktrees e baseline confirmados |
+| `git worktree add -b feat/jarvis-g6-mac-002-2-ctr-fix WORKTREE d898ea287338613ec4adb546dcd9952e400964a5` | PASS: criada no caminho solicitado, limpa |
+| `uv sync --locked --python 3.12` | PASS: ambiente local fixado; lockfile preservado |
+| `uv run --locked --python 3.12 pytest -q --tb=short test_native_ctr_partition.py` antes da correção | EXPECTED FAIL: recuperação de plaintext nas duas direções |
+| `cargo test --locked --features mac003-production-supervisor-test consecutive_multiblock_messages_do_not_reuse_keystream -- --test-threads=1` antes da correção | EXPECTED FAIL: keystream repetido no CommonCrypto real |
+| Probe final Python de known-plaintext contra arquivos v2 exportados de `git show d898ea2:...`, em `/tmp/jv-ctr-old-regression-*` | EXPECTED FAIL: duas direções. Shim apenas adicionou constantes de tamanho para coletar testes; não alterou cifra ou nonce. Exportação removida |
+| `uv run --locked --python 3.12 pytest -q --tb=short test_native_ctr_partition.py test_native_app_api.py test_native_runtime_process.py` | PASS: 23; um aviso de depreciação Starlette/httpx |
+| `cargo test --locked --features mac003-production-supervisor-test transport::tests -- --test-threads=1` | PASS final: 24; 3 ignorados (entrypoint subordinado e stresses). Inclui funções de produção request/response, guards e interoperabilidade |
+| `cargo test --locked --features mac003-production-supervisor-test separate_managers_and_stale_generations_cannot_cross_authenticate -- --test-threads=1` | PASS: 1 |
+| `cargo test --locked --features mac003-production-supervisor-test --test mac003_production_supervisor -- --nocapture` | PASS: 1; supervisor real/FastAPI, G5, listener substituído pós-prova recebe zero bytes, STOP/EOF/crash/restart/reap/UDS cleanup |
+| `cargo test --locked --features mac003-production-supervisor-test -- --test-threads=1` | PASS após ajuste da fixture: 80 unitários, 9 ignorados, mais 1 integração de produção. Guards adicionais posteriores foram cobertos na repetição final focada |
+| `cargo fmt --all -- --check`, `cargo build --locked`, `git diff --check` | PASS final |
 
-Os testes de API incluem envelope inválido, sequência replay e chave de geração antiga. O fluxo de processo usa um codec de referência independente para abrir a resposta cifrada do FastAPI e percorre sessão, consentimento, leitura, revogação, negativa e STOP/EOF/crash/restart.
+A interoperabilidade é uma regressão Cargo dedicada: Rust sela com funções de produção, Python abre com funções de produção, verifica conteúdo público sintético, sela novamente e Rust abre a resposta Python. Ciphertext/tag são comparados byte a byte para request e response nos limites de tamanho. Material gerado e mensagens trafegam somente em pipes privados, nunca em arquivos/logs; asserções não exibem bytes. A jornada de integração também usa framing real e FastAPI pelo UDS.
 
-Após a integração, as asserções do RuntimeManager confirmaram reap e remoção dos UDS por geração; `pgrep` não encontrou `serve.py --desktop-runtime`, e as buscas de UDS e diretórios temporários `mac003-production-supervisor-*` não encontraram resíduos.
+## Falhas intermediárias e diagnóstico
 
-## Falhas intermediárias preservadas
+- Primeira invocação `uv sync` na raiz não encontrou pyproject; corrigido para `apps/api`. Primeiras invocações Cargo na raiz sem manifest não encontraram Cargo.toml; corrigidas para o diretório do crate.
+- A primeira regressão Python tentou construir o cliente de teste com `raw=None`; falhou em `raw.app`, sem testar a cifra. A fixture foi corrigida; depois houve as duas falhas criptográficas esperadas antes da correção.
+- As falhas red/green anteriores não exibiram plaintext, chaves, ciphertexts ou tokens.
+- A primeira suíte Rust completa encontrou 79 PASS, 1 FAIL e 9 ignorados: a fixture `rust_manager_uses_fastapi_g5_over_authenticated_uds` iniciava child real sem configurar seu PID esperado (o default cfg(test) é o PID do pai). A fixture agora faz `set_expected_peer_pid(child.id())`, como o launcher de produção. Não foi relaxada nenhuma verificação de peer. Repetição: 80 PASS e integração PASS.
+- Uma checagem de formato apontou wrapping após importar a constante da versão; aplicado cargo fmt e check final PASS.
 
-- Uma tentativa inicial de pytest sem selecionar o Python fixado usou Python 3.14 e falhou na coleta por incompatibilidade de validação de status 204 do FastAPI. O teste foi então executado com `--locked --python 3.12`.
-- A primeira rodada com Python 3.12 teve 15 aprovados e uma asserção antiga esperando 400; a nova allowlist externa corretamente devolvia 404 para G5 em texto claro. A expectativa foi atualizada e a repetição passou com 16.
-- Uma execução Rust inicial sem a feature `mac003-production-supervisor-test` não compilou o entrypoint de integração protegido pela feature. Os testes focados foram executados com a feature habilitada.
-- Uma compilação intermediária de Rust encontrou um erro de borrow-checker (`E0502`) no código novo; foi corrigido antes dos testes focados. A primeira rodada unitária também teve duas falhas em respostas fake de controle sem `Content-Type`; o parser agora mantém esse header opcional apenas para controle e exige tipo exato no envelope seguro.
-- A primeira execução do supervisor real falhou no READY porque o parser Rust não aceitava o `text/plain; charset=utf-8` emitido pelo FastAPI. O parser passou a aceitar esse único parâmetro em respostas de controle; o envelope seguro continua exigindo `application/octet-stream` exato.
-- A primeira versão do probe movia o socket antes de iniciar a operação e, por isso, não reproduzia a troca depois da prova. A falha revelou que o caminho de teste ainda precisava ser corrigido; a renomeação foi movida para o callback pós-prova e sincronizada depois do `listen` do fake.
-- Uma versão intermediária do probe same-UID falhou em parsing auxiliar do corpo. Como os códigos HTTP bastam para a negativa de rotas em texto claro, o probe foi simplificado para registrar somente os status. A execução final completa passou.
-- O teste de manager/geração obsoleta inicialmente esperava `proof_rejected`; depois da proteção por PID, a tentativa entre managers é recusada antes do handshake como `peer_rejected`. A expectativa foi atualizada e o teste isolado passou.
-- Ao alinhar o sufixo do `BUILD_ID` de v1 para v2 em ambos os lados, um teste de processo ainda tinha a string v1 literal e falhou (15 aprovados, 1 falho). A fixture independente foi alinhada e a suíte final passou com 16.
-- A primeira verificação de formato Rust apontou uma quebra de linha no probe de teste; `cargo fmt --all` aplicou o formato e a checagem final passou.
+## CAPTURAS/DEMOS, cleanup e preservação
 
-## Escopo preservado e limites
+Sem capturas visuais: o smoke Tauri/WebView não foi executado nem fechado. Probes e testes usaram somente material gerado/sintético e bancos descartáveis, sem banco padrão ou dados reais.
 
-Não foram alterados G5, rotas/DTOs internos, migrations, contratos SQLite, lockfiles ou dependências. UDS, stdin/EOF, STOP, supervisor, reap e isolamento por geração permanecem. Não há listener TCP. A solução não cobre processo comprometido, inspeção privilegiada de memória, root/admin ou falha do kernel; outro processo local ainda pode provocar DoS. O smoke da janela Tauri/WebView segue gate separado e aberto até existir evidência real dessa jornada.
+Supervisor e fixtures confirmaram STOP/reap/cleanup. A checagem filtrada de `ps -axo pid,command` não encontrou processos `serve.py --desktop-runtime`; glob de sockets de runtime `.jv-*`, `mac003-production-supervisor-*` e `jv-mac003-*` em diretórios temporários encontrou zero sockets. A exportação v2 do probe foi removida. O banco sintético deixado pela falha intermediária da fixture foi removido somente do diretório identificado desta execução, validando nomes de arquivos antes de unlink/rmdir. Nenhuma worktree anterior foi removida.
 
-## Decisão pendente
+Branch auditada continua em `d898ea287338613ec4adb546dcd9952e400964a5`; main em `bf575be1645578eebedd41cddd3463b75726776b`; checkout compartilhado em `e648e92467396ce67b75019858fbcd0ee5557042`, branch `feat/gate2.0-e-integracao-web-api`. Seus quatro arquivos não rastreados permanecem: `PROMPT_JARVIS_G3_MISSOES_PERSISTENTES_P2.md`, `SUPERPROMPT_JARVIS_MADRUGADA_2026-09-25.md`, `docs/ANALISE_PLAYLIST_JARVIS_2026-09.md`, `package-lock.json`. Worktree antiga detached `bb6b78a` preservada. A nova branch recebe somente commit local, sem merge/push/tag/deploy.
 
-Reauditoria independente do código, framing binário, primitive crypto/CommonCrypto, autenticação por PID e testes adversariais. Não há autorização para merge, push, tag, deploy ou integração à `main`.
+## RISCOS RESIDUAIS, AUTORIZAÇÃO e PRÓXIMO GATE
+
+A não sobreposição vale para o estado monotônico único por geração, os limites de tamanho, CTR big-endian e chaves separadas por geração/direção. Não cobre reutilização externa deliberada de capability/contexto/nonce, comprometimento de processo, root/admin, inspeção privilegiada de memória, kernel ou DoS local. Comprimentos/tráfego não são ocultados. Stress tests marcados ignore e smoke de release/WebView continuam fora da evidência executada; frontend lint/typecheck/build não foram executados nesta alteração exclusivamente nativa/API.
+
+Nenhum aceite formal é declarado. Próximo gate: reauditoria independente do commit local desta branch. MAC-003 e smoke Tauri/WebView permanecem abertos. Merge, push, tag, deploy, conectores reais e dados pessoais/institucionais não estão autorizados por esta entrega.

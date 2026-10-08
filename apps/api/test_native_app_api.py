@@ -40,7 +40,6 @@ class AuthenticatedNativeTestClient:
         self.raw = raw
         self.identity = identity
         self.app = raw.app
-        self.prefix = b"testv2!!"
         self.sequence = 0
 
     def request(self, *args, **kwargs):
@@ -62,7 +61,7 @@ class AuthenticatedNativeTestClient:
     def seal_request(self, path: str, body: bytes, *, nonce: bytes | None = None, version: int = ENVELOPE_VERSION):
         if nonce is None:
             self.sequence += 1
-            nonce = self.prefix + self.sequence.to_bytes(8, "big")
+            nonce = self.sequence.to_bytes(8, "big") + bytes(8)
         path_bytes = path.encode("ascii")
         plaintext = (
             bytes([version, 1])
@@ -238,7 +237,7 @@ def test_native_surface_is_closed_and_does_not_mount_web_routes(native_client):
     ).status_code == 413
 
 
-def test_native_protocol_requires_encrypted_authenticated_v2_and_replay_rejection(native_client):
+def test_native_protocol_requires_encrypted_authenticated_v3_and_replay_rejection(native_client):
     plain = native_client.raw.post(
         "/v1/app/session/open",
         content=body(passphrase=PASSPHRASE),
@@ -278,7 +277,7 @@ def test_native_protocol_requires_encrypted_authenticated_v2_and_replay_rejectio
     assert old_response.status_code == 401
     old_generation.clear()
 
-    nonce = b"replay!!" + (1).to_bytes(8, "big")
+    nonce = (1).to_bytes(8, "big") + bytes(8)
     envelope = native_client.seal_request(
         "/v1/app/session/open",
         body(passphrase="credencial-sintetica-incorreta").encode(),

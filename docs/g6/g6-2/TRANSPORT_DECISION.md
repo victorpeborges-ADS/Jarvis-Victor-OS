@@ -2,7 +2,7 @@
 
 **Escolha:** WebView → Tauri IPC → cliente Rust limitado → HTTP/1.1 em UDS → runtime sintético. A decisão detalhada, incluindo opções A–D, está no [ADR-011](../../adr/011-local-desktop-runtime-transport.md).
 
-**Emenda MAC-002.2:** a prova HMAC do handshake autentica o runtime para o cliente, mas não protege uma requisição posterior se o pathname UDS for trocado. Antes de enviar qualquer byte por uma conexão, Rust agora valida `LOCAL_PEERPID` contra o child supervisionado. As operações G5 são envelopadas em AES-256-CTR + HMAC-SHA-256 por direção e por geração. A rota externa única `/v2/secure` falha fechada em versões incompatíveis; o protocolo está descrito em [MAC_002_2_ENCRYPTED_UDS.md](MAC_002_2_ENCRYPTED_UDS.md).
+**Emenda MAC-002.2:** a prova HMAC do handshake autentica o runtime para o cliente, mas não protege uma requisição posterior se o pathname UDS for trocado. Antes de enviar qualquer byte por uma conexão, Rust agora valida `LOCAL_PEERPID` contra o child supervisionado. As operações G5 são envelopadas em AES-256-CTR + HMAC-SHA-256 por direção e por geração. A rota externa única `/v3/secure` falha fechada em versões incompatíveis; o protocolo está descrito em [MAC_002_2_ENCRYPTED_UDS.md](MAC_002_2_ENCRYPTED_UDS.md).
 
 | Pergunta | Resposta | Motivo |
 |---|---|---|

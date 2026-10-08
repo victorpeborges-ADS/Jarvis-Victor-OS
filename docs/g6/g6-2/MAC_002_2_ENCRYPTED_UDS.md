@@ -1,43 +1,61 @@
-# MAC-002.2 — Canal UDS autenticado e cifrado
+# MAC-002.2 — Canal UDS autenticado e cifrado, protocolo v3
 
-## Estado
+## Estado e escopo
 
-Implementação candidata derivada de `5dd976e94acff09316381e455d4bd5ac1543ce38`, pendente de reauditoria independente. Este documento descreve a versão 2 do transporte local. Não declara aceite formal, integração à `main` nem fechamento do gate separado de smoke Tauri/WebView.
+Candidata em `feat/jarvis-g6-mac-002-2-ctr-fix`, derivada de `d898ea287338613ec4adb546dcd9952e400964a5` (base anterior `5dd976e94acff09316381e455d4bd5ac1543ce38`). Corrige exclusivamente o P1 de reutilização de keystream CTR. Não declara aceite de MAC-002.2/MAC-003 nem fecha o smoke Tauri/WebView.
 
-## Fronteiras
+A reauditoria demonstrou reutilização de blocos de contador entre mensagens multibloco consecutivas e recuperação de plaintext com outro plaintext conhecido. Não demonstrou captura dos ciphertexts por atacante same-UID após a proteção por PID, nem falsificação de HMAC. A construção v2 não deve ser reutilizada.
 
-O transporte continua exclusivamente UDS por geração. A WebView chama comandos Tauri tipados; endpoint, capability, tokens e corpos de aplicação permanecem em Rust e no processo FastAPI supervisionado. O supervisor continua proprietário do spawn, stdin/EOF, STOP, crash, reap e cleanup.
+Não existe adapter AEAD interoperável já implementado nos dois lados do projeto. Python dispõe de `cryptography`, mas Rust utiliza somente CommonCrypto por FFI para CTR/HMAC. Mantém-se Encrypt-then-MAC, com partição determinística de contador, sem nova dependência nem mudança de lockfiles.
 
-O handshake de prontidão consulta health e version e prova a instância com um nonce novo e HMAC-SHA-256 no domínio `jarvis-local-transport-proof-v2`. Essa prova autentica o runtime para o cliente. Ela não é tratada como autenticação mútua de operações. Para cada conexão UDS, antes de escrever qualquer byte HTTP, Rust consulta `LOCAL_PEERPID` e exige o PID exato do child ainda supervisionado. Falha ao obter ou comparar o PID fecha a operação.
+## Fronteiras preservadas e versões
 
-## Envelope de aplicação v2
+UDS-only por geração; sem TCP. WebView chama comandos Tauri tipados. Capability, endpoint e material sensível permanecem no processo Rust e no FastAPI supervisionado. Spawn, stdin/EOF, STOP, crash, reap e cleanup continuam pertencendo ao supervisor. Nenhuma mudança em G5, DTOs internos, migrations ou SQLite.
 
-Todas as cinco operações MAC-003 — abrir/fechar sessão, criar/revogar grant e listar missão — são enviadas por `POST /v2/secure`. Rotas `/v1/app/*` em texto claro não pertencem à allowlist externa e são recusadas. Não há fallback de versão: o cliente valida a versão/build do runtime, e qualquer lado que não suporte a rota ou envelope v2 falha fechado.
+O cliente consulta `LOCAL_PEERPID` de cada conexão e exige o PID do child supervisionado antes de escrever qualquer byte HTTP. O servidor não autentica o PID do cliente: autentica a capability do envelope antes de descriptografar e fazer dispatch.
 
-O envelope binário externo é:
+Health e version precedem a prova com nonce CSPRNG novo e HMAC no domínio `jarvis-local-transport-proof-v3`. A versão é `3` e o build é `g6-mac-002-2-encrypted-uds-v3`. A prova continua autenticando o runtime para o cliente. Versão, build, domínio, byte de framing e rota são explícitos; nenhum fallback v2. `/v2/secure` e rotas G5 em texto claro não pertencem à allowlist externa.
+
+## Framing e autenticação
+
+Todas as cinco operações usam `POST /v3/secure`, HTTP/1.1, `Host: jarvis.local`, `Connection: close`, comprimento explícito e `Content-Type: application/octet-stream`.
 
 ```text
 nonce[16] || ciphertext[n] || tag_hmac_sha256[32]
+nonce = sequence:u64_be || zero:u64_be
+pedido = versão:u8(3) || método:u8(1=POST) || path_len:u16_be || body_len:u32_be || path_ascii || body_utf8
+resposta = versão:u8(3) || status:u16_be || body_len:u32_be || body
 ```
 
-O nonce é `prefixo aleatório da geração[8] || sequência big-endian[8]`, com sequência iniciando em 1 e avançando por operação. A solicitação decifrada tem o framing:
+A resposta repete o nonce do pedido. Rust rejeita nonce inesperado antes de expor qualquer resultado. O HMAC cobre `jarvis-local-envelope-v3\0 || instance_id || 0 || direção || 0 || /v3/secure || 0 || nonce || ciphertext`. Método/operação/path/corpo e status/corpo são vinculados pelo ciphertext autenticado; comprimentos e versão também. Headers de transporte não carregam decisões G5.
+
+Para propósito (`encryption`, `authentication`) e direção (`request`, `response`), a chave é HMAC-SHA-256 da capability com `jarvis-local-envelope-v3\0 || propósito || 0 || direção || 0 || instance_id_ascii`. Chaves de cifra/MAC e request/response são separadas; cada nova geração cria nova capability CSPRNG e novo contexto. Não restaurar/reutilizar capability e estado de sequência de uma geração encerrada.
+
+HMAC de 32 bytes é validado antes de qualquer descriptografia. Python usa `hmac.compare_digest`; Rust compara comprimento fixo acumulando XOR. Após autenticar, ambos validam tamanho e nonce canônico antes de invocar CTR. Falhas devolvem somente categorias genéricas, sem plaintext ou segredos.
+
+## Partição formal do contador
+
+O nonce externo também é o contador inicial AES-CTR: `s_be64 || 0_be64`. `s` começa em 1, cresce estritamente e nunca volta a zero. Rust serializa as operações e usa incremento checked de `u64`; depois de `2^64-1`, recusa novas mensagens antes da cifra. Uma tentativa que falha consome sua sequência, sem retry com o mesmo nonce.
+
+O servidor aceita apenas nonce com `s != 0` e metade baixa zero. Sob lock, recusa `s <= last_sequence` antes do dispatch. Cada pedido aceito produz no máximo um envelope de resposta, mesmo para falha G5. Uma resposta reutiliza `s` somente sob a chave distinta de response.
+
+Para mensagem com `L` bytes, `B = ceil(L/16)`. Os blocos AES de `s` são:
 
 ```text
-versão:u8 (=2) || método:u8 (=1, POST) || tamanho_path:u16_be || tamanho_corpo:u32_be || path_ascii || corpo_utf8
+[s * 2^64, s * 2^64 + B - 1]
 ```
 
-A resposta decifrada contém `versão:u8 (=2) || status:u16_be || tamanho_corpo:u32_be || corpo`. Cliente e servidor mantêm os limites MAC-003 existentes. O nonce da resposta deve ser idêntico ao nonce da solicitação.
+| Direção | Limite de ciphertext/plaintext | Máximo de blocos |
+|---|---:|---:|
+| request | 1232 bytes (envelope externo 1280 menos 48) | 77 |
+| response | 2055 bytes (corpo 2048 mais framing 7) | 129 |
 
-Para cada propósito (`encryption`, `authentication`) e direção (`request`, `response`), a chave é derivada como HMAC-SHA-256 com a capability da geração e contexto `jarvis-local-envelope-v2\0 || propósito || 0 || direção || 0 || instance_id_ascii`. A cifra é AES-256-CTR. O tag HMAC-SHA-256 cobre domínio, instance ID, direção, rota externa `/v2/secure`, nonce e ciphertext. As chaves de cifra/autenticação e as direções são distintas. A verificação do tag ocorre antes da decifragem e comparação é em tempo constante. Rust usa CommonCrypto do macOS; FastAPI usa a dependência `cryptography` já fixada no ambiente do projeto. Nenhuma dependência ou lockfile foi alterado.
+Os corpos G5 continuam limitados a 1024 bytes no pedido e 2048 na resposta; os limites da tabela são limites criptográficos adicionais. Ambos os seal/open de produção impõem os limites. `B <= 129 < 2^64`, portanto o contador de bloco nunca invade a sequência. Para `s < t`, o último contador de `s` é menor que `t * 2^64`. Mesmo para `s = 2^64-1`, o contador final é menor que `2^128`; não há wrap. A garantia depende do estado monotônico único da geração e da separação de chaves, não de nonces aleatórios.
 
-O servidor fixa o primeiro prefixo válido da geração e aceita apenas sequências estritamente crescentes; prefixo diferente, sequência zero ou repetida/antiga é recusada antes do dispatch. O cliente serializa chamadas em uma sessão, gera o nonce por geração e rejeita tag incorreto, geração distinta ou resposta associada a outro nonce. O servidor autentica cada solicitação antes de abrir path/corpo; o cliente autentica cada resposta antes de expor qualquer resultado ao Runtime Manager.
+CommonCrypto usa explicitamente `kCCModeOptionCTR_BE=2`. Python usa `cryptography.modes.CTR`. Testes reais comparam blocos 0, 1, 77 e 128 com cifras independentes iniciadas em `s_be64 || block_be64`, incluindo sequências próximas do máximo. Isso verifica a progressão efetiva, além do cálculo formal. Ver [NIST SP 800-38A, seção 6.5 e apêndice B](https://nvlpubs.nist.gov/nistpubs/Legacy/SP/nistspecialpublication800-38a.pdf).
 
-## Troca de socket e limite de confiança
+## Evidência e limites
 
-O probe adversarial reproduz a ordem da falha: o FastAPI real responde a prova HMAC, seu socket é renomeado e outro processo do mesmo UID liga um listener falso ao pathname original antes da operação. O cliente conecta, consulta o PID do peer e rejeita a conexão antes do primeiro byte HTTP; o listener registra zero bytes, e uma resposta HTTP forjada que oferece não pode ser aceita pelo cliente. O teste executa essa troca antes de abrir sessão, criar grant, revogar grant e listar missão. Em seguida, a jornada legítima continua pelo FastAPI real.
+Regressões usam funções de produção: mensagens consecutivas multibloco request/response, probe de plaintext conhecido, limites, sequência máxima/wrap, nonce inválido, tag/ciphertext alterados, replay, geração e versão antiga. A interoperabilidade compara ciphertext/tag byte a byte de CommonCrypto e Python e abre em ambos os lados, por pipes privados em memória; nada sensível é registrado. A integração do supervisor usa FastAPI real, prova, operações G5, substituição same-UID pós-prova, STOP/EOF/crash/restart/reap/cleanup.
 
-Um processo sem a capability não consegue criar envelope aceito; envelope forjado ou de outra geração recebe rejeição, texto claro em rotas de aplicação não é encaminhado, e replay de envelope autenticado é recusado. Um relay que não substitua o peer PID pode causar indisponibilidade, mas cifragem e tags impedem que leia ou modifique o conteúdo. A garantia não cobre inspeção privilegiada da memória, comprometimento de um dos processos, root/admin ou defeito do kernel/criptografia. Um processo local ainda pode causar DoS e disputar o pathname; a detecção deve falhar fechado.
-
-## Evidência nesta branch
-
-Os testes de regressão são `test_native_protocol_requires_encrypted_authenticated_v2_and_replay_rejection`, os fluxos de processo FastAPI supervisionado e STOP/EOF/crash/restart, testes Rust de cifra, confidencialidade, tamper, resposta e geração, e `mac003_production_supervisor`. O último compila a biblioteca como dependência sem `cfg(test)`, usa o RuntimeManager de produção para iniciar FastAPI, aguarda READY autenticado e exercita a substituição de socket, as operações G5 legítimas e STOP/EOF/crash/reap. Resultados efetivamente executados e falhas intermediárias ficam registrados no relatório `MAC_002_2_REPORT.md`.
+O listener falso continua sendo recusado antes de receber bytes. Um processo local pode causar DoS ou disputar pathname. Não há proteção contra comprometimento de processo, inspeção privilegiada de memória, root/admin ou falha do kernel. Não se promete invulnerabilidade criptográfica absoluta nem proteção contra análise de comprimento/tráfego. Resultados e falhas intermediárias estão em [MAC_002_2_REPORT.md](MAC_002_2_REPORT.md).

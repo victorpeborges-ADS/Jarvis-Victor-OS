@@ -4,11 +4,11 @@
 
 Protocolo de aplicação aprovado para o primeiro marco MAC-003. Este documento precede a implementação e fixa a allowlist, o framing, os limites e o fluxo de autorização. O escopo é local e sintético; não habilita fontes externas, dados pessoais, workers adicionais ou distribuição do runtime.
 
-O protocolo MAC-002 continua responsável pelo ownership e lifecycle do processo, pelo socket UDS da geração e pela prova HMAC que autentica o runtime para o cliente. A emenda MAC-002.2 autentica também cada operação G5 e cifra pedidos/respostas no envelope externo v2. MAC-003 define operações de aplicação com caminhos e DTOs fixos; o framing de campos descrito abaixo permanece dentro do ciphertext. A capability MAC-002 não é sessão, grant nem credencial G5.
+O protocolo MAC-002 continua responsável pelo ownership e lifecycle do processo, pelo socket UDS da geração e pela prova HMAC que autentica o runtime para o cliente. A emenda MAC-002.2 autentica também cada operação G5 e cifra pedidos/respostas no envelope externo v3. MAC-003 define operações de aplicação com caminhos e DTOs fixos; o framing de campos descrito abaixo permanece dentro do ciphertext. A capability MAC-002 não é sessão, grant nem credencial G5.
 
 ## Contrato de transporte preservado
 
-O UDS usa HTTP/1.1, `Host: jarvis.local`, uma requisição por conexão, `Connection: close`, `Content-Length` explícito e `Content-Type: text/plain` para controle. As operações de aplicação usam somente `POST /v2/secure`, com `Content-Type: application/octet-stream`; path e corpo MAC-003 ficam dentro do envelope AES-256-CTR + HMAC-SHA-256. O cliente mantém timeout, limites, validação de framing, validação do host, verificação do PID do peer antes de escrever e rejeição de `Origin` e headers desconhecidos. Não há TCP, URL de rede, CORS ou transporte direto pela WebView. A especificação do envelope está em [MAC-002.2](../g6-2/MAC_002_2_ENCRYPTED_UDS.md).
+O UDS usa HTTP/1.1, `Host: jarvis.local`, uma requisição por conexão, `Connection: close`, `Content-Length` explícito e `Content-Type: text/plain` para controle. As operações de aplicação usam somente `POST /v3/secure`, com `Content-Type: application/octet-stream`; path e corpo MAC-003 ficam dentro do envelope AES-256-CTR + HMAC-SHA-256. O cliente mantém timeout, limites, validação de framing, validação do host, verificação do PID do peer antes de escrever e rejeição de `Origin` e headers desconhecidos. Não há TCP, URL de rede, CORS ou transporte direto pela WebView. A especificação do envelope está em [MAC-002.2](../g6-2/MAC_002_2_ENCRYPTED_UDS.md).
 
 As operações de controle permanecem:
 
@@ -18,7 +18,7 @@ As operações de controle permanecem:
 | `GET` | `/v1/version` | vazio | `protocol_version`, `runtime_kind`, `instance_id`, `build` |
 | `POST` | `/v1/instance-proof` | nonce hexadecimal de 32 bytes | campos atuais de identidade, `pong:<instance_id>` e HMAC-SHA-256 |
 
-O transporte candidato MAC-002.2 usa versão `2` e domínio de prova `jarvis-local-transport-proof-v2`; cliente e servidor falham fechados em versões/builds/rotas desconhecidos. A allowlist externa remove os caminhos G5 em texto claro. O envelope v2 cifra e autentica cada operação; o servidor também rejeita replay de sequência dentro da geração. A capability continua entrando pelo registro privado de stdin e não aparece em argv, environment, URL, frontend, logs ou erros. EOF e STOP continuam controlados pelo supervisor, sem subprocesso descendente.
+O transporte candidato MAC-002.2 usa versão `3` e domínio de prova `jarvis-local-transport-proof-v3`; cliente e servidor falham fechados em versões/builds/rotas desconhecidos. A allowlist externa remove os caminhos G5 em texto claro. O envelope v3 cifra e autentica cada operação; o servidor também rejeita replay de sequência dentro da geração. A capability continua entrando pelo registro privado de stdin e não aparece em argv, environment, URL, frontend, logs ou erros. EOF e STOP continuam controlados pelo supervisor, sem subprocesso descendente.
 
 ## Framing do protocolo de aplicação v1
 

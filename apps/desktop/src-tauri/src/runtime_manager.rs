@@ -1,5 +1,6 @@
 use crate::transport::{
     ChildTransportConfig, TransportError, TransportSession, TransportSnapshot, TransportState,
+    PROTOCOL_VERSION,
 };
 use std::{
     env,
@@ -2017,7 +2018,7 @@ fn mark_ready_after_transport(
         state: TransportState::Ready,
         runtime_instance_id: Some(instance_id.to_owned()),
         endpoint_type: Some("uds"),
-        protocol_version: Some("2".to_owned()),
+        protocol_version: Some(PROTOCOL_VERSION.to_owned()),
         error_category: None,
     };
     if !transition_locked(&mut inner, RuntimeState::Ready, instance_id) {
@@ -2051,11 +2052,11 @@ fn complete_transport_probe(shared: &Shared, instance_id: &str, session: Arc<Tra
                 state: TransportState::Ready,
                 runtime_instance_id: Some(instance_id.to_owned()),
                 endpoint_type: Some("uds"),
-                protocol_version: Some("2".to_owned()),
+                protocol_version: Some(PROTOCOL_VERSION.to_owned()),
                 error_category: None,
             };
             eprintln!(
-                "transport ready instance_id={instance_id} endpoint_type=uds protocol_version=2"
+                "transport ready instance_id={instance_id} endpoint_type=uds protocol_version={PROTOCOL_VERSION}"
             );
         }
         Err(error) => {
@@ -2398,7 +2399,7 @@ fn supervise_child(
                             continue;
                         }
                         eprintln!(
-                            "runtime authenticated and ready instance_id={instance_id} endpoint_type=uds protocol_version=2"
+                            "runtime authenticated and ready instance_id={instance_id} endpoint_type=uds protocol_version={PROTOCOL_VERSION}"
                         );
                     }
                     result => {
@@ -3566,6 +3567,7 @@ mod tests {
             .stderr(Stdio::null())
             .spawn()
             .expect("supervised FastAPI runtime starts");
+        session.set_expected_peer_pid(child.id()).unwrap();
         let stdin = child.stdin.take().unwrap();
         let mut process = FastApiChild {
             child,
@@ -3606,7 +3608,7 @@ mod tests {
                 state: TransportState::Ready,
                 runtime_instance_id: Some(instance_id.clone()),
                 endpoint_type: Some("uds"),
-                protocol_version: Some("2".to_owned()),
+                protocol_version: Some(PROTOCOL_VERSION.to_owned()),
                 error_category: None,
             };
             inner.transport_session = Some(Arc::clone(&session));
@@ -3683,7 +3685,10 @@ mod tests {
             manager.wait_for_transport_state(TransportState::Ready, Duration::from_secs(2));
         assert_eq!(transport.runtime_instance_id, ready.runtime_instance_id);
         assert_eq!(transport.endpoint_type, Some("uds"));
-        assert_eq!(transport.protocol_version.as_deref(), Some("2"));
+        assert_eq!(
+            transport.protocol_version.as_deref(),
+            Some(PROTOCOL_VERSION)
+        );
         let transport_session = manager.transport_session_for_test();
         assert_eq!(
             fs::symlink_metadata(transport_session.socket_path_for_test())
@@ -4084,7 +4089,10 @@ mod tests {
         let transport =
             manager.wait_for_transport_state(TransportState::Ready, Duration::from_secs(8));
         assert_eq!(transport.runtime_instance_id, ready.runtime_instance_id);
-        assert_eq!(transport.protocol_version.as_deref(), Some("2"));
+        assert_eq!(
+            transport.protocol_version.as_deref(),
+            Some(PROTOCOL_VERSION)
+        );
         assert_eq!(
             manager.stop_and_wait().unwrap().state,
             RuntimeState::Stopped
