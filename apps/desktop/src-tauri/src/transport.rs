@@ -416,12 +416,15 @@ impl TransportSession {
     }
 
     pub(crate) fn deactivate(&self) {
+        // One critical section covers inactivity, secret destruction, and sequence
+        // retirement. The counter is parked at u64::MAX so it cannot be reissued.
+        let mut secret = lock(&self.secret);
         self.active.store(false, Ordering::Release);
-        self.envelope_sequence.store(0, Ordering::Release);
-        if let Some(mut secret) = lock(&self.secret).take() {
+        if let Some(mut secret) = secret.take() {
             secret.fill(0);
             std::hint::black_box(secret);
         }
+        self.envelope_sequence.store(u64::MAX, Ordering::Release);
     }
 
     fn cleanup_endpoint(&self) {
@@ -483,6 +486,7 @@ impl TransportSession {
             "{method} {route} HTTP/1.1\r\nHost: jarvis.local\r\nConnection: close\r\nContent-Length: {}\r\nContent-Type: {content_type}\r\n\r\n",
             body.len()
         );
+        self.ensure_active()?;
         stream
             .write_all(request.as_bytes())
             .and_then(|_| stream.write_all(body))
@@ -516,22 +520,16 @@ impl TransportSession {
     }
 
     fn next_envelope_nonce(&self) -> Result<[u8; ENVELOPE_NONCE_BYTES], TransportError> {
-        self.ensure_active()?;
-        let mut current = self.envelope_sequence.load(Ordering::Acquire);
-        let sequence = loop {
-            let next = current
-                .checked_add(1)
-                .ok_or(TransportError::OsCryptoUnavailable)?;
-            match self.envelope_sequence.compare_exchange_weak(
-                current,
-                next,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => break next,
-                Err(observed) => current = observed,
-            }
-        };
+        let secret = lock(&self.secret);
+        if !self.active.load(Ordering::Acquire) || secret.is_none() {
+            return Err(TransportError::Inactive);
+        }
+        let sequence = self
+            .envelope_sequence
+            .load(Ordering::Acquire)
+            .checked_add(1)
+            .ok_or(TransportError::OsCryptoUnavailable)?;
+        self.envelope_sequence.store(sequence, Ordering::Release);
         let mut nonce = [0_u8; ENVELOPE_NONCE_BYTES];
         nonce[..ENVELOPE_SEQUENCE_BYTES].copy_from_slice(&sequence.to_be_bytes());
         Ok(nonce)
@@ -554,7 +552,13 @@ impl TransportSession {
         plaintext.extend_from_slice(&body_len.to_be_bytes());
         plaintext.extend_from_slice(path);
         plaintext.extend_from_slice(body);
-        let (mut encryption_key, mut authentication_key) = self.envelope_keys(b"request")?;
+        let secret = lock(&self.secret);
+        if !self.active.load(Ordering::Acquire) || secret.is_none() {
+            plaintext.fill(0);
+            return Err(TransportError::Inactive);
+        }
+        let (mut encryption_key, mut authentication_key) =
+            derive_envelope_keys(secret.as_ref().unwrap(), &self.instance_id, b"request")?;
         let result = seal_message(
             &self.instance_id,
             b"request",
@@ -566,6 +570,7 @@ impl TransportSession {
         plaintext.fill(0);
         encryption_key.fill(0);
         authentication_key.fill(0);
+        drop(secret);
         if result
             .as_ref()
             .is_ok_and(|envelope| envelope.len() > MAX_ENVELOPE_REQUEST_BYTES)
@@ -615,18 +620,13 @@ impl TransportSession {
 
     fn envelope_keys(&self, direction: &[u8]) -> Result<([u8; 32], [u8; 32]), TransportError> {
         let secret = lock(&self.secret);
+        if !self.active.load(Ordering::Acquire) {
+            return Err(TransportError::Inactive);
+        }
         let Some(secret) = secret.as_ref() else {
             return Err(TransportError::Inactive);
         };
-        let mut encryption_context =
-            envelope_key_context(b"encryption", direction, &self.instance_id);
-        let mut authentication_context =
-            envelope_key_context(b"authentication", direction, &self.instance_id);
-        let encryption_key = hmac_sha256(secret, &encryption_context)?;
-        let authentication_key = hmac_sha256(secret, &authentication_context)?;
-        encryption_context.fill(0);
-        authentication_context.fill(0);
-        Ok((encryption_key, authentication_key))
+        derive_envelope_keys(secret, &self.instance_id, direction)
     }
 
     fn verify_proof(
@@ -1487,6 +1487,21 @@ fn unix_peer_pid(_stream: &UnixStream) -> Result<u32, TransportError> {
     Err(TransportError::PeerRejected)
 }
 
+fn derive_envelope_keys(
+    secret: &[u8; SECRET_BYTES],
+    instance_id: &str,
+    direction: &[u8],
+) -> Result<([u8; 32], [u8; 32]), TransportError> {
+    let mut encryption_context = envelope_key_context(b"encryption", direction, instance_id);
+    let mut authentication_context =
+        envelope_key_context(b"authentication", direction, instance_id);
+    let encryption_key = hmac_sha256(secret, &encryption_context)?;
+    let authentication_key = hmac_sha256(secret, &authentication_context)?;
+    encryption_context.fill(0);
+    authentication_context.fill(0);
+    Ok((encryption_key, authentication_key))
+}
+
 fn envelope_key_context(purpose: &[u8], direction: &[u8], instance_id: &str) -> Vec<u8> {
     let mut context = b"jarvis-local-envelope-v3\0".to_vec();
     context.extend_from_slice(purpose);
@@ -2016,9 +2031,9 @@ mod tests {
         let second = session.next_envelope_nonce().unwrap();
         for direction in [b"request".as_slice(), b"response".as_slice()] {
             let (mut encryption, mut authentication) = session.envelope_keys(direction).unwrap();
-            let mut unknown = [0_u8; 96];
+            let mut unknown = [0_u8; 100];
             os_random(&mut unknown).unwrap();
-            let known = [0_u8; 96];
+            let known = [0_u8; 100];
             let a = seal_message(
                 &session.instance_id,
                 direction,
@@ -2037,13 +2052,114 @@ mod tests {
                 &known,
             )
             .unwrap();
-            // Audit attack: known plaintext from message 2 must not recover message 1.
-            let recovered = (0..80).all(|i| a[32 + i] ^ b[16 + i] ^ known[i] == unknown[16 + i]);
+            let v3_shared = shared_keystream_blocks(
+                &a[16..a.len() - 32],
+                &unknown,
+                &b[16..b.len() - 32],
+                &known,
+            );
+            let prefix = [0x11_u8; 8];
+            let mut old_first = [0_u8; 16];
+            let mut old_second = [0_u8; 16];
+            old_first[..8].copy_from_slice(&prefix);
+            old_second[..8].copy_from_slice(&prefix);
+            old_first[8..].copy_from_slice(&1_u64.to_be_bytes());
+            old_second[8..].copy_from_slice(&2_u64.to_be_bytes());
+            let old_a = aes_ctr_xor(&encryption, &old_first, &unknown).unwrap();
+            let old_b = aes_ctr_xor(&encryption, &old_second, &known).unwrap();
+            let old_shared = shared_keystream_blocks(&old_a, &unknown, &old_b, &known);
             unknown.fill(0);
             encryption.fill(0);
             authentication.fill(0);
-            assert!(!recovered, "consecutive messages reused CTR keystream");
+            assert!(old_shared > 0, "old counter layout was not detected");
+            assert_eq!(v3_shared, 0, "consecutive messages reused CTR keystream");
         }
+        session.revoke();
+    }
+
+    fn shared_keystream_blocks(
+        left_ciphertext: &[u8],
+        left_plaintext: &[u8],
+        right_ciphertext: &[u8],
+        right_plaintext: &[u8],
+    ) -> usize {
+        let left = keystream_blocks(left_ciphertext, left_plaintext);
+        let right = keystream_blocks(right_ciphertext, right_plaintext);
+        left.iter().filter(|block| right.contains(block)).count()
+    }
+
+    fn keystream_blocks(ciphertext: &[u8], plaintext: &[u8]) -> Vec<Vec<u8>> {
+        let mut blocks = Vec::new();
+        let mut offset = 0;
+        while offset < ciphertext.len() {
+            let end = (offset + 16).min(ciphertext.len());
+            blocks.push(
+                ciphertext[offset..end]
+                    .iter()
+                    .zip(&plaintext[offset..end])
+                    .map(|(cipher_byte, plain_byte)| cipher_byte ^ plain_byte)
+                    .collect(),
+            );
+            offset = end;
+        }
+        blocks
+    }
+
+    #[test]
+    fn deactivation_is_synchronized_and_concurrent_seals_do_not_reuse_sequence() {
+        let session = TransportSession::create("deactivate-race").unwrap();
+        let first = session.next_envelope_nonce().unwrap();
+        assert!(session
+            .seal_application_request(APP_SESSION_OPEN_ROUTE, b"k=v\n", &first)
+            .is_ok());
+        let allocated = Arc::new(Mutex::new(Vec::<[u8; ENVELOPE_NONCE_BYTES]>::new()));
+        let start = Arc::new(std::sync::Barrier::new(5));
+        let mut workers = Vec::new();
+        for _ in 0..4 {
+            let session = Arc::clone(&session);
+            let allocated = Arc::clone(&allocated);
+            let start = Arc::clone(&start);
+            workers.push(thread::spawn(move || {
+                start.wait();
+                for _ in 0..10_000 {
+                    let Ok(nonce) = session.next_envelope_nonce() else {
+                        break;
+                    };
+                    if session
+                        .seal_application_request(APP_SESSION_OPEN_ROUTE, b"k=v\n", &nonce)
+                        .is_ok()
+                    {
+                        allocated.lock().unwrap().push(nonce);
+                    }
+                }
+            }));
+        }
+        start.wait();
+        session.deactivate();
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        let allocated = allocated.lock().unwrap();
+        let mut unique = allocated.clone();
+        unique.sort();
+        unique.dedup();
+        assert_eq!(unique.len(), allocated.len());
+        assert!(session.next_envelope_nonce().is_err());
+        assert!(session
+            .seal_application_request(APP_SESSION_OPEN_ROUTE, b"k=v\n", &first)
+            .is_err());
+        assert_eq!(
+            session.exchange_at(
+                &session.socket_path,
+                Verb::Post,
+                APPLICATION_ENVELOPE_ROUTE,
+                b""
+            ),
+            Err(TransportError::Inactive)
+        );
+        assert!(lock(&session.secret).is_none());
+        assert_eq!(session.envelope_sequence.load(Ordering::Acquire), u64::MAX);
+        session.revoke();
     }
 
     #[test]

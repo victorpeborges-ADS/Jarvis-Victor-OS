@@ -31,13 +31,13 @@ A resposta repete o nonce do pedido. Rust rejeita nonce inesperado antes de expo
 
 Para propósito (`encryption`, `authentication`) e direção (`request`, `response`), a chave é HMAC-SHA-256 da capability com `jarvis-local-envelope-v3\0 || propósito || 0 || direção || 0 || instance_id_ascii`. Chaves de cifra/MAC e request/response são separadas; cada nova geração cria nova capability CSPRNG e novo contexto. Não restaurar/reutilizar capability e estado de sequência de uma geração encerrada.
 
-HMAC de 32 bytes é validado antes de qualquer descriptografia. Python usa `hmac.compare_digest`; Rust compara comprimento fixo acumulando XOR. Após autenticar, ambos validam tamanho e nonce canônico antes de invocar CTR. Falhas devolvem somente categorias genéricas, sem plaintext ou segredos.
+HMAC de 32 bytes é validado antes de qualquer descriptografia. Python usa `hmac.compare_digest`; Rust compara comprimento fixo acumulando XOR. Após autenticar, ambos validam tamanho e nonce canônico antes de qualquer outra operação criptográfica. No pedido, o servidor então reserva a sequência sob o lock e só depois invoca CTR. Uma falha de HMAC, um nonce não canônico ou um ciphertext acima do limite não consome sequência. Uma mensagem autenticada e canônica consome a sequência mesmo se o frame ou o dispatch falharem depois; o replay dessa sequência não volta a descriptografar nem a despachar. Falhas devolvem somente categorias genéricas, sem plaintext ou segredos.
 
 ## Partição formal do contador
 
-O nonce externo também é o contador inicial AES-CTR: `s_be64 || 0_be64`. `s` começa em 1, cresce estritamente e nunca volta a zero. Rust serializa as operações e usa incremento checked de `u64`; depois de `2^64-1`, recusa novas mensagens antes da cifra. Uma tentativa que falha consome sua sequência, sem retry com o mesmo nonce.
+O nonce externo também é o contador inicial AES-CTR: `s_be64 || 0_be64`. `s` começa em 1, cresce estritamente e nunca volta a zero. Rust serializa a alocação e o seal sob o mesmo mutex da capability. O incremento é checked; depois de `2^64-1`, recusa novas mensagens antes da cifra. Uma tentativa que falha consome sua sequência, sem retry com o mesmo nonce. A desativação, ainda sob esse mutex, marca a sessão inativa, apaga o segredo e estaciona a sequência em `2^64-1`. Ela não volta a zero e não permite selar ou enviar com a capability retirada. O envio também recusa sessão inativa imediatamente antes de escrever no socket.
 
-O servidor aceita apenas nonce com `s != 0` e metade baixa zero. Sob lock, recusa `s <= last_sequence` antes do dispatch. Cada pedido aceito produz no máximo um envelope de resposta, mesmo para falha G5. Uma resposta reutiliza `s` somente sob a chave distinta de response.
+O servidor aceita apenas nonce com `s != 0` e metade baixa zero. Sob lock, reserva `s` maior que `last_sequence` antes do AES-CTR e do dispatch. Cada pedido reservado produz no máximo um envelope de resposta, mesmo para falha G5. Uma resposta reutiliza `s` somente sob a chave distinta de response.
 
 Para mensagem com `L` bytes, `B = ceil(L/16)`. Os blocos AES de `s` são:
 
@@ -56,6 +56,6 @@ CommonCrypto usa explicitamente `kCCModeOptionCTR_BE=2`. Python usa `cryptograph
 
 ## Evidência e limites
 
-Regressões usam funções de produção: mensagens consecutivas multibloco request/response, probe de plaintext conhecido, limites, sequência máxima/wrap, nonce inválido, tag/ciphertext alterados, replay, geração e versão antiga. A interoperabilidade compara ciphertext/tag byte a byte de CommonCrypto e Python e abre em ambos os lados, por pipes privados em memória; nada sensível é registrado. A integração do supervisor usa FastAPI real, prova, operações G5, substituição same-UID pós-prova, STOP/EOF/crash/restart/reap/cleanup.
+Regressões usam funções de produção: interseção de blocos em toda a mensagem multibloco consecutiva, nas duas direções, com a construção antiga detectada e o v3 sem blocos em comum; limites, sequência máxima/wrap, nonce inválido, tag/ciphertext alterados, replay sem nova cifra, HMAC inválido sem consumo de sequência, 32 pedidos concorrentes do mesmo nonce, desativação concorrente, geração e versão antiga. A interoperabilidade compara ciphertext/tag byte a byte de CommonCrypto e Python e abre em ambos os lados, por pipes privados em memória; nada sensível é registrado. A integração do supervisor usa FastAPI real, prova, operações G5, substituição same-UID pós-prova, STOP/EOF/crash/restart/reap/cleanup.
 
 O listener falso continua sendo recusado antes de receber bytes. Um processo local pode causar DoS ou disputar pathname. Não há proteção contra comprometimento de processo, inspeção privilegiada de memória, root/admin ou falha do kernel. Não se promete invulnerabilidade criptográfica absoluta nem proteção contra análise de comprimento/tráfego. Resultados e falhas intermediárias estão em [MAC_002_2_REPORT.md](MAC_002_2_REPORT.md).

@@ -77,3 +77,26 @@ Branch auditada continua em `d898ea287338613ec4adb546dcd9952e400964a5`; main em 
 A não sobreposição vale para o estado monotônico único por geração, os limites de tamanho, CTR big-endian e chaves separadas por geração/direção. Não cobre reutilização externa deliberada de capability/contexto/nonce, comprometimento de processo, root/admin, inspeção privilegiada de memória, kernel ou DoS local. Comprimentos/tráfego não são ocultados. Stress tests marcados ignore e smoke de release/WebView continuam fora da evidência executada; frontend lint/typecheck/build não foram executados nesta alteração exclusivamente nativa/API.
 
 Nenhum aceite formal é declarado. Próximo gate: reauditoria independente do commit local desta branch. MAC-003 e smoke Tauri/WebView permanecem abertos. Merge, push, tag, deploy, conectores reais e dados pessoais/institucionais não estão autorizados por esta entrega.
+
+## Hardening de ciclo de vida pós-reauditoria
+
+Branch `feat/jarvis-g6-mac-002-2-replay-lifecycle-fix`, worktree `/Users/vic/.codex/worktrees/jarvis-g6-mac-002-2-replay-lifecycle-fix/Jarvis-Victor-OS`, derivada de `f05e19222ee6d3ae58769632c2cea2470f109f86`. Não muda o wire format v3, a partição CTR, os limites de 77/129 blocos, as chaves por geração e direção, UDS-only, PID, lockfiles, migrations, SQLite ou controles G5.
+
+Dois P3 da reauditoria ficam corrigidos no código de produção:
+
+- O servidor autentica o HMAC e valida o nonce canônico antes de reservar a sequência. A reserva é atômica e ocorre antes do AES-CTR. Replay de sequência já reservada não descriptografa nem despacha. Falha de HMAC, nonce não canônico e ciphertext acima do limite não consomem sequência. Uma mensagem autenticada e canônica consome a sequência mesmo quando o frame ou o dispatch falham depois.
+- `deactivate` segura o mutex da capability durante toda a transição: marca inatividade, apaga o segredo e estaciona a sequência em `u64::MAX`. A sequência não volta a zero. Alocação e seal releem atividade e presença do segredo sob o mesmo mutex. O envio recusa sessão inativa antes de escrever no socket.
+
+A regressão de plaintext conhecido agora compara todos os blocos da mensagem, inclusive o bloco parcial, nas duas direções. A construção antiga `prefixo || sequência` produz interseção e o v3 produz zero blocos em comum. As asserções comparam apenas contagens.
+
+Evidência desta correção, executada na worktree nova:
+
+| Comando | Resultado |
+|---|---|
+| `uv sync --locked --python 3.12` em `apps/api` | PASS; lockfile preservado |
+| `uv run --locked --python 3.12 pytest -q --tb=short test_native_ctr_partition.py test_native_app_api.py test_native_runtime_process.py` | PASS: 26; um aviso de depreciação Starlette/httpx |
+| `cargo fmt --all -- --check` e `git diff --check` | PASS |
+| `cargo test --locked --features mac003-production-supervisor-test --lib transport::tests -- --test-threads=1` | PASS: 25; 3 ignorados (entrypoint subordinado e dois stresses MAC-002.1); 62 filtrados de outros módulos |
+| `cargo test --locked --features mac003-production-supervisor-test --test mac003_production_supervisor -- --test-threads=1` | PASS: 1; supervisor real/FastAPI, G5, STOP/EOF/crash/restart |
+
+Não houve falha intermediária nesta correção. A suíte completa do crate e os stresses ignorados não foram repetidos. O smoke Tauri/WebView não foi executado. Nenhum aceite formal é declarado. Próximo passo: reauditoria focada deste commit. Merge, push, tag e deploy continuam não autorizados.

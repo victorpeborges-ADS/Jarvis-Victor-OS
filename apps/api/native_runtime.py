@@ -208,8 +208,25 @@ def _open_application_envelope(
     if not hmac.compare_digest(tag, expected):
         raise ValueError("invalid envelope")
     _validate_counter_partition(direction, nonce, len(ciphertext))
+    if direction == b"request":
+        # Canonical, authenticated requests consume the sequence before CTR.
+        # A later framing or dispatch failure does not release it. HMAC failure,
+        # a non-canonical nonce, and an oversized ciphertext never reach here.
+        _reserve_request_sequence(identity, nonce)
     encryption_key = _derive_key(identity, b"encryption", direction)
     return nonce, _aes_ctr(encryption_key, nonce, ciphertext)
+
+
+class ReplayError(ValueError):
+    pass
+
+
+def _reserve_request_sequence(identity: NativeRuntimeIdentity, nonce: bytes) -> None:
+    sequence = int.from_bytes(nonce[:ENVELOPE_SEQUENCE_BYTES], "big")
+    with identity.replay_lock:
+        if sequence <= identity.last_request_sequence:
+            raise ReplayError
+        identity.last_request_sequence = sequence
 
 
 def _accept_request_nonce(identity: NativeRuntimeIdentity, nonce: bytes) -> bool:
@@ -218,15 +235,11 @@ def _accept_request_nonce(identity: NativeRuntimeIdentity, nonce: bytes) -> bool
     sequence = int.from_bytes(nonce[:ENVELOPE_SEQUENCE_BYTES], "big")
     if sequence == 0 or nonce[ENVELOPE_SEQUENCE_BYTES:] != bytes(8):
         return False
-    with identity.replay_lock:
-        if sequence <= identity.last_request_sequence:
-            return False
-        identity.last_request_sequence = sequence
-        return True
-
-
-class ReplayError(ValueError):
-    pass
+    try:
+        _reserve_request_sequence(identity, nonce)
+    except ReplayError:
+        return False
+    return True
 
 
 class RequestTooLargeError(ValueError):
@@ -251,8 +264,6 @@ def _decode_application_request(identity: NativeRuntimeIdentity, envelope: bytes
         raise ValueError("invalid request frame") from exc
     if ("POST", path) not in APP_PATHS:
         raise ValueError("route rejected")
-    if not _accept_request_nonce(identity, nonce):
-        raise ReplayError
     return nonce, path, bytes(plaintext[8 + path_length :])
 
 
