@@ -225,7 +225,7 @@ pub(crate) struct TransportSession {
     request_cv: Condvar,
     request_lock_depth: AtomicUsize,
     #[cfg(test)]
-    before_socket_write: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    transaction_barrier: Mutex<Option<Arc<dyn Fn(&str) + Send + Sync>>>,
 }
 
 impl TransportSession {
@@ -286,7 +286,7 @@ impl TransportSession {
             request_cv: Condvar::new(),
             request_lock_depth: AtomicUsize::new(0),
             #[cfg(test)]
-            before_socket_write: Mutex::new(None),
+            transaction_barrier: Mutex::new(None),
         }))
     }
 
@@ -391,10 +391,15 @@ impl TransportSession {
             return Err(TransportError::ApplicationRequestTooLarge);
         }
         let _serial = self.lock_request();
+        self.ensure_active()?;
+        #[cfg(test)]
+        self.pause_transaction_for_test("admitted");
         self.probe_endpoint_locked(&self.socket_path)?;
         after_probe();
         let nonce = self.next_envelope_nonce_locked()?;
         let envelope = self.seal_application_request_locked(route, body, &nonce)?;
+        #[cfg(test)]
+        self.pause_transaction_for_test("sealed");
         let response = self.exchange_at(
             &self.socket_path,
             Verb::Post,
@@ -537,7 +542,7 @@ impl TransportSession {
         );
         self.ensure_active()?;
         #[cfg(test)]
-        self.pause_before_socket_write_for_test();
+        self.pause_transaction_for_test("checked");
         self.ensure_active()?;
         debug_assert!(self.request_lock_depth.load(Ordering::Acquire) > 0);
         stream
@@ -763,10 +768,10 @@ impl TransportSession {
     }
 
     #[cfg(test)]
-    fn pause_before_socket_write_for_test(&self) {
-        let hook = lock(&self.before_socket_write).clone();
+    fn pause_transaction_for_test(&self, phase: &str) {
+        let hook = lock(&self.transaction_barrier).clone();
         if let Some(hook) = hook {
-            hook();
+            hook(phase);
         }
     }
 
@@ -2297,8 +2302,11 @@ mod tests {
         let entered_hook = Arc::clone(&entered);
         let release_hook = Arc::clone(&release);
         {
-            let mut hook = lock(&session.before_socket_write);
-            *hook = Some(Arc::new(move || {
+            let mut hook = lock(&session.transaction_barrier);
+            *hook = Some(Arc::new(move |phase: &str| {
+                if phase != "checked" {
+                    return;
+                }
                 if let Some(sender) = entered_hook.lock().unwrap().take() {
                     sender.send(()).unwrap();
                 }
@@ -2368,7 +2376,7 @@ mod tests {
         assert!(inflight_bytes > 0, "in-flight send wrote no bytes");
 
         {
-            let mut hook = lock(&session.before_socket_write);
+            let mut hook = lock(&session.transaction_barrier);
             *hook = None;
         }
         let after = {
@@ -2402,6 +2410,159 @@ mod tests {
         assert!(lock(&blocked.secret).is_none());
         assert_eq!(blocked.envelope_sequence.load(Ordering::Acquire), u64::MAX);
         assert!(blocked.next_envelope_nonce().is_err());
+        blocked.revoke();
+    }
+
+    #[test]
+    fn g5_transaction_barriers_cover_admission_seal_and_prewrite_check() {
+        use std::sync::mpsc;
+
+        fn arm(
+            session: &TransportSession,
+            phase: &'static str,
+        ) -> (mpsc::Receiver<()>, Arc<std::sync::Barrier>) {
+            let (entered_tx, entered_rx) = mpsc::channel();
+            let entered = Arc::new(Mutex::new(Some(entered_tx)));
+            let release = Arc::new(std::sync::Barrier::new(2));
+            let entered_hook = Arc::clone(&entered);
+            let release_hook = Arc::clone(&release);
+            let mut hook = lock(&session.transaction_barrier);
+            *hook = Some(Arc::new(move |current: &str| {
+                if current != phase {
+                    return;
+                }
+                if let Some(sender) = entered_hook.lock().unwrap().take() {
+                    sender.send(()).unwrap();
+                }
+                release_hook.wait();
+            }));
+            (entered_rx, release)
+        }
+
+        fn serve_probe(
+            session: &TransportSession,
+            secure_bytes: Arc<AtomicUsize>,
+            accepts: Arc<AtomicUsize>,
+            stop: Arc<AtomicBool>,
+        ) -> JoinHandle<()> {
+            let instance_id = session.instance_id.clone();
+            let mut secret = lock(&session.secret).as_ref().unwrap().to_owned();
+            let listener = fake_listener(session);
+            listener.set_nonblocking(true).unwrap();
+            thread::spawn(move || {
+                let deadline = Instant::now() + Duration::from_secs(3);
+                while !stop.load(Ordering::Acquire) && Instant::now() < deadline {
+                    let mut stream = match listener.accept() {
+                        Ok((stream, _)) => stream,
+                        Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                            thread::sleep(Duration::from_millis(5));
+                            continue;
+                        }
+                        Err(_) => break,
+                    };
+                    stream.set_nonblocking(false).unwrap();
+                    accepts.fetch_add(1, Ordering::Release);
+                    let (start, body) = read_fake_request(&mut stream);
+                    let route = start.split_whitespace().nth(1).unwrap_or_default();
+                    if route == APPLICATION_ENVELOPE_ROUTE {
+                        secure_bytes.fetch_add(body.len(), Ordering::Release);
+                        let response = b"x";
+                        let header = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\nContent-Type: application/octet-stream\r\n\r\n",
+                            response.len()
+                        );
+                        let _ = stream.write_all(header.as_bytes());
+                        let _ = stream.write_all(response);
+                    } else {
+                        let response = if route == HEALTH_ROUTE {
+                            b"ok\n".to_vec()
+                        } else if route == VERSION_ROUTE {
+                            version_body(&instance_id, PROTOCOL_VERSION)
+                        } else if route == PROOF_ROUTE {
+                            let nonce = std::str::from_utf8(&body).unwrap();
+                            proof_body(&instance_id, nonce, &secret)
+                        } else {
+                            b"no\n".to_vec()
+                        };
+                        write_fake_response(&mut stream, "200 OK", &response);
+                    }
+                }
+                secret.fill(0);
+            })
+        }
+
+        for phase in ["admitted", "sealed"] {
+            let session = TransportSession::create(&format!("g5-barrier-{phase}")).unwrap();
+            let secure_bytes = Arc::new(AtomicUsize::new(0));
+            let accepts = Arc::new(AtomicUsize::new(0));
+            let stop = Arc::new(AtomicBool::new(false));
+            let server = serve_probe(
+                &session,
+                Arc::clone(&secure_bytes),
+                Arc::clone(&accepts),
+                Arc::clone(&stop),
+            );
+            let (entered_rx, release) = arm(&session, phase);
+            let worker = Arc::clone(&session);
+            let call =
+                thread::spawn(move || worker.call_g5_application(APP_SESSION_OPEN_ROUTE, b"k=v\n"));
+            entered_rx
+                .recv_timeout(Duration::from_secs(2))
+                .unwrap_or_else(|_| panic!("{phase} barrier was not reached"));
+            if phase == "admitted" {
+                assert_eq!(accepts.load(Ordering::Acquire), 0);
+            } else {
+                assert_eq!(secure_bytes.load(Ordering::Acquire), 0);
+                assert_eq!(accepts.load(Ordering::Acquire), 3);
+            }
+            let done = Arc::new(AtomicBool::new(false));
+            let done_flag = Arc::clone(&done);
+            let retiring = Arc::clone(&session);
+            let retirement = thread::spawn(move || {
+                retiring.deactivate();
+                done_flag.store(true, Ordering::Release);
+            });
+            session.wait_until_request_contended_for_test();
+            assert!(!done.load(Ordering::Acquire));
+            release.wait();
+            let _ = call.join().unwrap();
+            retirement.join().unwrap();
+            stop.store(true, Ordering::Release);
+            server.join().unwrap();
+            if phase == "sealed" {
+                assert!(secure_bytes.load(Ordering::Acquire) > 0);
+            }
+            let accepts_after = accepts.load(Ordering::Acquire);
+            {
+                let mut hook = lock(&session.transaction_barrier);
+                *hook = None;
+            }
+            assert_eq!(
+                session.call_g5_application(APP_SESSION_OPEN_ROUTE, b"k=v\n"),
+                Err(TransportError::Inactive)
+            );
+            assert_eq!(accepts.load(Ordering::Acquire), accepts_after);
+            assert!(lock(&session.secret).is_none());
+            assert_eq!(session.envelope_sequence.load(Ordering::Acquire), u64::MAX);
+            assert!(session.next_envelope_nonce().is_err());
+            session.revoke();
+        }
+
+        let blocked = TransportSession::create("g5-barrier-deactivate-first").unwrap();
+        blocked.deactivate();
+        let listener = fake_listener(&blocked);
+        listener.set_nonblocking(true).unwrap();
+        assert_eq!(
+            blocked.call_g5_application(APP_SESSION_OPEN_ROUTE, b"k=v\n"),
+            Err(TransportError::Inactive)
+        );
+        match listener.accept() {
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+            Ok(_) => panic!("call after deactivate connected"),
+            Err(error) => panic!("accept after deactivate failed: {error}"),
+        }
+        assert!(lock(&blocked.secret).is_none());
+        assert_eq!(blocked.envelope_sequence.load(Ordering::Acquire), u64::MAX);
         blocked.revoke();
     }
 
