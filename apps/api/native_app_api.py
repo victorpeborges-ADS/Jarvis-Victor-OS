@@ -10,7 +10,7 @@ from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import PlainTextResponse
 from pydantic import ValidationError
 
-from domain_registry import MISSION_READ_RESOURCE
+from domain_registry import MISSION_READ_RESOURCE, MISSION_REVIEW_RESOURCE
 from local_security import (
     GrantIn,
     LoginIn,
@@ -21,10 +21,11 @@ from local_security import (
     _revoke_grant_for_session,
     _close_session_for,
     mission_read_scope_confirmed,
+    mission_review_confirmed,
 )
 from external_connectors import public_status
 from local_captures import clear_captures, create_capture, encode_capture_items, list_captures
-from mission_repository import MissionCorrupt, MissionRepository
+from mission_repository import MissionConflict, MissionCorrupt, MissionDenied, MissionRejected, MissionRepository
 
 router = APIRouter()
 NATIVE_DOMAIN = "dom_synthetic_a"
@@ -43,6 +44,17 @@ EXPECTED_FIELDS = {
     "/v1/app/captures/list": ("session_token",),
     "/v1/app/captures/clear": ("session_token", "csrf_token"),
     "/v1/app/connectors/status": ("session_token",),
+    "/v1/app/grants/mission-review": ("session_token", "csrf_token", "domain_id", "confirm"),
+    "/v1/app/reviews/pending": ("session_token", "domain_id"),
+    "/v1/app/reviews/approve": (
+        "session_token",
+        "csrf_token",
+        "review_id",
+        "expected_revision",
+        "expected_sha256",
+        "idempotency_key",
+        "confirm",
+    ),
 }
 
 
@@ -327,3 +339,118 @@ async def native_connector_status(request: Request) -> PlainTextResponse:
         calendar_scope=status["calendar_scope"],
         calendar_sim=status["calendar_sim"],
     )
+
+
+def _review_grant(session, domain_id: str, confirm: str):
+    if confirm != "review-local" or domain_id != NATIVE_DOMAIN:
+        raise ValueError("confirmação ausente")
+    expires_at = (_now() + NATIVE_GRANT_TTL).astimezone(timezone.utc)
+    body = GrantIn(
+        connector="mission_sim",
+        permission="read",
+        resource_ids=[MISSION_REVIEW_RESOURCE],
+        domain_ids=[NATIVE_DOMAIN],
+        expires_at=expires_at,
+    )
+    return _create_grant_for_session(session, body, replay_exact=True)
+
+
+@router.post("/v1/app/grants/mission-review")
+async def create_native_review_grant(request: Request) -> PlainTextResponse:
+    try:
+        fields = await _read_fields(request, EXPECTED_FIELDS[request.url.path])
+        session = _native_session(fields["session_token"], fields["csrf_token"], mutation=True)
+        grant = _review_grant(session, fields["domain_id"], fields["confirm"])
+    except (ValueError, UnicodeError, ValidationError):
+        return _error("scope_invalid")
+    except HTTPException as exc:
+        return _error_for(exc)
+    return _success(
+        grant_id=grant.id,
+        domain_id=NATIVE_DOMAIN,
+        resource=MISSION_REVIEW_RESOURCE,
+        expires_at_epoch_us=_epoch_microseconds(grant.expires_at),
+        expires_at=grant.expires_at.isoformat(),
+    )
+
+
+@router.post("/v1/app/reviews/pending")
+async def list_native_pending_reviews(request: Request) -> PlainTextResponse:
+    try:
+        fields = await _read_fields(request, EXPECTED_FIELDS[request.url.path])
+        session = _native_session(fields["session_token"])
+        if fields["domain_id"] != NATIVE_DOMAIN:
+            return _error("scope_invalid")
+        with mission_review_confirmed(session.principal, NATIVE_DOMAIN, session.token):
+            page = MissionRepository(request.app.state.memory_store).list_reviews(
+                session.principal, NATIVE_DOMAIN, "pending", 1, None, frozenset({NATIVE_DOMAIN})
+            )
+        if page["corrupt"]:
+            return _error("operation_failed")
+        items = page["items"]
+        if not items:
+            return _success(count=0)
+        item = items[0]
+        review_id = item.get("id")
+        sha = item.get("artifact_sha256")
+        revision = item.get("revision")
+        title = item.get("artifact_title")
+        if (
+            not isinstance(review_id, str)
+            or not re.fullmatch(r"[A-Za-z0-9_-]{8,128}", review_id)
+            or not isinstance(sha, str)
+            or not re.fullmatch(r"[0-9a-f]{64}", sha)
+            or type(revision) is not int
+            or not isinstance(title, str)
+            or not 1 <= len(title) <= 80
+        ):
+            return _error("operation_failed")
+        return _success(count=1, review_id=review_id, revision=revision, sha256=sha, title=title)
+    except (ValueError, UnicodeError):
+        return _error("scope_invalid")
+    except HTTPException as exc:
+        return _error_for(exc)
+    except PermissionError:
+        return _error("grant_required")
+    except MissionCorrupt:
+        return _error("operation_failed")
+
+
+@router.post("/v1/app/reviews/approve")
+async def approve_native_review(request: Request) -> PlainTextResponse:
+    try:
+        fields = await _read_fields(request, EXPECTED_FIELDS[request.url.path])
+        session = _native_session(fields["session_token"], fields["csrf_token"], mutation=True)
+        if fields["confirm"] != "approve-local":
+            return _error("scope_invalid")
+        if not re.fullmatch(r"[0-9a-f]{64}", fields["expected_sha256"]):
+            return _error("scope_invalid")
+        if not 8 <= len(fields["idempotency_key"]) <= 160:
+            return _error("scope_invalid")
+        revision = int(fields["expected_revision"])
+        if revision < 1:
+            return _error("scope_invalid")
+        with mission_review_confirmed(session.principal, NATIVE_DOMAIN, session.token):
+            record, replayed = MissionRepository(request.app.state.memory_store).decide_review(
+                session.principal,
+                fields["review_id"],
+                "approved",
+                revision,
+                fields["expected_sha256"],
+                None,
+                fields["idempotency_key"],
+                session.token,
+            )
+        if record.get("domain_id") != NATIVE_DOMAIN:
+            return _error("scope_invalid")
+        return _success(approved="true", replayed="true" if replayed else "false")
+    except (ValueError, UnicodeError, ValidationError):
+        return _error("scope_invalid")
+    except HTTPException as exc:
+        return _error_for(exc)
+    except PermissionError:
+        return _error("grant_required")
+    except MissionDenied:
+        return _error("grant_required")
+    except (MissionConflict, MissionCorrupt, MissionRejected):
+        return _error("operation_failed")

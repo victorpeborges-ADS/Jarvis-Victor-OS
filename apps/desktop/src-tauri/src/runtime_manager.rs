@@ -1185,6 +1185,154 @@ impl RuntimeManager {
         result
     }
 
+    fn g5_review_grant_create(&self) -> String {
+        let _operation = self
+            .g5_operation
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let (instance_id, transport, token, csrf_token) = match self.g5_credentials_for_active() {
+            Ok(value) => value,
+            Err(error) => return g5_error_json(error),
+        };
+        let body = SecretBytes::new(encode_application_fields(&[
+            ("session_token", token.as_str()),
+            ("csrf_token", csrf_token.as_str()),
+            ("domain_id", "dom_synthetic_a"),
+            ("confirm", "review-local"),
+        ]));
+        let response =
+            match transport.call_g5_application("/v1/app/grants/mission-review", body.as_slice()) {
+                Ok(value) => SecretBytes::new(value),
+                Err(_) => return g5_error_json("transport_failure"),
+            };
+        let fields = match parse_application_response(response.as_slice()) {
+            Ok(value) => value,
+            Err(()) => return g5_error_json("protocol_failure"),
+        };
+        if let Some(error) = app_response_error(&fields) {
+            clear_cached_authorization_after_rejection(
+                &self.shared,
+                &instance_id,
+                &transport,
+                token.as_str(),
+                error,
+            );
+            return g5_error_json(error);
+        }
+        if !app_fields_match(
+            &fields,
+            &[
+                "ok",
+                "grant_id",
+                "domain_id",
+                "resource",
+                "expires_at_epoch_us",
+                "expires_at",
+            ],
+        ) || app_field(&fields, "ok") != Some("true")
+            || app_field(&fields, "domain_id") != Some("dom_synthetic_a")
+            || app_field(&fields, "resource") != Some("mission:review")
+            || !app_field(&fields, "grant_id").is_some_and(is_hex_identifier)
+            || !app_field(&fields, "expires_at")
+                .is_some_and(|value| parse_rfc3339_micros(value).is_some())
+        {
+            return g5_error_json("protocol_failure");
+        }
+        let expires_at = app_field(&fields, "expires_at")
+            .unwrap_or_default()
+            .to_owned();
+        let inner = lock_inner(&self.shared);
+        if !g5_generation_matches(&inner, &instance_id, &transport)
+            || inner
+                .g5_session
+                .as_ref()
+                .is_none_or(|session| session.token.as_str() != token.as_str())
+        {
+            return g5_error_json("stale_generation");
+        }
+        format!(
+            "{{\"ok\":true,\"review_grant\":true,\"expires_at\":{}}}",
+            json_string(&expires_at)
+        )
+    }
+
+    fn g5_reviews_pending(&self) -> String {
+        let _operation = self
+            .g5_operation
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let (instance_id, transport, token, _csrf) = match self.g5_credentials_for_active() {
+            Ok(value) => value,
+            Err(error) => return g5_error_json(error),
+        };
+        let body = SecretBytes::new(encode_application_fields(&[
+            ("session_token", token.as_str()),
+            ("domain_id", "dom_synthetic_a"),
+        ]));
+        let response =
+            match transport.call_g5_application("/v1/app/reviews/pending", body.as_slice()) {
+                Ok(value) => SecretBytes::new(value),
+                Err(_) => return g5_error_json("transport_failure"),
+            };
+        let fields = match parse_application_response(response.as_slice()) {
+            Ok(value) => value,
+            Err(()) => return g5_error_json("protocol_failure"),
+        };
+        if let Some(error) = app_response_error(&fields) {
+            clear_cached_authorization_after_rejection(
+                &self.shared,
+                &instance_id,
+                &transport,
+                token.as_str(),
+                error,
+            );
+            return g5_error_json(error);
+        }
+        let count = app_field(&fields, "count");
+        let expected: &[&str] = if count == Some("0") {
+            &["ok", "count"]
+        } else if count == Some("1") {
+            &["ok", "count", "review_id", "revision", "sha256", "title"]
+        } else {
+            return g5_error_json("protocol_failure");
+        };
+        if !app_fields_match(&fields, expected) || app_field(&fields, "ok") != Some("true") {
+            return g5_error_json("protocol_failure");
+        }
+        let result = if count == Some("0") {
+            "{\"ok\":true,\"reviews\":[]}".to_owned()
+        } else {
+            let review_id = app_field(&fields, "review_id").unwrap_or_default();
+            let revision = app_field(&fields, "revision").unwrap_or_default();
+            let sha = app_field(&fields, "sha256").unwrap_or_default();
+            let title = app_field(&fields, "title").unwrap_or_default();
+            if review_id.len() < 8
+                || revision.parse::<u64>().is_err()
+                || sha.len() != 64
+                || title.is_empty()
+            {
+                return g5_error_json("protocol_failure");
+            }
+            format!(
+                "{{\"ok\":true,\"reviews\":[{{\"id\":{},\"revision\":{},\"sha256\":{},\"title\":{}}}]}}",
+                json_string(review_id),
+                revision,
+                json_string(sha),
+                json_string(title)
+            )
+        };
+        let inner = lock_inner(&self.shared);
+        if !g5_generation_matches(&inner, &instance_id, &transport)
+            || inner
+                .g5_session
+                .as_ref()
+                .is_none_or(|session| session.token.as_str() != token.as_str())
+        {
+            return g5_error_json("stale_generation");
+        }
+        result
+    }
+
     fn g5_credentials_for_active(
         &self,
     ) -> Result<(String, Arc<TransportSession>, SecretText, SecretText), &'static str> {
@@ -1252,6 +1400,10 @@ impl RuntimeManager {
         };
         complete_transport_probe(&self.shared, &instance_id, session);
         lock_inner(&self.shared).transport_snapshot.clone()
+    }
+
+    pub(crate) fn start_on_launch(&self) -> Result<RuntimeSnapshot, ManagerError> {
+        self.start_runtime()
     }
 
     fn start_runtime(&self) -> Result<RuntimeSnapshot, ManagerError> {
@@ -3726,15 +3878,30 @@ pub fn g5_connectors_status(manager: tauri::State<'_, RuntimeManager>) -> String
 }
 
 #[tauri::command]
+pub fn g5_review_grant_create(manager: tauri::State<'_, RuntimeManager>) -> String {
+    manager.g5_review_grant_create()
+}
+
+#[tauri::command]
+pub fn g5_reviews_pending(manager: tauri::State<'_, RuntimeManager>) -> String {
+    manager.g5_reviews_pending()
+}
+
+#[tauri::command]
 pub fn runtime_local_config() -> String {
     let passphrase_configured = env::var_os("JARVIS_LOCAL_PASSPHRASE")
         .is_some_and(|value| (12..=128).contains(&value.len()));
     let database_configured = env::var_os("JARVIS_DATABASE_PATH").is_some();
+    let database_mode = if database_configured {
+        "override"
+    } else {
+        "stable"
+    };
     let api_root_configured = env::var_os("JARVIS_API_ROOT").is_some();
     let oauth_client_configured =
         env::var_os("JARVIS_GOOGLE_OAUTH_CLIENT_ID").is_some_and(|value| !value.is_empty());
     format!(
-        "{{\"ok\":true,\"passphrase_configured\":{passphrase_configured},\"database_configured\":{database_configured},\"api_root_configured\":{api_root_configured},\"oauth_client_configured\":{oauth_client_configured}}}"
+        "{{\"ok\":true,\"passphrase_configured\":{passphrase_configured},\"database_configured\":{database_configured},\"database_mode\":\"{database_mode}\",\"api_root_configured\":{api_root_configured},\"oauth_client_configured\":{oauth_client_configured}}}"
     )
 }
 

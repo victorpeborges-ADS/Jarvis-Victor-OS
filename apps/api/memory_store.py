@@ -184,10 +184,10 @@ def default_database_path() -> Path:
     if override:
         return _safe_database_path(Path(override))
     if platform.system() == "Darwin":
-        path = Path.home() / "Library" / "Application Support" / "JARVIS" / "memory.sqlite3"
+        path = Path.home() / "Library" / "Application Support" / "Jarvis" / "memory.sqlite3"
     else:
         data_home = Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local" / "share"))
-        path = data_home / "JARVIS" / "memory.sqlite3"
+        path = data_home / "Jarvis" / "memory.sqlite3"
     return _safe_database_path(path)
 
 

@@ -46,6 +46,9 @@ APP_PATHS = frozenset(
         ("POST", "/v1/app/captures/list"),
         ("POST", "/v1/app/captures/clear"),
         ("POST", "/v1/app/connectors/status"),
+        ("POST", "/v1/app/grants/mission-review"),
+        ("POST", "/v1/app/reviews/pending"),
+        ("POST", "/v1/app/reviews/approve"),
     }
 )
 CONTROL_PATHS = frozenset(

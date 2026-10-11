@@ -537,6 +537,34 @@ def test_connector_status_stays_disconnected_without_printing_client_id(native_c
         read_google_calendar_events()
 
 
+def test_review_grant_requires_explicit_confirmation_and_does_not_approve(native_client):
+    token, csrf = login(native_client)
+    missing = fields(native_client.post("/v1/app/reviews/pending", content=body(
+        session_token=token, domain_id="dom_synthetic_a"), headers=HEADERS))
+    assert missing == {"ok": "false", "code": "grant_required"}
+    refused = fields(native_client.post("/v1/app/grants/mission-review", content=body(
+        session_token=token, csrf_token=csrf, domain_id="dom_synthetic_a", confirm="no"), headers=HEADERS))
+    assert refused == {"ok": "false", "code": "scope_invalid"}
+    granted = fields(native_client.post("/v1/app/grants/mission-review", content=body(
+        session_token=token, csrf_token=csrf, domain_id="dom_synthetic_a", confirm="review-local"), headers=HEADERS))
+    assert granted["ok"] == "true" and granted["resource"] == "mission:review"
+    replayed = fields(native_client.post("/v1/app/grants/mission-review", content=body(
+        session_token=token, csrf_token=csrf, domain_id="dom_synthetic_a", confirm="review-local"), headers=HEADERS))
+    assert replayed["grant_id"] == granted["grant_id"]
+    pending = fields(native_client.post("/v1/app/reviews/pending", content=body(
+        session_token=token, domain_id="dom_synthetic_a"), headers=HEADERS))
+    assert pending == {"ok": "true", "count": "0"}
+    denied = fields(native_client.post("/v1/app/reviews/approve", content=body(
+        session_token=token, csrf_token=csrf, review_id="review_missing_local",
+        expected_revision="1", expected_sha256="a" * 64, idempotency_key="approve-local-1",
+        confirm="approve-local"), headers=HEADERS))
+    assert denied["ok"] == "false"
+    assert denied["code"] in {"operation_failed", "scope_invalid"}
+    missions = fields(native_client.post("/v1/app/missions/list", content=body(
+        session_token=token, domain_id="dom_synthetic_a"), headers=HEADERS))
+    assert missions == {"ok": "false", "code": "grant_required"}
+
+
 def test_epoch_microseconds_preserves_datetime_precision_without_float_rounding():
     from datetime import timezone
     from native_app_api import _epoch_microseconds

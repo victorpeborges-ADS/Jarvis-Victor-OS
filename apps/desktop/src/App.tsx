@@ -55,6 +55,9 @@ function App() {
   const [connectors, setConnectors] = useState<ConnectorStatus | null>(null);
   const [localConfig, setLocalConfig] = useState<LocalRuntimeConfig | null>(null);
   const [nowMs, setNowMs] = useState(() => Date.now());
+  const [reviewConfirmed, setReviewConfirmed] = useState(false);
+  const [reviewGrant, setReviewGrant] = useState(false);
+  const [pendingReviews, setPendingReviews] = useState<{ id: string; revision: number; sha256: string; title: string }[]>([]);
   const runtimeAvailable = isTauri();
   const grantActive = g5Status ? grantIsDisplayedActive(g5Status, nowMs) : false;
 
@@ -82,6 +85,8 @@ function App() {
             setMissions([]);
             setCaptures([]);
             setConnectors(null);
+            setReviewGrant(false);
+            setPendingReviews([]);
           } else if (!grantIsDisplayedActive(g5Response, Date.now())) {
             setMissions([]);
           }
@@ -232,6 +237,31 @@ function App() {
     }
   }
 
+  async function requestReviewGrant() {
+    setG5Busy(true);
+    setG5Error("");
+    try {
+      const granted = await g5Ipc.createReviewGrant();
+      if (!granted.ok) {
+        setReviewGrant(false);
+        setG5Error(granted.error ?? "A concessão de revisão não foi criada.");
+        return;
+      }
+      setReviewGrant(true);
+      const pending = await g5Ipc.pendingReviews();
+      if (!pending.ok) {
+        setG5Error(pending.error ?? "A fila de revisão não pôde ser lida.");
+        return;
+      }
+      setPendingReviews(pending.reviews ?? []);
+      setNotice("Concessão mission:review registrada. Nenhuma ação externa foi executada.");
+    } catch {
+      setG5Error("Não foi possível solicitar a revisão local.");
+    } finally {
+      setG5Busy(false);
+    }
+  }
+
   async function clearCaptures() {
     setG5Busy(true);
     setG5Error("");
@@ -324,9 +354,15 @@ function App() {
         {runtimeAvailable && grantActive && missions.length === 0 && <p className="field-hint">Nenhuma missão autorizada apareceu nesta leitura. O banco de teste permanece separado e não recebe fixtures automaticamente.</p>}
       </article>}
       {section === "Aprovações" && <article className="card"><p className="badge">SEM EFEITO EXTERNO</p>
-        <h2>Confirmação humana, sem envio</h2>
-        <p>Este cliente não envia e-mail, não cria evento e não executa ação fora da máquina. A fila de revisão do servidor exige a concessão <code>mission:review</code>, que esta janela não solicita.</p>
-        {missions.some((mission) => mission.status === "awaiting_approval") ? <ul>{missions.filter((mission) => mission.status === "awaiting_approval").map((mission) => <li key={mission.id}><span>{mission.title}</span><span>aguardando aprovação · revisão {mission.revision}</span></li>)}</ul> : <p>Nenhuma missão lida está aguardando aprovação. Ler a lista exige a concessão <code>mission:read</code>.</p>}
+        <h2>Revisão local, com confirmação</h2>
+        <p>A concessão <code>mission:review</code> só é pedida se você confirmar. Ela não é automática e não envia e-mail nem altera calendário.</p>
+        {!g5Status?.session_active && <p>Abra a sessão em Missões antes de solicitar a revisão.</p>}
+        {g5Status?.session_active && <>
+          <label className="confirm"><input type="checkbox" checked={reviewConfirmed} onChange={(event) => setReviewConfirmed(event.currentTarget.checked)} /> Confirmo a concessão de revisão só para decisões locais em <code>dom_synthetic_a</code>.</label>
+          <button className="action" type="button" disabled={g5Busy || !reviewConfirmed} onClick={() => void requestReviewGrant()}>Solicitar revisão local</button>
+          {reviewGrant && pendingReviews.length === 0 && <p>Nenhuma revisão pendente. Nada será enviado para fora.</p>}
+          {pendingReviews.length > 0 && <ul>{pendingReviews.map((review) => <li key={review.id}><span>{review.title}</span><span>revisão {review.revision}</span></li>)}</ul>}
+        </>}
       </article>}
       {section === "Runtime local" && <article className="card runtime-card">
         <p className="badge">RUNTIME FASTAPI / G5</p>
@@ -355,7 +391,7 @@ function App() {
         <h2>Estado local</h2>
         <ul>
           <li><span>Passphrase no ambiente</span><span>{localConfig?.passphrase_configured ? "presente" : "ausente"}</span></li>
-          <li><span>Banco indicado</span><span>{localConfig?.database_configured ? "caminho definido" : "ausente"}</span></li>
+          <li><span>Banco</span><span>{localConfig?.database_mode === "override" ? "caminho de teste" : "estável em Application Support"}</span></li>
           <li><span>JARVIS_API_ROOT</span><span>{localConfig?.api_root_configured ? "definido" : "usa o checkout de desenvolvimento"}</span></li>
           <li><span>Client ID OAuth</span><span>{localConfig?.oauth_client_configured ? "presente, sem consentimento" : "ausente"}</span></li>
           <li><span>Gmail</span><span>{connectors ? connectorBlockLabels[connectors.gmail_block] : "não conectada"}</span></li>

@@ -21,6 +21,8 @@ pub fn run() {
             runtime_manager::g5_capture_list,
             runtime_manager::g5_capture_clear,
             runtime_manager::g5_connectors_status,
+            runtime_manager::g5_review_grant_create,
+            runtime_manager::g5_reviews_pending,
             runtime_manager::runtime_local_config,
             runtime_manager::runtime_start,
             runtime_manager::runtime_stop,
@@ -30,6 +32,11 @@ pub fn run() {
         .expect("error while building tauri application");
 
     app.run(|app_handle, event| {
+        if matches!(event, tauri::RunEvent::Ready) {
+            let _ = app_handle
+                .state::<runtime_manager::RuntimeManager>()
+                .start_on_launch();
+        }
         if matches!(event, tauri::RunEvent::Exit) {
             let _ = app_handle
                 .state::<runtime_manager::RuntimeManager>()

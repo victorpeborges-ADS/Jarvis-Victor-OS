@@ -133,6 +133,25 @@ def test_default_database_path_is_outside_repository_and_repo_path_is_rejected(t
         SQLiteMemoryStore(REPOSITORY_ROOT / "should-never-exist.sqlite3")
 
 
+def test_daily_store_is_private_and_unseeded_until_path_override(tmp_path, monkeypatch):
+    monkeypatch.delenv("JARVIS_DATABASE_PATH", raising=False)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    daily = default_database_path()
+    assert daily == (tmp_path / "Library" / "Application Support" / "Jarvis" / "memory.sqlite3").resolve()
+    store = SQLiteMemoryStore()
+    store.initialize()
+    assert store.path == daily
+    assert stat.S_IMODE(store.path.parent.stat().st_mode) == 0o700
+    assert stat.S_IMODE(store.path.stat().st_mode) == 0o600
+    with sqlite3.connect(store.path) as connection:
+        assert connection.execute("SELECT COUNT(*) FROM missions").fetchone()[0] == 0
+        assert connection.execute("SELECT COUNT(*) FROM local_captures").fetchone()[0] == 0
+    override = tmp_path / "smoke" / "synthetic.sqlite3"
+    monkeypatch.setenv("JARVIS_DATABASE_PATH", str(override))
+    assert default_database_path() == override.parent.resolve() / override.name
+    assert default_database_path() != daily
+
+
 def test_database_from_previous_migration_version_upgrades_without_replaying_ddl(tmp_path):
     previous_migrations = tmp_path / "previous_migrations"
     previous_migrations.mkdir()

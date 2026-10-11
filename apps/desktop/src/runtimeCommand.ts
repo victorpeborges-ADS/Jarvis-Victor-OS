@@ -49,6 +49,7 @@ export type LocalRuntimeConfig = {
   ok: true;
   passphrase_configured: boolean;
   database_configured: boolean;
+  database_mode: "stable" | "override";
   api_root_configured: boolean;
   oauth_client_configured: boolean;
 };
@@ -71,6 +72,8 @@ export type G5CommandResult = {
   dataset?: "api_synthetic";
   items?: G5Mission[];
   captures?: LocalCapture[];
+  reviews?: { id: string; revision: number; sha256: string; title: string }[];
+  review_grant?: boolean;
   id?: string;
   created_at?: string;
   cleared?: boolean;
@@ -100,6 +103,10 @@ export function createG5Ipc(invokeG5: G5Invoke) {
       parseG5CommandResult(await invokeG5("g5_capture_clear")),
     connectorStatus: async (): Promise<ConnectorStatus> =>
       parseConnectorStatus(await invokeG5("g5_connectors_status")),
+    createReviewGrant: async (): Promise<G5CommandResult> =>
+      parseG5CommandResult(await invokeG5("g5_review_grant_create")),
+    pendingReviews: async (): Promise<G5CommandResult> =>
+      parseG5CommandResult(await invokeG5("g5_reviews_pending")),
   };
 }
 
@@ -233,6 +240,23 @@ export function parseG5CommandResult(value: string): G5CommandResult {
     if (record.cleared !== true) throw new Error("Limpeza de captura inválida.");
     result.cleared = true;
   }
+  if (record.review_grant !== undefined) {
+    if (record.review_grant !== true) throw new Error("Concessão de revisão inválida.");
+    result.review_grant = true;
+  }
+  if (record.reviews !== undefined) {
+    if (!Array.isArray(record.reviews)) throw new Error("Fila de revisão inválida.");
+    result.reviews = record.reviews.map((item) => {
+      if (typeof item !== "object" || item === null) throw new Error("Revisão inválida.");
+      const review = item as Record<string, unknown>;
+      if (typeof review.id !== "string" || typeof review.title !== "string" ||
+          typeof review.sha256 !== "string" || !/^[0-9a-f]{64}$/.test(review.sha256) ||
+          typeof review.revision !== "number" || !Number.isSafeInteger(review.revision)) {
+        throw new Error("Revisão inválida.");
+      }
+      return { id: review.id, revision: review.revision, sha256: review.sha256, title: review.title };
+    });
+  }
   if (record.captures !== undefined) {
     if (!Array.isArray(record.captures)) throw new Error("Lista de capturas inválida.");
     result.captures = record.captures.map((item): LocalCapture => {
@@ -290,10 +314,14 @@ export function parseLocalRuntimeConfig(value: string): LocalRuntimeConfig {
     return record[key] as boolean;
   };
   if (record.ok !== true) throw new Error("Configuração local inválida.");
+  if (record.database_mode !== "stable" && record.database_mode !== "override") {
+    throw new Error("Configuração local inválida.");
+  }
   return {
     ok: true,
     passphrase_configured: flag("passphrase_configured"),
     database_configured: flag("database_configured"),
+    database_mode: record.database_mode,
     api_root_configured: flag("api_root_configured"),
     oauth_client_configured: flag("oauth_client_configured"),
   };
