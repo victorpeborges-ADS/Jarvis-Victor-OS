@@ -22,6 +22,8 @@ from local_security import (
     _close_session_for,
     mission_read_scope_confirmed,
 )
+from external_connectors import public_status
+from local_captures import clear_captures, create_capture, encode_capture_items, list_captures
 from mission_repository import MissionCorrupt, MissionRepository
 
 router = APIRouter()
@@ -37,6 +39,10 @@ EXPECTED_FIELDS = {
     "/v1/app/grants/mission-read": ("session_token", "csrf_token", "domain_id"),
     "/v1/app/grants/mission-read/revoke": ("session_token", "csrf_token", "grant_id"),
     "/v1/app/missions/list": ("session_token", "domain_id"),
+    "/v1/app/captures/create": ("session_token", "csrf_token", "text"),
+    "/v1/app/captures/list": ("session_token",),
+    "/v1/app/captures/clear": ("session_token", "csrf_token"),
+    "/v1/app/connectors/status": ("session_token",),
 }
 
 
@@ -102,6 +108,7 @@ def _error(code: str) -> PlainTextResponse:
         "grant_conflict",
         "grant_expired",
         "operation_failed",
+        "capture_rejected",
     }
     safe_code = code if code in allowed else "operation_failed"
     return _response((("ok", "false"), ("code", safe_code)))
@@ -179,7 +186,7 @@ async def create_native_mission_read_grant(request: Request) -> PlainTextRespons
             domain_ids=[NATIVE_DOMAIN],
             expires_at=expires_at,
         )
-        grant = _create_grant_for_session(session, body)
+        grant = _create_grant_for_session(session, body, replay_exact=True)
     except (ValueError, UnicodeError, ValidationError):
         return _error("scope_invalid")
     except HTTPException as exc:
@@ -259,3 +266,64 @@ async def list_native_missions(request: Request) -> PlainTextResponse:
         return _error("grant_required")
     except MissionCorrupt:
         return _error("operation_failed")
+
+
+@router.post("/v1/app/captures/create")
+async def create_native_capture(request: Request) -> PlainTextResponse:
+    try:
+        fields = await _read_fields(request, EXPECTED_FIELDS[request.url.path])
+        session = _native_session(fields["session_token"], fields["csrf_token"], mutation=True)
+        saved = create_capture(request.app.state.memory_store, session.principal, fields["text"], _now())
+    except (ValueError, UnicodeError):
+        return _error("capture_rejected")
+    except HTTPException as exc:
+        return _error_for(exc)
+    return _success(id=saved["id"], created_at=saved["created_at"], domain_id=saved["domain_id"])
+
+
+@router.post("/v1/app/captures/list")
+async def list_native_captures(request: Request) -> PlainTextResponse:
+    try:
+        fields = await _read_fields(request, EXPECTED_FIELDS[request.url.path])
+        session = _native_session(fields["session_token"])
+        items = list_captures(request.app.state.memory_store, session.principal)
+        payload = encode_capture_items(items)
+    except (ValueError, UnicodeError):
+        return _error("capture_rejected")
+    except HTTPException as exc:
+        return _error_for(exc)
+    return _success(count=len(items), items=payload)
+
+
+@router.post("/v1/app/captures/clear")
+async def clear_native_captures(request: Request) -> PlainTextResponse:
+    try:
+        fields = await _read_fields(request, EXPECTED_FIELDS[request.url.path])
+        session = _native_session(fields["session_token"], fields["csrf_token"], mutation=True)
+        clear_captures(request.app.state.memory_store, session.principal)
+    except (ValueError, UnicodeError):
+        return _error("capture_rejected")
+    except HTTPException as exc:
+        return _error_for(exc)
+    return _success(cleared="true")
+
+
+@router.post("/v1/app/connectors/status")
+async def native_connector_status(request: Request) -> PlainTextResponse:
+    try:
+        fields = await _read_fields(request, EXPECTED_FIELDS[request.url.path])
+        _native_session(fields["session_token"])
+        status = public_status()
+    except (ValueError, UnicodeError):
+        return _error("session_required")
+    except HTTPException as exc:
+        return _error_for(exc)
+    return _success(
+        gmail=status["gmail"],
+        gmail_block=status["gmail_block"],
+        gmail_scope=status["gmail_scope"],
+        calendar=status["calendar"],
+        calendar_block=status["calendar_block"],
+        calendar_scope=status["calendar_scope"],
+        calendar_sim=status["calendar_sim"],
+    )

@@ -25,9 +25,32 @@ export type G5SessionSnapshot = {
   ok: true;
   session_active: boolean;
   session_expires_at: string | null;
+  session_expires_at_epoch_us: number | null;
   grant_active: boolean;
   grant_domain_id: string | null;
   grant_expires_at: string | null;
+  grant_expires_at_epoch_us: number | null;
+};
+
+export type LocalCapture = { id: string; text: string; created_at: string };
+
+export type ConnectorStatus = {
+  ok: true;
+  gmail: "not_connected";
+  gmail_block: "missing_oauth_client" | "consent_required";
+  gmail_scope: "gmail.readonly";
+  calendar: "not_connected";
+  calendar_block: "missing_oauth_client" | "consent_required";
+  calendar_scope: "calendar.readonly";
+  calendar_sim: "synthetic_local";
+};
+
+export type LocalRuntimeConfig = {
+  ok: true;
+  passphrase_configured: boolean;
+  database_configured: boolean;
+  api_root_configured: boolean;
+  oauth_client_configured: boolean;
 };
 
 export type G5Mission = {
@@ -47,6 +70,10 @@ export type G5CommandResult = {
   domain_id?: string;
   dataset?: "api_synthetic";
   items?: G5Mission[];
+  captures?: LocalCapture[];
+  id?: string;
+  created_at?: string;
+  cleared?: boolean;
 };
 
 type G5Invoke = (command: string, args?: Record<string, unknown>) => Promise<string>;
@@ -65,6 +92,14 @@ export function createG5Ipc(invokeG5: G5Invoke) {
       parseG5CommandResult(await invokeG5("g5_session_close")),
     listMissions: async (): Promise<G5CommandResult> =>
       parseG5CommandResult(await invokeG5("g5_missions_list")),
+    createCapture: async (text: string): Promise<G5CommandResult> =>
+      parseG5CommandResult(await invokeG5("g5_capture_create", { text })),
+    listCaptures: async (): Promise<G5CommandResult> =>
+      parseG5CommandResult(await invokeG5("g5_capture_list")),
+    clearCaptures: async (): Promise<G5CommandResult> =>
+      parseG5CommandResult(await invokeG5("g5_capture_clear")),
+    connectorStatus: async (): Promise<ConnectorStatus> =>
+      parseConnectorStatus(await invokeG5("g5_connectors_status")),
   };
 }
 
@@ -121,14 +156,29 @@ export function parseG5SessionSnapshot(value: string): G5SessionSnapshot {
   if (record.ok !== true || typeof record.session_active !== "boolean" || typeof record.grant_active !== "boolean") {
     throw new Error("Estado G5 inválido.");
   }
+  const optionalEpoch = (key: string): number | null => {
+    const field = record[key];
+    if (field === undefined || field === null) return null;
+    if (typeof field !== "number" || !Number.isSafeInteger(field) || field < 0) {
+      throw new Error(`Campo ${key} inválido.`);
+    }
+    return field;
+  };
   return {
     ok: true,
     session_active: record.session_active,
     session_expires_at: optionalText("session_expires_at"),
+    session_expires_at_epoch_us: optionalEpoch("session_expires_at_epoch_us"),
     grant_active: record.grant_active,
     grant_domain_id: optionalText("grant_domain_id"),
     grant_expires_at: optionalText("grant_expires_at"),
+    grant_expires_at_epoch_us: optionalEpoch("grant_expires_at_epoch_us"),
   };
+}
+
+export function grantIsDisplayedActive(status: G5SessionSnapshot, nowMs: number): boolean {
+  if (!status.grant_active || status.grant_expires_at_epoch_us === null) return false;
+  return status.grant_expires_at_epoch_us > nowMs * 1000;
 }
 
 export function parseG5CommandResult(value: string): G5CommandResult {
@@ -179,10 +229,74 @@ export function parseG5CommandResult(value: string): G5CommandResult {
     });
     result.items = items;
   }
+  if (record.cleared !== undefined) {
+    if (record.cleared !== true) throw new Error("Limpeza de captura inválida.");
+    result.cleared = true;
+  }
+  if (record.captures !== undefined) {
+    if (!Array.isArray(record.captures)) throw new Error("Lista de capturas inválida.");
+    result.captures = record.captures.map((item): LocalCapture => {
+      if (typeof item !== "object" || item === null) throw new Error("Captura inválida.");
+      const capture = item as Record<string, unknown>;
+      if (typeof capture.id !== "string" || !/^[0-9a-f]{32}$/.test(capture.id) ||
+          typeof capture.text !== "string" || capture.text.length === 0 || [...capture.text].length > 80 ||
+          /[\u0000-\u001f\u007f]/.test(capture.text) || typeof capture.created_at !== "string") {
+        throw new Error("Captura inválida.");
+      }
+      return { id: capture.id, text: capture.text, created_at: capture.created_at };
+    });
+  }
+  if (record.id !== undefined || record.created_at !== undefined) {
+    if (typeof record.id !== "string" || typeof record.created_at !== "string") throw new Error("Captura inválida.");
+    result.id = record.id;
+    result.created_at = record.created_at;
+  }
   if ((result.dataset === "api_synthetic") !== (result.items !== undefined)) {
     throw new Error("Resposta de missões inválida.");
   }
   return result;
+}
+
+export function parseConnectorStatus(value: string): ConnectorStatus {
+  const parsed: unknown = JSON.parse(value);
+  if (typeof parsed !== "object" || parsed === null) throw new Error("Conector inválido.");
+  const record = parsed as Record<string, unknown>;
+  const block = record.gmail_block;
+  if (record.ok !== true || record.gmail !== "not_connected" || record.calendar !== "not_connected" ||
+      record.calendar_sim !== "synthetic_local" || record.gmail_scope !== "gmail.readonly" ||
+      record.calendar_scope !== "calendar.readonly" ||
+      (block !== "missing_oauth_client" && block !== "consent_required") ||
+      record.calendar_block !== block) {
+    throw new Error("Conector inválido.");
+  }
+  return {
+    ok: true,
+    gmail: "not_connected",
+    gmail_block: block,
+    gmail_scope: "gmail.readonly",
+    calendar: "not_connected",
+    calendar_block: block,
+    calendar_scope: "calendar.readonly",
+    calendar_sim: "synthetic_local",
+  };
+}
+
+export function parseLocalRuntimeConfig(value: string): LocalRuntimeConfig {
+  const parsed: unknown = JSON.parse(value);
+  if (typeof parsed !== "object" || parsed === null) throw new Error("Configuração local inválida.");
+  const record = parsed as Record<string, unknown>;
+  const flag = (key: string) => {
+    if (typeof record[key] !== "boolean") throw new Error("Configuração local inválida.");
+    return record[key] as boolean;
+  };
+  if (record.ok !== true) throw new Error("Configuração local inválida.");
+  return {
+    ok: true,
+    passphrase_configured: flag("passphrase_configured"),
+    database_configured: flag("database_configured"),
+    api_root_configured: flag("api_root_configured"),
+    oauth_client_configured: flag("oauth_client_configured"),
+  };
 }
 
 export async function executeRuntimeCommand(

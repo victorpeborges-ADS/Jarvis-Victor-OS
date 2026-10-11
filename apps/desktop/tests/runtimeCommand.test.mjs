@@ -1,6 +1,18 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { createG5Ipc, executeRuntimeCommand, parseG5CommandResult, parseG5SessionSnapshot, parseTransportSnapshot } from "../src/runtimeCommand.ts";
+import { createG5Ipc, executeRuntimeCommand, grantIsDisplayedActive, parseG5CommandResult, parseG5SessionSnapshot, parseTransportSnapshot } from "../src/runtimeCommand.ts";
+
+test("concessão exibida segue o instante do servidor, não o rótulo", () => {
+  const future = Date.now() * 1000 + 60_000_000;
+  const active = parseG5SessionSnapshot(JSON.stringify({
+    ok: true, session_active: true, session_expires_at: "2026-10-11T20:00:00+00:00",
+    session_expires_at_epoch_us: future, grant_active: true, grant_domain_id: "dom_synthetic_a",
+    grant_expires_at: "texto que não autoriza", grant_expires_at_epoch_us: future,
+  }));
+  assert.equal(grantIsDisplayedActive(active, Date.now()), true);
+  assert.equal(grantIsDisplayedActive({ ...active, grant_expires_at_epoch_us: Date.now() * 1000 - 1 }, Date.now()), false);
+  assert.equal(grantIsDisplayedActive({ ...active, grant_expires_at_epoch_us: null }, Date.now()), false);
+});
 
 function envelope(state, id) {
   return JSON.stringify({

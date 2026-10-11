@@ -455,12 +455,14 @@ impl RuntimeManager {
             None
         };
         format!(
-            "{{\"ok\":true,\"session_active\":{},\"session_expires_at\":{},\"grant_active\":{},\"grant_domain_id\":{},\"grant_expires_at\":{}}}",
+            "{{\"ok\":true,\"session_active\":{},\"session_expires_at\":{},\"session_expires_at_epoch_us\":{},\"grant_active\":{},\"grant_domain_id\":{},\"grant_expires_at\":{},\"grant_expires_at_epoch_us\":{}}}",
             session.is_some(),
             json_optional_string(session.map(|value| value.expires_at.as_str())),
+            json_optional_number(session.map(|value| value.expires_at_unix_microseconds)),
             grant.is_some(),
             json_optional_string(grant.map(|value| value.domain_id.as_str())),
             json_optional_string(grant.map(|value| value.expires_at.as_str())),
+            json_optional_number(grant.map(|value| value.expires_at_unix_microseconds)),
         )
     }
 
@@ -558,6 +560,9 @@ impl RuntimeManager {
             Some(value) if value > unix_time_microseconds() => value,
             _ => return g5_error_json("protocol_failure"),
         };
+        if !expiry_matches(&expires_at, expires_at_unix_microseconds) {
+            return g5_error_json("protocol_failure");
+        }
         let mut inner = lock_inner(&self.shared);
         if inner.snapshot.runtime_instance_id.as_deref() != Some(instance_id.as_str())
             || inner.snapshot.state != RuntimeState::Ready
@@ -652,6 +657,9 @@ impl RuntimeManager {
             Some(value) if value > unix_time_microseconds() => value,
             _ => return g5_error_json("protocol_failure"),
         };
+        if !expiry_matches(&expires_at, expires_at_unix_microseconds) {
+            return g5_error_json("protocol_failure");
+        }
         let mut inner = lock_inner(&self.shared);
         if !g5_generation_matches(&inner, &instance_id, &transport)
             || inner
@@ -901,6 +909,270 @@ impl RuntimeManager {
                 revision.as_str(),
             )
         };
+        let inner = lock_inner(&self.shared);
+        if !g5_generation_matches(&inner, &instance_id, &transport)
+            || inner
+                .g5_session
+                .as_ref()
+                .is_none_or(|session| session.token.as_str() != token.as_str())
+        {
+            return g5_error_json("stale_generation");
+        }
+        result
+    }
+
+    fn g5_capture_create(&self, text: String) -> String {
+        let _operation = self
+            .g5_operation
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if text.chars().count() == 0
+            || text.chars().count() > 80
+            || text.chars().any(|character| character.is_control())
+        {
+            return g5_error_json("capture_rejected");
+        }
+        let (instance_id, transport, token, csrf_token) = match self.g5_credentials_for_active() {
+            Ok(value) => value,
+            Err(error) => return g5_error_json(error),
+        };
+        let body = SecretBytes::new(encode_application_fields(&[
+            ("session_token", token.as_str()),
+            ("csrf_token", csrf_token.as_str()),
+            ("text", text.as_str()),
+        ]));
+        let response =
+            match transport.call_g5_application("/v1/app/captures/create", body.as_slice()) {
+                Ok(value) => SecretBytes::new(value),
+                Err(_) => return g5_error_json("transport_failure"),
+            };
+        let fields = match parse_application_response(response.as_slice()) {
+            Ok(value) => value,
+            Err(()) => return g5_error_json("protocol_failure"),
+        };
+        if let Some(error) = app_response_error(&fields) {
+            clear_cached_authorization_after_rejection(
+                &self.shared,
+                &instance_id,
+                &transport,
+                token.as_str(),
+                error,
+            );
+            return g5_error_json(error);
+        }
+        if !app_fields_match(&fields, &["ok", "id", "created_at", "domain_id"])
+            || app_field(&fields, "ok") != Some("true")
+            || app_field(&fields, "domain_id") != Some("dom_synthetic_a")
+            || !app_field(&fields, "id").is_some_and(is_hex_identifier)
+            || !app_field(&fields, "created_at")
+                .is_some_and(|value| parse_rfc3339_micros(value).is_some())
+        {
+            return g5_error_json("protocol_failure");
+        }
+        let id = app_field(&fields, "id").unwrap_or_default();
+        let created_at = app_field(&fields, "created_at").unwrap_or_default();
+        let result = format!(
+            "{{\"ok\":true,\"id\":{},\"created_at\":{},\"domain_id\":\"dom_synthetic_a\"}}",
+            json_string(id),
+            json_string(created_at)
+        );
+        let inner = lock_inner(&self.shared);
+        if !g5_generation_matches(&inner, &instance_id, &transport)
+            || inner
+                .g5_session
+                .as_ref()
+                .is_none_or(|session| session.token.as_str() != token.as_str())
+        {
+            return g5_error_json("stale_generation");
+        }
+        result
+    }
+
+    fn g5_capture_list(&self) -> String {
+        let _operation = self
+            .g5_operation
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let (instance_id, transport, token, _csrf_token) = match self.g5_credentials_for_active() {
+            Ok(value) => value,
+            Err(error) => return g5_error_json(error),
+        };
+        let body = SecretBytes::new(encode_application_fields(&[(
+            "session_token",
+            token.as_str(),
+        )]));
+        let response = match transport.call_g5_application("/v1/app/captures/list", body.as_slice())
+        {
+            Ok(value) => SecretBytes::new(value),
+            Err(_) => return g5_error_json("transport_failure"),
+        };
+        let fields = match parse_application_response(response.as_slice()) {
+            Ok(value) => value,
+            Err(()) => return g5_error_json("protocol_failure"),
+        };
+        if let Some(error) = app_response_error(&fields) {
+            clear_cached_authorization_after_rejection(
+                &self.shared,
+                &instance_id,
+                &transport,
+                token.as_str(),
+                error,
+            );
+            return g5_error_json(error);
+        }
+        let count = app_field(&fields, "count").and_then(|value| value.parse::<usize>().ok());
+        let Some(count) = count.filter(|value| *value <= 3) else {
+            return g5_error_json("protocol_failure");
+        };
+        if !app_fields_match(&fields, &["ok", "count", "items"])
+            || app_field(&fields, "ok") != Some("true")
+        {
+            return g5_error_json("protocol_failure");
+        }
+        let items = app_field(&fields, "items").unwrap_or_default();
+        let parsed = parse_capture_items(items, count);
+        let Some(parsed) = parsed else {
+            return g5_error_json("protocol_failure");
+        };
+        let mut rendered = String::from("{\"ok\":true,\"items\":[");
+        for (index, item) in parsed.iter().enumerate() {
+            if index > 0 {
+                rendered.push(',');
+            }
+            rendered.push_str(&format!(
+                "{{\"id\":{},\"text\":{},\"created_at\":{}}}",
+                json_string(&item.0),
+                json_string(&item.2),
+                json_string(&item.1)
+            ));
+        }
+        rendered.push_str("]}");
+        let inner = lock_inner(&self.shared);
+        if !g5_generation_matches(&inner, &instance_id, &transport)
+            || inner
+                .g5_session
+                .as_ref()
+                .is_none_or(|session| session.token.as_str() != token.as_str())
+        {
+            return g5_error_json("stale_generation");
+        }
+        rendered
+    }
+
+    fn g5_capture_clear(&self) -> String {
+        let _operation = self
+            .g5_operation
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let (instance_id, transport, token, csrf_token) = match self.g5_credentials_for_active() {
+            Ok(value) => value,
+            Err(error) => return g5_error_json(error),
+        };
+        let body = SecretBytes::new(encode_application_fields(&[
+            ("session_token", token.as_str()),
+            ("csrf_token", csrf_token.as_str()),
+        ]));
+        let response =
+            match transport.call_g5_application("/v1/app/captures/clear", body.as_slice()) {
+                Ok(value) => SecretBytes::new(value),
+                Err(_) => return g5_error_json("transport_failure"),
+            };
+        let fields = match parse_application_response(response.as_slice()) {
+            Ok(value) => value,
+            Err(()) => return g5_error_json("protocol_failure"),
+        };
+        if let Some(error) = app_response_error(&fields) {
+            clear_cached_authorization_after_rejection(
+                &self.shared,
+                &instance_id,
+                &transport,
+                token.as_str(),
+                error,
+            );
+            return g5_error_json(error);
+        }
+        if !app_fields_match(&fields, &["ok", "cleared"])
+            || app_field(&fields, "ok") != Some("true")
+            || app_field(&fields, "cleared") != Some("true")
+        {
+            return g5_error_json("protocol_failure");
+        }
+        let inner = lock_inner(&self.shared);
+        if !g5_generation_matches(&inner, &instance_id, &transport)
+            || inner
+                .g5_session
+                .as_ref()
+                .is_none_or(|session| session.token.as_str() != token.as_str())
+        {
+            return g5_error_json("stale_generation");
+        }
+        "{\"ok\":true,\"cleared\":true}".to_owned()
+    }
+
+    fn g5_connectors_status(&self) -> String {
+        let _operation = self
+            .g5_operation
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let (instance_id, transport, token, _csrf_token) = match self.g5_credentials_for_active() {
+            Ok(value) => value,
+            Err(error) => return g5_error_json(error),
+        };
+        let body = SecretBytes::new(encode_application_fields(&[(
+            "session_token",
+            token.as_str(),
+        )]));
+        let response =
+            match transport.call_g5_application("/v1/app/connectors/status", body.as_slice()) {
+                Ok(value) => SecretBytes::new(value),
+                Err(_) => return g5_error_json("transport_failure"),
+            };
+        let fields = match parse_application_response(response.as_slice()) {
+            Ok(value) => value,
+            Err(()) => return g5_error_json("protocol_failure"),
+        };
+        if let Some(error) = app_response_error(&fields) {
+            clear_cached_authorization_after_rejection(
+                &self.shared,
+                &instance_id,
+                &transport,
+                token.as_str(),
+                error,
+            );
+            return g5_error_json(error);
+        }
+        if !app_fields_match(
+            &fields,
+            &[
+                "ok",
+                "gmail",
+                "gmail_block",
+                "gmail_scope",
+                "calendar",
+                "calendar_block",
+                "calendar_scope",
+                "calendar_sim",
+            ],
+        ) || app_field(&fields, "ok") != Some("true")
+            || app_field(&fields, "gmail") != Some("not_connected")
+            || app_field(&fields, "calendar") != Some("not_connected")
+            || app_field(&fields, "calendar_sim") != Some("synthetic_local")
+            || app_field(&fields, "gmail_scope") != Some("gmail.readonly")
+            || app_field(&fields, "calendar_scope") != Some("calendar.readonly")
+            || !matches!(
+                app_field(&fields, "gmail_block"),
+                Some("missing_oauth_client" | "consent_required")
+            )
+            || app_field(&fields, "calendar_block") != app_field(&fields, "gmail_block")
+        {
+            return g5_error_json("protocol_failure");
+        }
+        let block = app_field(&fields, "gmail_block").unwrap_or_default();
+        let result = format!(
+            "{{\"ok\":true,\"gmail\":\"not_connected\",\"gmail_block\":{},\"gmail_scope\":\"gmail.readonly\",\"calendar\":\"not_connected\",\"calendar_block\":{},\"calendar_scope\":\"calendar.readonly\",\"calendar_sim\":\"synthetic_local\"}}",
+            json_string(block),
+            json_string(block)
+        );
         let inner = lock_inner(&self.shared);
         if !g5_generation_matches(&inner, &instance_id, &transport)
             || inner
@@ -2558,6 +2830,17 @@ fn helper_arguments(instance_id: &str, mode: HelperMode) -> Vec<String> {
     ]
 }
 
+fn resolve_api_root(candidate: &Path) -> io::Result<PathBuf> {
+    let api_root = candidate.canonicalize()?;
+    if !api_root.join("serve.py").is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "serve.py ausente no diretório da API",
+        ));
+    }
+    Ok(api_root)
+}
+
 fn helper_command(
     instance_id: &str,
     mode: HelperMode,
@@ -2594,9 +2877,10 @@ fn helper_command(
     {
         let _ = mode;
         let _ = stale_instance_id;
-        let api_root = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../api")
-            .canonicalize()?;
+        let candidate = env::var_os("JARVIS_API_ROOT")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| Path::new(env!("CARGO_MANIFEST_DIR")).join("../../api"));
+        let api_root = resolve_api_root(&candidate)?;
         let venv_python = api_root.join(".venv/bin/python");
         let executable = if venv_python.is_file() {
             venv_python
@@ -2645,6 +2929,123 @@ fn unix_time_microseconds() -> u64 {
             .as_micros(),
     )
     .unwrap_or(u64::MAX)
+}
+
+fn expiry_matches(display: &str, epoch_us: u64) -> bool {
+    parse_rfc3339_micros(display) == Some(epoch_us)
+}
+
+fn parse_rfc3339_micros(value: &str) -> Option<u64> {
+    if value.len() > 64 || !value.is_ascii() {
+        return None;
+    }
+    let (local, offset_sign, offset_body) = if let Some(rest) = value.strip_suffix('Z') {
+        (rest, 1_i64, "00:00")
+    } else {
+        let split = value.len().checked_sub(6)?;
+        let (local, zone) = value.split_at(split);
+        let sign = zone.chars().next()?;
+        if sign != '+' && sign != '-' {
+            return None;
+        }
+        (local, if sign == '+' { 1 } else { -1 }, &zone[1..])
+    };
+    let (date, time) = local.split_once('T')?;
+    let mut date_parts = date.split('-');
+    let year: i32 = date_parts.next()?.parse().ok()?;
+    let month: u32 = date_parts.next()?.parse().ok()?;
+    let day: u32 = date_parts.next()?.parse().ok()?;
+    if date_parts.next().is_some() || !(1970..=9999).contains(&year) {
+        return None;
+    }
+    let (clock, fraction) = time
+        .split_once('.')
+        .map_or((time, None), |(clock, fraction)| (clock, Some(fraction)));
+    let mut clock_parts = clock.split(':');
+    let hour: u32 = clock_parts.next()?.parse().ok()?;
+    let minute: u32 = clock_parts.next()?.parse().ok()?;
+    let second: u32 = clock_parts.next()?.parse().ok()?;
+    if clock_parts.next().is_some() || hour > 23 || minute > 59 || second > 59 {
+        return None;
+    }
+    let micros = match fraction {
+        None => 0_u32,
+        Some(digits)
+            if !digits.is_empty()
+                && digits.len() <= 6
+                && digits.bytes().all(|byte| byte.is_ascii_digit()) =>
+        {
+            digits.parse::<u32>().ok()? * 10_u32.pow(6 - digits.len() as u32)
+        }
+        _ => return None,
+    };
+    let mut zone_parts = offset_body.split(':');
+    let offset_hour: u32 = zone_parts.next()?.parse().ok()?;
+    let offset_minute: u32 = zone_parts.next()?.parse().ok()?;
+    if zone_parts.next().is_some() || offset_hour > 23 || offset_minute > 59 {
+        return None;
+    }
+    let days = days_from_civil(year, month, day)?;
+    let local_seconds = days
+        .checked_mul(86_400)?
+        .checked_add(i64::from(hour) * 3_600)?
+        .checked_add(i64::from(minute) * 60)?
+        .checked_add(i64::from(second))?;
+    let offset_seconds =
+        offset_sign * (i64::from(offset_hour) * 3_600 + i64::from(offset_minute) * 60);
+    let utc_seconds = local_seconds.checked_sub(offset_seconds)?;
+    if utc_seconds < 0 {
+        return None;
+    }
+    u64::try_from(utc_seconds)
+        .ok()?
+        .checked_mul(1_000_000)?
+        .checked_add(u64::from(micros))
+}
+
+fn parse_capture_items(raw: &str, count: usize) -> Option<Vec<(String, String, String)>> {
+    if count == 0 {
+        return if raw.is_empty() {
+            Some(Vec::new())
+        } else {
+            None
+        };
+    }
+    let lines: Vec<&str> = raw.split('\n').collect();
+    if lines.len() != count {
+        return None;
+    }
+    let mut items = Vec::with_capacity(count);
+    for line in lines {
+        let mut parts = line.split('\t');
+        let id = parts.next()?;
+        let created_at = parts.next()?;
+        let text = parts.next()?;
+        if parts.next().is_some()
+            || !is_hex_identifier(id)
+            || parse_rfc3339_micros(created_at).is_none()
+            || text.is_empty()
+            || text.chars().count() > 80
+            || text.chars().any(char::is_control)
+        {
+            return None;
+        }
+        items.push((id.to_owned(), created_at.to_owned(), text.to_owned()));
+    }
+    Some(items)
+}
+
+fn days_from_civil(year: i32, month: u32, day: u32) -> Option<i64> {
+    if !(1..=12).contains(&month) || day == 0 || day > 31 {
+        return None;
+    }
+    let y = if month <= 2 { year - 1 } else { year } as i64;
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = u64::try_from(y - era * 400).ok()?;
+    let month_index = if month > 2 { month - 3 } else { month + 9 };
+    let day_of_year = (153 * u64::from(month_index) + 2) / 5 + u64::from(day) - 1;
+    let day_of_era = yoe * 365 + yoe / 4 - yoe / 100 + day_of_year;
+    Some(era * 146_097 + i64::try_from(day_of_era).ok()? - 719_468)
 }
 
 fn expire_cached_authorization(inner: &mut Inner) {
@@ -2711,6 +3112,9 @@ fn g5_error_json(code: &str) -> String {
         "grant_expired" => "A concessão de leitura expirou.",
         "stale_generation" => "A resposta pertence a um runtime encerrado.",
         "protocol_failure" => "O backend retornou uma resposta inválida.",
+        "capture_rejected" => {
+            "A captura local foi recusada. Use até 80 caracteres, sem quebra de linha."
+        }
         _ => "Não foi possível concluir a operação G5 local.",
     };
     format!("{{\"ok\":false,\"error\":{}}}", json_string(message))
@@ -2839,6 +3243,7 @@ fn app_response_error(fields: &[(String, SecretText)]) -> Option<&'static str> {
         "grant_conflict" => "grant_conflict",
         "grant_expired" => "grant_expired",
         "operation_failed" => "operation_failed",
+        "capture_rejected" => "capture_rejected",
         _ => "protocol_failure",
     })
 }
@@ -3298,6 +3703,39 @@ pub fn g5_session_close(manager: tauri::State<'_, RuntimeManager>) -> String {
 #[tauri::command]
 pub fn g5_missions_list(manager: tauri::State<'_, RuntimeManager>) -> String {
     manager.g5_missions_list()
+}
+
+#[tauri::command]
+pub fn g5_capture_create(manager: tauri::State<'_, RuntimeManager>, text: String) -> String {
+    manager.g5_capture_create(text)
+}
+
+#[tauri::command]
+pub fn g5_capture_list(manager: tauri::State<'_, RuntimeManager>) -> String {
+    manager.g5_capture_list()
+}
+
+#[tauri::command]
+pub fn g5_capture_clear(manager: tauri::State<'_, RuntimeManager>) -> String {
+    manager.g5_capture_clear()
+}
+
+#[tauri::command]
+pub fn g5_connectors_status(manager: tauri::State<'_, RuntimeManager>) -> String {
+    manager.g5_connectors_status()
+}
+
+#[tauri::command]
+pub fn runtime_local_config() -> String {
+    let passphrase_configured = env::var_os("JARVIS_LOCAL_PASSPHRASE")
+        .is_some_and(|value| (12..=128).contains(&value.len()));
+    let database_configured = env::var_os("JARVIS_DATABASE_PATH").is_some();
+    let api_root_configured = env::var_os("JARVIS_API_ROOT").is_some();
+    let oauth_client_configured =
+        env::var_os("JARVIS_GOOGLE_OAUTH_CLIENT_ID").is_some_and(|value| !value.is_empty());
+    format!(
+        "{{\"ok\":true,\"passphrase_configured\":{passphrase_configured},\"database_configured\":{database_configured},\"api_root_configured\":{api_root_configured},\"oauth_client_configured\":{oauth_client_configured}}}"
+    )
 }
 
 #[tauri::command]
@@ -4572,5 +5010,36 @@ mod tests {
             assert!(session.is_clean_for_test(), "round {round}: UDS remained");
             assert_clean(&manager);
         }
+    }
+}
+
+#[cfg(test)]
+mod local_use_tests {
+    use super::{expiry_matches, parse_capture_items, parse_rfc3339_micros, resolve_api_root};
+    use std::fs;
+
+    #[test]
+    fn rfc3339_display_must_match_epoch_and_carry_a_timezone() {
+        let utc = parse_rfc3339_micros("2026-10-07T12:00:00.750000+00:00").unwrap();
+        assert!(expiry_matches("2026-10-07T12:00:00.750000+00:00", utc));
+        assert!(!expiry_matches("2026-10-07T12:00:00.750000", utc));
+        assert!(!expiry_matches("2026-10-07T12:00:00.750001+00:00", utc));
+        assert_eq!(
+            parse_rfc3339_micros("2026-10-07T09:00:00.750000-03:00"),
+            Some(utc)
+        );
+        assert_eq!(parse_capture_items("", 0).unwrap().len(), 0);
+        assert!(parse_capture_items("not-a-capture", 1).is_none());
+    }
+
+    #[test]
+    fn api_root_requires_serve_py() {
+        let root = std::env::temp_dir().join(format!("jarvis-api-root-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir(&root).unwrap();
+        assert!(resolve_api_root(&root).is_err());
+        fs::write(root.join("serve.py"), b"# synthetic\n").unwrap();
+        assert!(resolve_api_root(&root).unwrap().join("serve.py").is_file());
+        let _ = fs::remove_dir_all(&root);
     }
 }

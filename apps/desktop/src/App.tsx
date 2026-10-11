@@ -1,14 +1,17 @@
 import { useEffect, useState } from "react";
 import { invoke, isTauri } from "@tauri-apps/api/core";
 import "./App.css";
-import { createG5Ipc, executeRuntimeCommand, parseRuntimeEnvelope, parseTransportSnapshot } from "./runtimeCommand";
-import type { G5CommandResult, G5Mission, G5SessionSnapshot, RuntimeEnvelope, RuntimeState, RuntimeCommand, TransportSnapshot, TransportState } from "./runtimeCommand";
+import { createG5Ipc, executeRuntimeCommand, grantIsDisplayedActive, parseLocalRuntimeConfig, parseRuntimeEnvelope, parseTransportSnapshot } from "./runtimeCommand";
+import type { ConnectorStatus, G5CommandResult, G5Mission, G5SessionSnapshot, LocalCapture, LocalRuntimeConfig, RuntimeEnvelope, RuntimeState, RuntimeCommand, TransportSnapshot, TransportState } from "./runtimeCommand";
 
-const STORAGE_KEY = "jarvis-desktop-demo-captures-v1";
 const g5Ipc = createG5Ipc((command, args) => invoke<string>(command, args));
 const sections = ["Agora", "Inbox", "Missões", "Aprovações", "Runtime local", "Configurações"] as const;
 type Section = (typeof sections)[number];
-type Capture = { id: string; text: string; created_at: string };
+
+const connectorBlockLabels = {
+  missing_oauth_client: "não conectada: falta o client ID OAuth",
+  consent_required: "não conectada: o client ID está presente e o consentimento da conta ainda não foi dado",
+} as const;
 
 const runtimeStateLabels: Record<RuntimeState, string> = {
   STOPPED: "Parado",
@@ -34,22 +37,10 @@ const missionStatusLabels: Record<G5Mission["status"], string> = {
   failed: "Falhou", interrupted: "Interrompida",
 };
 
-function readCaptures(): Capture[] {
-  try {
-    const value: unknown = JSON.parse(localStorage.getItem(STORAGE_KEY) ?? "[]");
-    if (!Array.isArray(value)) return [];
-    return value.filter((item): item is Capture =>
-      typeof item?.id === "string" && typeof item?.text === "string" &&
-      item.text.length <= 500 && typeof item?.created_at === "string"
-    ).slice(0, 20);
-  } catch { return []; }
-}
-
 function App() {
   const [section, setSection] = useState<Section>("Agora");
-  const [captures, setCaptures] = useState<Capture[]>(readCaptures);
+  const [captures, setCaptures] = useState<LocalCapture[]>([]);
   const [text, setText] = useState("");
-  const [syntheticConfirmed, setSyntheticConfirmed] = useState(false);
   const [notice, setNotice] = useState("");
   const [runtime, setRuntime] = useState<RuntimeEnvelope | null>(null);
   const [transport, setTransport] = useState<TransportSnapshot | null>(null);
@@ -61,31 +52,40 @@ function App() {
   const [passphrase, setPassphrase] = useState("");
   const [grantConfirmed, setGrantConfirmed] = useState(false);
   const [missions, setMissions] = useState<G5Mission[]>([]);
+  const [connectors, setConnectors] = useState<ConnectorStatus | null>(null);
+  const [localConfig, setLocalConfig] = useState<LocalRuntimeConfig | null>(null);
+  const [nowMs, setNowMs] = useState(() => Date.now());
   const runtimeAvailable = isTauri();
+  const grantActive = g5Status ? grantIsDisplayedActive(g5Status, nowMs) : false;
 
   useEffect(() => {
-    if (!(section === "Runtime local" || section === "Missões") || !runtimeAvailable) return;
+    if (!runtimeAvailable) return;
     let cancelled = false;
     const refresh = async () => {
       try {
-        const [response, transportResponse, g5Response] = await Promise.all([
+        const [response, transportResponse, g5Response, configResponse] = await Promise.all([
           invoke<string>("runtime_status"),
           invoke<string>("runtime_transport_status"),
           g5Ipc.sessionStatus(),
+          invoke<string>("runtime_local_config"),
         ]);
         const next = parseRuntimeEnvelope(response);
         const nextTransport = parseTransportSnapshot(transportResponse);
-          if (!cancelled) {
-            setRuntime(next);
-            setTransport(nextTransport);
-            setG5Status(g5Response);
-            if (next.snapshot.state !== "READY" || nextTransport.state !== "READY" || !g5Response.session_active) {
-              setGrantConfirmed(false);
-              setMissions([]);
-            } else if (!g5Response.grant_active) {
-              setMissions([]);
-            }
-            setRuntimeError("");
+        if (!cancelled) {
+          setRuntime(next);
+          setTransport(nextTransport);
+          setG5Status(g5Response);
+          setLocalConfig(parseLocalRuntimeConfig(configResponse));
+          setNowMs(Date.now());
+          if (next.snapshot.state !== "READY" || nextTransport.state !== "READY" || !g5Response.session_active) {
+            setGrantConfirmed(false);
+            setMissions([]);
+            setCaptures([]);
+            setConnectors(null);
+          } else if (!grantIsDisplayedActive(g5Response, Date.now())) {
+            setMissions([]);
+          }
+          setRuntimeError("");
         }
       } catch {
         if (!cancelled) setRuntimeError("Não foi possível consultar o supervisor local.");
@@ -97,7 +97,23 @@ function App() {
       cancelled = true;
       window.clearInterval(timer);
     };
-  }, [section, runtimeAvailable]);
+  }, [runtimeAvailable]);
+
+  useEffect(() => {
+    if (!runtimeAvailable || !g5Status?.session_active) return;
+    let cancelled = false;
+    void (async () => {
+      try {
+        const [listed, status] = await Promise.all([g5Ipc.listCaptures(), g5Ipc.connectorStatus()]);
+        if (cancelled) return;
+        if (listed.ok) setCaptures(listed.captures ?? []);
+        setConnectors(status);
+      } catch {
+        if (!cancelled) setConnectors(null);
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [runtimeAvailable, g5Status?.session_active, section]);
 
   async function runRuntimeCommand(command: RuntimeCommand) {
     setRuntimeBusy(true);
@@ -162,9 +178,18 @@ function App() {
       }
       const status = await g5Ipc.sessionStatus();
       setG5Status(status);
-      if (!status.session_active || !status.grant_active) {
+      setNowMs(Date.now());
+      if (!status.session_active || !grantIsDisplayedActive(status, Date.now())) {
         setMissions([]);
         setGrantConfirmed(false);
+      }
+      if (status.session_active) {
+        const listed = await g5Ipc.listCaptures();
+        if (listed.ok) setCaptures(listed.captures ?? []);
+        setConnectors(await g5Ipc.connectorStatus());
+      } else {
+        setCaptures([]);
+        setConnectors(null);
       }
     } catch {
       setG5Error("Não foi possível falar com o backend local autenticado.");
@@ -180,21 +205,49 @@ function App() {
     await runG5Command("open-session", value);
   }
 
-  function saveCapture(event: React.FormEvent<HTMLFormElement>) {
+  async function saveCapture(event: React.FormEvent<HTMLFormElement>) {
     event.preventDefault();
     const content = text.trim();
-    if (!syntheticConfirmed || !content || content.length > 500) return;
-    const next = [{ id: crypto.randomUUID(), text: content, created_at: new Date().toISOString() }, ...captures].slice(0, 20);
+    if (!content || [...content].length > 80) return;
+    setG5Busy(true);
+    setG5Error("");
     try {
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(next));
-      setCaptures(next); setText(""); setSyntheticConfirmed(false);
-      setNotice("Captura fictícia salva somente neste aplicativo. Nenhuma Missão foi criada na API.");
-    } catch { setNotice("Não foi possível salvar localmente. O texto continua no campo para recuperação."); }
+      const saved = await g5Ipc.createCapture(content);
+      if (!saved.ok) {
+        setG5Error(saved.error ?? "A captura não foi gravada.");
+        return;
+      }
+      const listed = await g5Ipc.listCaptures();
+      if (!listed.ok) {
+        setG5Error(listed.error ?? "A captura foi enviada, mas a lista não voltou.");
+        return;
+      }
+      setCaptures(listed.captures ?? []);
+      setText("");
+      setNotice("Ideia gravada no banco local sintético. Nenhuma missão, e-mail ou evento foi criado.");
+    } catch {
+      setG5Error("Não foi possível gravar a ideia no banco local.");
+    } finally {
+      setG5Busy(false);
+    }
   }
 
-  function clearCaptures() {
-    try { localStorage.removeItem(STORAGE_KEY); setCaptures([]); setNotice("Capturas fictícias deste aplicativo removidas."); }
-    catch { setNotice("Não foi possível remover as capturas locais."); }
+  async function clearCaptures() {
+    setG5Busy(true);
+    setG5Error("");
+    try {
+      const cleared = await g5Ipc.clearCaptures();
+      if (!cleared.ok) {
+        setG5Error(cleared.error ?? "Não foi possível apagar as capturas.");
+        return;
+      }
+      setCaptures([]);
+      setNotice("Capturas locais apagadas do banco sintético.");
+    } catch {
+      setG5Error("Não foi possível apagar as capturas locais.");
+    } finally {
+      setG5Busy(false);
+    }
   }
 
   return <div className="shell">
@@ -203,27 +256,34 @@ function App() {
       <nav aria-label="Seções do JARVIS">{sections.map((item) => <button
         aria-current={section === item ? "page" : undefined} className={section === item ? "nav-item active" : "nav-item"}
         key={item} onClick={() => { setSection(item); setNotice(""); if (item !== "Missões") { setPassphrase(""); setGrantConfirmed(false); } }} type="button">{item}</button>)}</nav>
-      <p className="rail-note">macOS local · dados fictícios · sem conexão externa</p>
+      <p className="rail-note">macOS local · banco sintético · sem conta externa</p>
     </aside>
     <main className="content" id="conteudo">
-      <p className="eyebrow">VICTOR OS · CLIENTE MACOS · {section === "Runtime local" ? "VALIDAÇÃO LOCAL" : "DEMO OFFLINE"}</p>
+      <p className="eyebrow">VICTOR OS · CLIENTE MACOS · {runtime?.snapshot.state === "READY" && transport?.state === "READY" ? "RUNTIME LOCAL" : "RUNTIME PARADO"}</p>
       <h1>{section}</h1>
       {notice && <p className="notice" role="status">{notice}</p>}
-      {section === "Agora" && <article className="card"><p className="badge">DEMO LOCAL</p>
-        <h2>Clareza antes de automação.</h2>
-        <p>Este aplicativo abre sem conta ou servidor. Há {captures.length} captura(s) fictícia(s) neste Mac. Nenhuma fonte pessoal foi lida.</p>
-        <button className="action" type="button" onClick={() => setSection("Inbox")}>Capturar uma ideia de teste</button>
+      {section === "Agora" && <article className="card"><p className="badge">BANCO LOCAL SINTÉTICO</p>
+        <h2>Uma ideia, gravada aqui.</h2>
+        <p>O runtime está {runtime ? runtimeStateLabels[runtime.snapshot.state] : "indisponível neste preview"}. Há {captures.length} ideia(s) no banco local. Gmail e Google Calendar permanecem não conectados.</p>
+        {g5Status?.session_active ? <form onSubmit={(event) => void saveCapture(event)}>
+          <label htmlFor="agora-capture">Ideia sintética</label>
+          <textarea id="agora-capture" maxLength={80} value={text} onChange={(event) => setText(event.currentTarget.value)} placeholder="Ex.: revisar a missão sintética amanhã" />
+          <button className="action" type="submit" disabled={g5Busy || !text.trim() || [...text.trim()].length > 80}>Gravar no banco local</button>
+        </form> : <p>Abra a sessão em Missões para gravar a ideia no SQLite. O texto abaixo permanece só neste formulário até lá.</p>}
+        {captures.length > 0 && <ul className="capture-list">{captures.map((item) => <li key={item.id}><span>{item.text}</span><small>{item.created_at}</small></li>)}</ul>}
       </article>}
-      {section === "Inbox" && <article className="card"><p className="badge">SOMENTE TEXTO FICTÍCIO</p>
-        <h2>Captura local com confirmação</h2>
-        <p>Escreva apenas conteúdo de teste. Ele ficará neste aplicativo e não será enviado à API.</p>
-        <form onSubmit={saveCapture}><label htmlFor="desktop-capture">Ideia de teste</label>
-          <textarea id="desktop-capture" maxLength={500} value={text} onChange={(event) => setText(event.currentTarget.value)} placeholder="Ex.: preparar um resumo sintético" />
-          <label className="confirm"><input type="checkbox" checked={syntheticConfirmed} onChange={(event) => setSyntheticConfirmed(event.currentTarget.checked)} /> Confirmo que o texto é fictício e pode ser salvo neste Mac.</label>
-          <button className="action" type="submit" disabled={!text.trim() || !syntheticConfirmed}>Salvar captura fictícia</button>
-        </form>
-        <h3>Capturas neste aplicativo ({captures.length})</h3>
-        {captures.length === 0 ? <p>Nenhuma captura local.</p> : <ul className="capture-list">{captures.map((item) => <li key={item.id}><span>{item.text}</span><small>{new Date(item.created_at).toLocaleString("pt-BR")}</small></li>)}</ul>}
+      {section === "Inbox" && <article className="card"><p className="badge">FONTES REAIS DESTE CLIENTE</p>
+        <h2>O que está ligado</h2>
+        <ul>
+          <li><span>Runtime local</span><span>{runtime ? runtimeStateLabels[runtime.snapshot.state] : "indisponível"}</span></li>
+          <li><span>Canal UDS</span><span>{transport ? transportStateLabels[transport.state] : "indisponível"}{transport?.error_category ? ` · ${transport.error_category}` : ""}</span></li>
+          <li><span>Gmail somente leitura</span><span>{connectors ? connectorBlockLabels[connectors.gmail_block] : "não conectada"}</span></li>
+          <li><span>Google Calendar somente leitura</span><span>{connectors ? connectorBlockLabels[connectors.calendar_block] : "não conectada"}</span></li>
+          <li><span>Calendar simulado</span><span>sintético na API; não é a conta Google</span></li>
+        </ul>
+        {runtimeError && <p className="notice" role="alert">{runtimeError}</p>}
+        <h3>Ideias gravadas ({captures.length})</h3>
+        {captures.length === 0 ? <p>Nenhuma ideia no banco local. A sessão precisa estar aberta para gravar.</p> : <ul className="capture-list">{captures.map((item) => <li key={item.id}><span>{item.text}</span><small>{item.created_at}</small></li>)}</ul>}
       </article>}
       {section === "Missões" && <article className="card g5-card">
         <p className="badge">{runtime?.snapshot.state === "READY" && transport?.state === "READY" ? "FASTAPI AUTENTICADA · DADOS SINTÉTICOS" : "BACKEND LOCAL NÃO PRONTO"}</p>
@@ -239,13 +299,14 @@ function App() {
         </form>}
         {runtimeAvailable && g5Status?.session_active && <section className="g5-state" aria-live="polite">
           <p><strong>Sessão aberta.</strong> Válida até {g5Status.session_expires_at ? new Date(g5Status.session_expires_at).toLocaleString("pt-BR") : "expirar no servidor"}.</p>
-          {g5Status.grant_active ? <>
-            <p><strong>Concessão ativa:</strong> leitura de Missões em <code>dom_synthetic_a</code> até {g5Status.grant_expires_at ? new Date(g5Status.grant_expires_at).toLocaleString("pt-BR") : "expirar no servidor"}.</p>
+          {g5Status.grant_active && grantActive ? <>
+            <p><strong>Concessão ativa:</strong> leitura de Missões em <code>dom_synthetic_a</code> até {g5Status.grant_expires_at ?? "o instante informado pelo servidor"}. O relógio da tela usa o instante numérico do servidor.</p>
             <div className="g5-actions">
               <button className="action" type="button" disabled={g5Busy} onClick={() => void runG5Command("list-missions")}>Ler uma missão sintética</button>
               <button className="action secondary" type="button" disabled={g5Busy} onClick={() => void runG5Command("revoke-grant")}>Revogar concessão</button>
             </div>
           </> : <>
+            {g5Status.grant_active && !grantActive && <p role="status">A concessão expirou neste relógio. O servidor é quem autoriza a próxima leitura.</p>}
             <label className="confirm"><input type="checkbox" checked={grantConfirmed} onChange={(event) => setGrantConfirmed(event.currentTarget.checked)} /> Confirmo leitura somente de Missões sintéticas em <code>dom_synthetic_a</code> por até 60 minutos.</label>
             <div className="g5-actions">
               <button className="action" type="button" disabled={g5Busy || !grantConfirmed} onClick={() => void runG5Command("create-grant")}>Conceder leitura</button>
@@ -260,10 +321,12 @@ function App() {
             <h4>{mission.title}</h4><p>{missionStatusLabels[mission.status]} · revisão {mission.revision} · {mission.domain_id}</p>
           </article>)}
         </section>}
-        {runtimeAvailable && g5Status?.grant_active && missions.length === 0 && <p className="field-hint">Nenhuma missão autorizada apareceu nesta leitura. O banco de teste permanece separado e não recebe fixtures automaticamente.</p>}
+        {runtimeAvailable && grantActive && missions.length === 0 && <p className="field-hint">Nenhuma missão autorizada apareceu nesta leitura. O banco de teste permanece separado e não recebe fixtures automaticamente.</p>}
       </article>}
-      {section === "Aprovações" && <article className="card"><p className="badge">SEM CONCESSÃO ATIVA</p>
-        <h2>Nenhuma decisão neste cliente</h2><p>A fila persistente depende de sessão, concessão e API local. Este aplicativo não simula decisões nem aprova conteúdo automaticamente.</p>
+      {section === "Aprovações" && <article className="card"><p className="badge">SEM EFEITO EXTERNO</p>
+        <h2>Confirmação humana, sem envio</h2>
+        <p>Este cliente não envia e-mail, não cria evento e não executa ação fora da máquina. A fila de revisão do servidor exige a concessão <code>mission:review</code>, que esta janela não solicita.</p>
+        {missions.some((mission) => mission.status === "awaiting_approval") ? <ul>{missions.filter((mission) => mission.status === "awaiting_approval").map((mission) => <li key={mission.id}><span>{mission.title}</span><span>aguardando aprovação · revisão {mission.revision}</span></li>)}</ul> : <p>Nenhuma missão lida está aguardando aprovação. Ler a lista exige a concessão <code>mission:read</code>.</p>}
       </article>}
       {section === "Runtime local" && <article className="card runtime-card">
         <p className="badge">RUNTIME FASTAPI / G5</p>
@@ -288,9 +351,18 @@ function App() {
         {!runtimeAvailable && <p className="runtime-hint">Os comandos de processo ficam disponíveis somente no aplicativo macOS. Este preview web não inicia processos.</p>}
         {runtimeError && <p className="notice" role="alert">{runtimeError}</p>}
       </article>}
-      {section === "Configurações" && <article className="card"><p className="badge">PRIVACIDADE LOCAL</p>
-        <h2>Estado deste aplicativo</h2><p>Modo DEMO offline. Sem OAuth, sincronização, serviço em segundo plano ou conexão com dados pessoais. As capturas fictícias ficam no armazenamento local da WebView.</p>
-        <button className="action secondary" type="button" disabled={captures.length === 0} onClick={clearCaptures}>Apagar capturas fictícias</button>
+      {section === "Configurações" && <article className="card"><p className="badge">O QUE ESTE APP SUPORTA</p>
+        <h2>Estado local</h2>
+        <ul>
+          <li><span>Passphrase no ambiente</span><span>{localConfig?.passphrase_configured ? "presente" : "ausente"}</span></li>
+          <li><span>Banco indicado</span><span>{localConfig?.database_configured ? "caminho definido" : "ausente"}</span></li>
+          <li><span>JARVIS_API_ROOT</span><span>{localConfig?.api_root_configured ? "definido" : "usa o checkout de desenvolvimento"}</span></li>
+          <li><span>Client ID OAuth</span><span>{localConfig?.oauth_client_configured ? "presente, sem consentimento" : "ausente"}</span></li>
+          <li><span>Gmail</span><span>{connectors ? connectorBlockLabels[connectors.gmail_block] : "não conectada"}</span></li>
+          <li><span>Google Calendar</span><span>{connectors ? connectorBlockLabels[connectors.calendar_block] : "não conectada"}</span></li>
+        </ul>
+        <p>A passphrase não é gravada nem exibida. O launcher só a repassa se ela já estiver no ambiente. Não há Keychain, instalador nem runner embutido.</p>
+        <button className="action secondary" type="button" disabled={!g5Status?.session_active || g5Busy || captures.length === 0} onClick={() => void clearCaptures()}>Apagar ideias do banco local</button>
       </article>}
     </main>
   </div>;

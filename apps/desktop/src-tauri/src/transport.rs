@@ -34,12 +34,20 @@ const APP_SESSION_CLOSE_ROUTE: &str = "/v1/app/session/close";
 const APP_GRANT_CREATE_ROUTE: &str = "/v1/app/grants/mission-read";
 const APP_GRANT_REVOKE_ROUTE: &str = "/v1/app/grants/mission-read/revoke";
 const APP_MISSIONS_LIST_ROUTE: &str = "/v1/app/missions/list";
-const APP_ROUTES: [&str; 5] = [
+const APP_CAPTURE_CREATE_ROUTE: &str = "/v1/app/captures/create";
+const APP_CAPTURE_LIST_ROUTE: &str = "/v1/app/captures/list";
+const APP_CAPTURE_CLEAR_ROUTE: &str = "/v1/app/captures/clear";
+const APP_CONNECTORS_STATUS_ROUTE: &str = "/v1/app/connectors/status";
+const APP_ROUTES: [&str; 9] = [
     APP_SESSION_OPEN_ROUTE,
     APP_SESSION_CLOSE_ROUTE,
     APP_GRANT_CREATE_ROUTE,
     APP_GRANT_REVOKE_ROUTE,
     APP_MISSIONS_LIST_ROUTE,
+    APP_CAPTURE_CREATE_ROUTE,
+    APP_CAPTURE_LIST_ROUTE,
+    APP_CAPTURE_CLEAR_ROUTE,
+    APP_CONNECTORS_STATUS_ROUTE,
 ];
 const CONNECT_TIMEOUT: Duration = Duration::from_millis(350);
 const REQUEST_TIMEOUT: Duration = Duration::from_millis(900);

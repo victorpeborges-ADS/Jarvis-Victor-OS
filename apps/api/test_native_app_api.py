@@ -331,7 +331,10 @@ def test_grants_are_session_bound_and_invalidated_atomically(native_client, monk
     assert call("grants/mission-read/revoke", session_token=s2, csrf_token=csrf2, grant_id=g1["grant_id"]) == {"ok": "false", "code": "grant_required"}
     g2 = call("grants/mission-read", session_token=s2, csrf_token=csrf2, domain_id="dom_synthetic_a")
     assert g2["ok"] == "true"
-    assert call("grants/mission-read", session_token=s2, csrf_token=csrf2, domain_id="dom_synthetic_a")["code"] == "grant_conflict"
+    replayed = call("grants/mission-read", session_token=s2, csrf_token=csrf2, domain_id="dom_synthetic_a")
+    assert replayed["ok"] == "true" and replayed["grant_id"] == g2["grant_id"]
+    assert replayed["expires_at"] == g2["expires_at"]
+    assert replayed["expires_at_epoch_us"] == g2["expires_at_epoch_us"]
     for _ in range(2):
         assert call("grants/mission-read/revoke", session_token=s2, csrf_token=csrf2, grant_id=g2["grant_id"]) == {"ok": "true", "revoked": "true"}
     assert call("missions/list", session_token=s2, domain_id="dom_synthetic_a")["code"] == "grant_required"
@@ -448,14 +451,90 @@ def test_fractional_grant_expiry_and_reconsent_match_authoritative_deadline(nati
     if offset_us < 0:
         assert not cache_expired
         assert read["ok"] == "true" and read["title"] == "Missão temporal sintética"
-        # This is a valid conflict, while UI/cache still retain the live grant.
-        assert renewed == {"ok": "false", "code": "grant_conflict"}
+        assert renewed["ok"] == "true"
+        assert renewed["grant_id"] == first["grant_id"]
+        assert renewed["expires_at_epoch_us"] == first["expires_at_epoch_us"]
     else:
         assert cache_expired
         assert read == {"ok": "false", "code": "grant_required"}
         assert renewed["ok"] == "true"
         assert renewed["grant_id"] != first["grant_id"]
         assert call("missions/list", session_token=token, domain_id="dom_synthetic_a")["ok"] == "true"
+
+
+def test_lost_grant_response_replays_exact_scope_without_extending_it(native_client):
+    from datetime import timedelta
+    import local_security as security
+
+    token, csrf = login(native_client)
+    created = fields(native_client.post("/v1/app/grants/mission-read", content=body(
+        session_token=token, csrf_token=csrf, domain_id="dom_synthetic_a"), headers=HEADERS))
+    retried = fields(native_client.post("/v1/app/grants/mission-read", content=body(
+        session_token=token, csrf_token=csrf, domain_id="dom_synthetic_a"), headers=HEADERS))
+    assert retried["grant_id"] == created["grant_id"]
+    assert retried["expires_at_epoch_us"] == created["expires_at_epoch_us"]
+    active = [grant for grant in security._grants.values() if not grant.revoked]
+    assert len(active) == 1
+
+    security._grants[created["grant_id"]].revoked = True
+    wider = security.GrantIn(
+        connector="mission_sim",
+        permission="read",
+        resource_ids=["mission:read"],
+        domain_ids=["dom_synthetic_a", "dom_synthetic_b"],
+        expires_at=security._now() + timedelta(minutes=10),
+    )
+    security._create_grant_for_session(security._native_session(token, csrf, mutation=True), wider)
+    overlap = fields(native_client.post("/v1/app/grants/mission-read", content=body(
+        session_token=token, csrf_token=csrf, domain_id="dom_synthetic_a"), headers=HEADERS))
+    assert overlap == {"ok": "false", "code": "grant_conflict"}
+
+
+def test_native_capture_persists_for_the_session_and_does_not_open_a_mission(native_client):
+    denied = fields(native_client.post("/v1/app/captures/list", content=body(session_token=""), headers=HEADERS))
+    assert denied == {"ok": "false", "code": "session_required"}
+    token, csrf = login(native_client)
+    empty = fields(native_client.post("/v1/app/captures/list", content=body(session_token=token), headers=HEADERS))
+    assert empty == {"ok": "true", "count": "0", "items": ""}
+    saved = fields(native_client.post("/v1/app/captures/create", content=body(
+        session_token=token, csrf_token=csrf, text="Ideia sintética do dia"), headers=HEADERS))
+    assert saved["ok"] == "true" and saved["domain_id"] == "dom_synthetic_a"
+    listed = fields(native_client.post("/v1/app/captures/list", content=body(session_token=token), headers=HEADERS))
+    assert listed["count"] == "1"
+    assert listed["items"] == f"{saved['id']}\t{saved['created_at']}\tIdeia sintética do dia"
+    missions = fields(native_client.post("/v1/app/missions/list", content=body(
+        session_token=token, domain_id="dom_synthetic_a"), headers=HEADERS))
+    assert missions == {"ok": "false", "code": "grant_required"}
+    rejected = fields(native_client.post("/v1/app/captures/create", content=body(
+        session_token=token, csrf_token=csrf, text="linha\nexterna"), headers=HEADERS))
+    assert rejected == {"ok": "false", "code": "capture_rejected"}
+    cleared = fields(native_client.post("/v1/app/captures/clear", content=body(
+        session_token=token, csrf_token=csrf), headers=HEADERS))
+    assert cleared == {"ok": "true", "cleared": "true"}
+    after = fields(native_client.post("/v1/app/captures/list", content=body(session_token=token), headers=HEADERS))
+    assert after["count"] == "0"
+
+
+def test_connector_status_stays_disconnected_without_printing_client_id(native_client, monkeypatch):
+    token, _csrf = login(native_client)
+    monkeypatch.delenv("JARVIS_GOOGLE_OAUTH_CLIENT_ID", raising=False)
+    missing = fields(native_client.post(
+        "/v1/app/connectors/status", content=body(session_token=token), headers=HEADERS))
+    assert missing["gmail"] == "not_connected"
+    assert missing["gmail_block"] == "missing_oauth_client"
+    assert missing["calendar"] == "not_connected"
+    assert missing["calendar_sim"] == "synthetic_local"
+    assert missing["gmail_scope"] == "gmail.readonly"
+    monkeypatch.setenv("JARVIS_GOOGLE_OAUTH_CLIENT_ID", "synthetic-client-id-not-a-secret-value")
+    present = fields(native_client.post(
+        "/v1/app/connectors/status", content=body(session_token=token), headers=HEADERS))
+    assert present["gmail_block"] == "consent_required"
+    assert "synthetic-client-id-not-a-secret-value" not in "".join(present.values())
+    from external_connectors import ConnectorUnavailable, read_gmail_messages, read_google_calendar_events
+    with pytest.raises(ConnectorUnavailable):
+        read_gmail_messages()
+    with pytest.raises(ConnectorUnavailable):
+        read_google_calendar_events()
 
 
 def test_epoch_microseconds_preserves_datetime_precision_without_float_rounding():

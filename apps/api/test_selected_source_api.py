@@ -279,7 +279,11 @@ def test_migration_preserves_unknown_sources_and_reconciles_only_byte_exact_fixt
     old_dir = tmp_path / "migrations-0013"
     old_dir.mkdir()
     for migration in sorted(MIGRATIONS_DIR.glob("[0-9][0-9][0-9][0-9]_*.sql")):
-        if migration.stem not in {"0014_curated_source_admission", "0015_selected_source_reconciliation"}:
+        if migration.stem not in {
+            "0014_curated_source_admission",
+            "0015_selected_source_reconciliation",
+            "0016_local_captures",
+        }:
             copyfile(migration, old_dir / migration.name)
     db_path = tmp_path / "private" / "legacy.sqlite3"
     old_store = SQLiteMemoryStore(db_path, migrations_dir=old_dir)

@@ -133,7 +133,7 @@ def _native_session(token: str, csrf_token: str | None = None, *, mutation: bool
     return session
 
 
-def _create_grant_for_session(session: Session, body: GrantIn) -> Grant:
+def _create_grant_for_session(session: Session, body: GrantIn, *, replay_exact: bool = False) -> Grant:
     resources = frozenset(body.resource_ids)
     domains = frozenset(body.domain_ids)
     with _grant_lock:
@@ -142,14 +142,23 @@ def _create_grant_for_session(session: Session, body: GrantIn) -> Grant:
         current = _session_by_token(session.token)
         if current.principal != session.principal:
             raise HTTPException(status_code=401, detail="sessão ausente")
+        exact: Grant | None = None
         for existing in _active_grants(session.principal, _now(), session.token):
             overlaps = (
                 existing.connector == body.connector
                 and bool(existing.resource_ids & resources)
                 and bool(existing.domain_ids & domains)
             )
+            identical = overlaps and existing.resource_ids == resources and existing.domain_ids == domains
+            if identical and replay_exact:
+                if exact is not None:
+                    raise HTTPException(status_code=409, detail="grant ativo sobreposto")
+                exact = existing
+                continue
             if overlaps:
                 raise HTTPException(status_code=409, detail="grant ativo sobreposto")
+        if exact is not None:
+            return exact
         grant = Grant(
             id=secrets.token_hex(16),
             principal=session.principal,
