@@ -88,6 +88,20 @@ test("G5 status and result parsers do not forward credentials or unknown fields"
   })));
 });
 
+test("aprovação local não encaminha rota nem segredo", () => {
+  const result = parseG5CommandResult(JSON.stringify({
+    ok: true,
+    approved: true,
+    replayed: false,
+    url: "https://example.invalid/approve",
+    session_token: "synthetic-secret",
+  }));
+  assert.equal(result.approved, true);
+  assert.equal(result.replayed, false);
+  assert.equal("url" in result, false);
+  assert.equal("session_token" in result, false);
+});
+
 test("G5 IPC exposes only the fixed typed operations", async () => {
   const calls = [];
   const ipc = createG5Ipc(async (command, args) => {

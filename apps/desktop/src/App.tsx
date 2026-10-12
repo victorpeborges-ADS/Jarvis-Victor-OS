@@ -58,6 +58,7 @@ function App() {
   const [reviewConfirmed, setReviewConfirmed] = useState(false);
   const [reviewGrant, setReviewGrant] = useState(false);
   const [pendingReviews, setPendingReviews] = useState<{ id: string; revision: number; sha256: string; title: string }[]>([]);
+  const [approveArmed, setApproveArmed] = useState<string | null>(null);
   const runtimeAvailable = isTauri();
   const grantActive = g5Status ? grantIsDisplayedActive(g5Status, nowMs) : false;
 
@@ -87,6 +88,7 @@ function App() {
             setConnectors(null);
             setReviewGrant(false);
             setPendingReviews([]);
+            setApproveArmed(null);
           } else if (!grantIsDisplayedActive(g5Response, Date.now())) {
             setMissions([]);
           }
@@ -254,9 +256,31 @@ function App() {
         return;
       }
       setPendingReviews(pending.reviews ?? []);
+      setApproveArmed(null);
       setNotice("Concessão mission:review registrada. Nenhuma ação externa foi executada.");
     } catch {
       setG5Error("Não foi possível solicitar a revisão local.");
+    } finally {
+      setG5Busy(false);
+    }
+  }
+
+  async function approveListedReview(review: { id: string; revision: number; sha256: string; title: string }) {
+    if (approveArmed !== review.id) return;
+    setG5Busy(true);
+    setG5Error("");
+    try {
+      const decided = await g5Ipc.approveReview(review.id, review.revision, review.sha256);
+      if (!decided.ok || decided.approved !== true) {
+        setG5Error(decided.error ?? "A revisão local não foi aprovada.");
+        return;
+      }
+      const pending = await g5Ipc.pendingReviews();
+      setPendingReviews(pending.ok ? pending.reviews ?? [] : []);
+      setApproveArmed(null);
+      setNotice(`Revisão local “${review.title}” registrada no servidor. Nenhum e-mail ou evento foi enviado.`);
+    } catch {
+      setG5Error("Não foi possível registrar a aprovação local.");
     } finally {
       setG5Busy(false);
     }
@@ -361,7 +385,13 @@ function App() {
           <label className="confirm"><input type="checkbox" checked={reviewConfirmed} onChange={(event) => setReviewConfirmed(event.currentTarget.checked)} /> Confirmo a concessão de revisão só para decisões locais em <code>dom_synthetic_a</code>.</label>
           <button className="action" type="button" disabled={g5Busy || !reviewConfirmed} onClick={() => void requestReviewGrant()}>Solicitar revisão local</button>
           {reviewGrant && pendingReviews.length === 0 && <p>Nenhuma revisão pendente. Nada será enviado para fora.</p>}
-          {pendingReviews.length > 0 && <ul>{pendingReviews.map((review) => <li key={review.id}><span>{review.title}</span><span>revisão {review.revision}</span></li>)}</ul>}
+          {pendingReviews.length > 0 && <ul>{pendingReviews.map((review) => <li key={review.id}>
+            <span>{review.title} · revisão {review.revision}</span>
+            <span>
+              <label className="confirm"><input type="checkbox" checked={approveArmed === review.id} onChange={(event) => setApproveArmed(event.currentTarget.checked ? review.id : null)} /> Confirmo aprovar só esta revisão local.</label>
+              <button className="action" type="button" disabled={g5Busy || approveArmed !== review.id} onClick={() => void approveListedReview(review)}>Aprovar esta revisão</button>
+            </span>
+          </li>)}</ul>}
         </>}
       </article>}
       {section === "Runtime local" && <article className="card runtime-card">

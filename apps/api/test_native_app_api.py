@@ -556,10 +556,9 @@ def test_review_grant_requires_explicit_confirmation_and_does_not_approve(native
     assert pending == {"ok": "true", "count": "0"}
     denied = fields(native_client.post("/v1/app/reviews/approve", content=body(
         session_token=token, csrf_token=csrf, review_id="review_missing_local",
-        expected_revision="1", expected_sha256="a" * 64, idempotency_key="approve-local-1",
+        expected_revision="1", expected_sha="a" * 64, idempotency_key="approve-local-1",
         confirm="approve-local"), headers=HEADERS))
-    assert denied["ok"] == "false"
-    assert denied["code"] in {"operation_failed", "scope_invalid"}
+    assert denied == {"ok": "false", "code": "operation_failed"}
     missions = fields(native_client.post("/v1/app/missions/list", content=body(
         session_token=token, domain_id="dom_synthetic_a"), headers=HEADERS))
     assert missions == {"ok": "false", "code": "grant_required"}

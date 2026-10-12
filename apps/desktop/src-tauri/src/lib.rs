@@ -23,6 +23,7 @@ pub fn run() {
             runtime_manager::g5_connectors_status,
             runtime_manager::g5_review_grant_create,
             runtime_manager::g5_reviews_pending,
+            runtime_manager::g5_review_approve,
             runtime_manager::runtime_local_config,
             runtime_manager::runtime_start,
             runtime_manager::runtime_stop,

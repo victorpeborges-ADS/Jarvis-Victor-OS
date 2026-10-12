@@ -38,7 +38,7 @@ Na janela: espere Pronto e canal Autenticado no protocolo 3, abra a sessão em M
 | Captura de ideia | `local_captures`, migração `0016` | pronto | sessão local | nenhum para uso sintético |
 | Inbox | `/v1/app/connectors/status` | parcial | Gmail e Calendar não conectados | client ID e consentimento |
 | Missões | rota nativa de leitura | pronto | concessão explícita | nenhum |
-| Aprovações | `/v1/app/grants/mission-review` e `/v1/app/reviews/pending` | parcial | fila vazia até existir revisão; aprovar uma revisão ausente falha | confirmação sua por ação |
+| Aprovações | `/v1/app/reviews/approve` só depois do checkbox da revisão exibida | parcial | a fila continua vazia até existir uma revisão; ausência é recusada | sua confirmação de cada item |
 | Runtime | `start_on_launch` | pronto no checkout | sem pacote distribuível | nenhum para uso local |
 | Configurações | `database_mode` `stable` ou `override` | pronto | passphrase não vai para Keychain | nenhum |
 | Gmail e Google Calendar | `oauth_pkce.py`, PKCE S256, escopos só de leitura | não conectado | falta client ID e consentimento; nenhum listener TCP | cliente OAuth no Google Cloud |
@@ -65,4 +65,13 @@ Na janela: espere Pronto e canal Autenticado no protocolo 3, abra a sessão em M
 | Processo do mesmo UID | Permanece. |
 | Diretórios `.jv-*` vazios | Permanecem. |
 
-O aceite histórico em `G6_MAC_002_2_MAC_003_ACEITE.md` não foi reescrito. Gmail, Calendar e Aprovações não estão concluídos.
+O aceite histórico em `G6_MAC_002_2_MAC_003_ACEITE.md` não foi reescrito. Gmail e Calendar não estão conectados. Aprovar uma revisão local exige o checkbox daquele item; a janela não escolhe a rota.
+
+## Handoff desta fase
+
+- Base: `main` `21f1537e14706a42e8272f92cb4f4b6dab746640`.
+- Partida: `feat/jarvis-uso-diario-mac` `3d3444dde9d25ab67426f1c5575063dc5652caed`.
+- Worktree: `/Users/vic/.codex/worktrees/jarvis-aprovacao-local/Jarvis-Victor-OS`, branch `feat/jarvis-aprovacao-local`.
+- Sem push, tag, deploy, fast-forward ou merge.
+- A janela Tauri não foi exercitada nesta fase. O smoke visual anterior continua pendente do proprietário.
+- `source-map-js@1.2.1` permanece. Nenhuma dependência nova.

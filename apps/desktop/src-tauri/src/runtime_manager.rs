@@ -1333,6 +1333,73 @@ impl RuntimeManager {
         result
     }
 
+    fn g5_review_approve(
+        &self,
+        review_id: String,
+        expected_revision: u64,
+        expected_sha256: String,
+    ) -> String {
+        let _operation = self
+            .g5_operation
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if !closed_review_target(&review_id, expected_revision, &expected_sha256) {
+            return g5_error_json("scope_invalid");
+        }
+        let (instance_id, transport, token, csrf_token) = match self.g5_credentials_for_active() {
+            Ok(value) => value,
+            Err(error) => return g5_error_json(error),
+        };
+        let idempotency_key = local_approve_key();
+        let revision = expected_revision.to_string();
+        let body = SecretBytes::new(encode_application_fields(&[
+            ("session_token", token.as_str()),
+            ("csrf_token", csrf_token.as_str()),
+            ("review_id", review_id.as_str()),
+            ("expected_revision", revision.as_str()),
+            ("expected_sha", expected_sha256.as_str()),
+            ("idempotency_key", idempotency_key.as_str()),
+            ("confirm", "approve-local"),
+        ]));
+        let response =
+            match transport.call_g5_application("/v1/app/reviews/approve", body.as_slice()) {
+                Ok(value) => SecretBytes::new(value),
+                Err(_) => return g5_error_json("transport_failure"),
+            };
+        let fields = match parse_application_response(response.as_slice()) {
+            Ok(value) => value,
+            Err(()) => return g5_error_json("protocol_failure"),
+        };
+        if let Some(error) = app_response_error(&fields) {
+            clear_cached_authorization_after_rejection(
+                &self.shared,
+                &instance_id,
+                &transport,
+                token.as_str(),
+                error,
+            );
+            return g5_error_json(error);
+        }
+        if !app_fields_match(&fields, &["ok", "approved", "replayed"])
+            || app_field(&fields, "ok") != Some("true")
+            || app_field(&fields, "approved") != Some("true")
+            || !matches!(app_field(&fields, "replayed"), Some("true" | "false"))
+        {
+            return g5_error_json("protocol_failure");
+        }
+        let replayed = app_field(&fields, "replayed") == Some("true");
+        let inner = lock_inner(&self.shared);
+        if !g5_generation_matches(&inner, &instance_id, &transport)
+            || inner
+                .g5_session
+                .as_ref()
+                .is_none_or(|session| session.token.as_str() != token.as_str())
+        {
+            return g5_error_json("stale_generation");
+        }
+        format!("{{\"ok\":true,\"approved\":true,\"replayed\":{replayed}}}")
+    }
+
     fn g5_credentials_for_active(
         &self,
     ) -> Result<(String, Arc<TransportSession>, SecretText, SecretText), &'static str> {
@@ -3155,6 +3222,26 @@ fn parse_rfc3339_micros(value: &str) -> Option<u64> {
         .checked_add(u64::from(micros))
 }
 
+fn closed_review_target(review_id: &str, revision: u64, sha: &str) -> bool {
+    (8..=128).contains(&review_id.len())
+        && review_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+        && revision >= 1
+        && sha.len() == 64
+        && sha
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+}
+
+fn local_approve_key() -> String {
+    format!(
+        "localapprove{:x}{:x}",
+        unix_time_microseconds(),
+        std::process::id()
+    )
+}
+
 fn parse_capture_items(raw: &str, count: usize) -> Option<Vec<(String, String, String)>> {
     if count == 0 {
         return if raw.is_empty() {
@@ -3885,6 +3972,16 @@ pub fn g5_review_grant_create(manager: tauri::State<'_, RuntimeManager>) -> Stri
 #[tauri::command]
 pub fn g5_reviews_pending(manager: tauri::State<'_, RuntimeManager>) -> String {
     manager.g5_reviews_pending()
+}
+
+#[tauri::command]
+pub fn g5_review_approve(
+    manager: tauri::State<'_, RuntimeManager>,
+    review_id: String,
+    expected_revision: u64,
+    expected_sha256: String,
+) -> String {
+    manager.g5_review_approve(review_id, expected_revision, expected_sha256)
 }
 
 #[tauri::command]
@@ -5182,7 +5279,10 @@ mod tests {
 
 #[cfg(test)]
 mod local_use_tests {
-    use super::{expiry_matches, parse_capture_items, parse_rfc3339_micros, resolve_api_root};
+    use super::{
+        closed_review_target, expiry_matches, local_approve_key, parse_capture_items,
+        parse_rfc3339_micros, resolve_api_root,
+    };
     use std::fs;
 
     #[test]
@@ -5208,5 +5308,22 @@ mod local_use_tests {
         fs::write(root.join("serve.py"), b"# synthetic\n").unwrap();
         assert!(resolve_api_root(&root).unwrap().join("serve.py").is_file());
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn review_approval_rejects_open_targets_and_keeps_its_key_local() {
+        let sha = "a".repeat(64);
+        assert!(closed_review_target("review_local_01", 1, &sha));
+        assert!(!closed_review_target(
+            "https://example.invalid/approve",
+            1,
+            &sha
+        ));
+        assert!(!closed_review_target("review_local_01", 0, &sha));
+        assert!(!closed_review_target("review_local_01", 1, "AA"));
+        let key = local_approve_key();
+        assert!(key.starts_with("localapprove"));
+        assert!(key.bytes().all(|byte| byte.is_ascii_alphanumeric()));
+        assert!((8..=160).contains(&key.len()));
     }
 }

@@ -51,7 +51,7 @@ EXPECTED_FIELDS = {
         "csrf_token",
         "review_id",
         "expected_revision",
-        "expected_sha256",
+        "expected_sha",
         "idempotency_key",
         "confirm",
     ),
@@ -423,7 +423,7 @@ async def approve_native_review(request: Request) -> PlainTextResponse:
         session = _native_session(fields["session_token"], fields["csrf_token"], mutation=True)
         if fields["confirm"] != "approve-local":
             return _error("scope_invalid")
-        if not re.fullmatch(r"[0-9a-f]{64}", fields["expected_sha256"]):
+        if not re.fullmatch(r"[0-9a-f]{64}", fields["expected_sha"]):
             return _error("scope_invalid")
         if not 8 <= len(fields["idempotency_key"]) <= 160:
             return _error("scope_invalid")
@@ -436,7 +436,7 @@ async def approve_native_review(request: Request) -> PlainTextResponse:
                 fields["review_id"],
                 "approved",
                 revision,
-                fields["expected_sha256"],
+                fields["expected_sha"],
                 None,
                 fields["idempotency_key"],
                 session.token,
