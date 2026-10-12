@@ -43,6 +43,8 @@ APP_PATHS = frozenset(
         ("POST", "/v1/app/grants/mission-read/revoke"),
         ("POST", "/v1/app/missions/list"),
         ("POST", "/v1/app/captures/create"),
+        ("POST", "/v1/app/captures/edit"),
+        ("POST", "/v1/app/captures/delete"),
         ("POST", "/v1/app/captures/list"),
         ("POST", "/v1/app/captures/clear"),
         ("POST", "/v1/app/connectors/status"),

@@ -29,13 +29,25 @@ scripts/run-local-desktop.sh
 
 O script pede a passphrase sintética no Terminal, sem eco e sem gravar. Se o terminal não for interativo, ele para. `JARVIS_DATABASE_PATH` é só override de teste; deixe-o indefinido para o banco estável.
 
-Na janela: espere Pronto e canal Autenticado no protocolo 3, abra a sessão em Missões com a mesma passphrase e grave a ideia em Agora. Feche e abra de novo para ver a ideia. Em Runtime local, Parar deve voltar a Parado.
+Na janela: espere Pronto e canal Autenticado no protocolo 3. Abra a sessão em Missões com a mesma passphrase. Em Agora, grave uma ideia. Feche a janela e rode o script de novo: a ideia continua. Editar e Apagar ficam na mesma lista e também só no banco local. Em Runtime local, Parar deve voltar a Parado. A ideia não sai do Mac e não vai para um modelo.
+
+## Roteiro do smoke manual
+
+1. Deixe `JARVIS_DATABASE_PATH` indefinido.
+2. Rode `scripts/run-local-desktop.sh` e digite uma passphrase sintética de 12 a 128 bytes.
+3. Espere Pronto, canal Autenticado, protocolo 3.
+4. Em Missões, abra a sessão com a mesma passphrase.
+5. Em Agora, grave uma ideia. Feche e abra de novo. O texto deve continuar.
+6. Se quiser, use Editar e Apagar. Nada disso é enviado para fora.
+7. Em Runtime local, clique Parar até o estado Parado.
+
+Os testes usam diretório temporário. Não há fast-forward nesta fase.
 
 ## Matriz
 
 | Funcionalidade | Evidência | Estado | Bloqueio | Próximo requisito |
 |---|---|---|---|---|
-| Captura de ideia | `local_captures`, migração `0016` | pronto | sessão local | nenhum para uso sintético |
+| Captura de ideia | gravação, edição, apagamento, restart e backup em banco temporário | sem smoke da janela | sessão local | o proprietário confirmar a persistência |
 | Inbox | `/v1/app/connectors/status` | parcial | Gmail e Calendar não conectados | client ID e consentimento |
 | Missões | rota nativa de leitura | pronto | concessão explícita | nenhum |
 | Aprovações | rascunho sintético só com `confirm=draft-local` e concessão de revisão; aprovação só do item exibido | parcial | não há efeito externo; Gmail e Calendar continuam desligados | sua confirmação de cada passo |

@@ -1109,6 +1109,125 @@ impl RuntimeManager {
         "{\"ok\":true,\"cleared\":true}".to_owned()
     }
 
+    fn g5_capture_edit(&self, capture_id: String, text: String) -> String {
+        let _operation = self
+            .g5_operation
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if !is_hex_identifier(&capture_id)
+            || text.is_empty()
+            || text.chars().count() > 80
+            || text.chars().any(char::is_control)
+        {
+            return g5_error_json("capture_rejected");
+        }
+        let (instance_id, transport, token, csrf_token) = match self.g5_credentials_for_active() {
+            Ok(value) => value,
+            Err(error) => return g5_error_json(error),
+        };
+        let body = SecretBytes::new(encode_application_fields(&[
+            ("session_token", token.as_str()),
+            ("csrf_token", csrf_token.as_str()),
+            ("capture_id", capture_id.as_str()),
+            ("text", text.as_str()),
+        ]));
+        let response = match transport.call_g5_application("/v1/app/captures/edit", body.as_slice())
+        {
+            Ok(value) => SecretBytes::new(value),
+            Err(_) => return g5_error_json("transport_failure"),
+        };
+        let fields = match parse_application_response(response.as_slice()) {
+            Ok(value) => value,
+            Err(()) => return g5_error_json("protocol_failure"),
+        };
+        if let Some(error) = app_response_error(&fields) {
+            clear_cached_authorization_after_rejection(
+                &self.shared,
+                &instance_id,
+                &transport,
+                token.as_str(),
+                error,
+            );
+            return g5_error_json(error);
+        }
+        if !app_fields_match(&fields, &["ok", "id", "created_at", "domain_id"])
+            || app_field(&fields, "ok") != Some("true")
+            || app_field(&fields, "id") != Some(capture_id.as_str())
+            || app_field(&fields, "domain_id") != Some("dom_synthetic_a")
+        {
+            return g5_error_json("protocol_failure");
+        }
+        let created_at = app_field(&fields, "created_at").unwrap_or_default();
+        let inner = lock_inner(&self.shared);
+        if !g5_generation_matches(&inner, &instance_id, &transport)
+            || inner
+                .g5_session
+                .as_ref()
+                .is_none_or(|session| session.token.as_str() != token.as_str())
+        {
+            return g5_error_json("stale_generation");
+        }
+        format!(
+            "{{\"ok\":true,\"id\":{},\"created_at\":{}}}",
+            json_string(&capture_id),
+            json_string(created_at)
+        )
+    }
+
+    fn g5_capture_delete(&self, capture_id: String) -> String {
+        let _operation = self
+            .g5_operation
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if !is_hex_identifier(&capture_id) {
+            return g5_error_json("capture_rejected");
+        }
+        let (instance_id, transport, token, csrf_token) = match self.g5_credentials_for_active() {
+            Ok(value) => value,
+            Err(error) => return g5_error_json(error),
+        };
+        let body = SecretBytes::new(encode_application_fields(&[
+            ("session_token", token.as_str()),
+            ("csrf_token", csrf_token.as_str()),
+            ("capture_id", capture_id.as_str()),
+        ]));
+        let response =
+            match transport.call_g5_application("/v1/app/captures/delete", body.as_slice()) {
+                Ok(value) => SecretBytes::new(value),
+                Err(_) => return g5_error_json("transport_failure"),
+            };
+        let fields = match parse_application_response(response.as_slice()) {
+            Ok(value) => value,
+            Err(()) => return g5_error_json("protocol_failure"),
+        };
+        if let Some(error) = app_response_error(&fields) {
+            clear_cached_authorization_after_rejection(
+                &self.shared,
+                &instance_id,
+                &transport,
+                token.as_str(),
+                error,
+            );
+            return g5_error_json(error);
+        }
+        if !app_fields_match(&fields, &["ok", "deleted"])
+            || app_field(&fields, "ok") != Some("true")
+            || app_field(&fields, "deleted") != Some("true")
+        {
+            return g5_error_json("protocol_failure");
+        }
+        let inner = lock_inner(&self.shared);
+        if !g5_generation_matches(&inner, &instance_id, &transport)
+            || inner
+                .g5_session
+                .as_ref()
+                .is_none_or(|session| session.token.as_str() != token.as_str())
+        {
+            return g5_error_json("stale_generation");
+        }
+        "{\"ok\":true,\"deleted\":true}".to_owned()
+    }
+
     fn g5_connectors_status(&self) -> String {
         let _operation = self
             .g5_operation
@@ -4009,6 +4128,20 @@ pub fn g5_capture_list(manager: tauri::State<'_, RuntimeManager>) -> String {
 #[tauri::command]
 pub fn g5_capture_clear(manager: tauri::State<'_, RuntimeManager>) -> String {
     manager.g5_capture_clear()
+}
+
+#[tauri::command]
+pub fn g5_capture_edit(
+    manager: tauri::State<'_, RuntimeManager>,
+    capture_id: String,
+    text: String,
+) -> String {
+    manager.g5_capture_edit(capture_id, text)
+}
+
+#[tauri::command]
+pub fn g5_capture_delete(manager: tauri::State<'_, RuntimeManager>, capture_id: String) -> String {
+    manager.g5_capture_delete(capture_id)
 }
 
 #[tauri::command]

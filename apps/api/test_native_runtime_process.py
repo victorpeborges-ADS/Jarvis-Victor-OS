@@ -32,6 +32,8 @@ APP_PATHS = {
     "/v1/app/grants/mission-read/revoke",
     "/v1/app/missions/list",
     "/v1/app/captures/create",
+    "/v1/app/captures/edit",
+    "/v1/app/captures/delete",
     "/v1/app/captures/list",
     "/v1/app/captures/clear",
     "/v1/app/connectors/status",

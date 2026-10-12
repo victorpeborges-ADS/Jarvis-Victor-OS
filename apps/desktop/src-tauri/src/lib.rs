@@ -20,6 +20,8 @@ pub fn run() {
             runtime_manager::g5_capture_create,
             runtime_manager::g5_capture_list,
             runtime_manager::g5_capture_clear,
+            runtime_manager::g5_capture_edit,
+            runtime_manager::g5_capture_delete,
             runtime_manager::g5_connectors_status,
             runtime_manager::g5_review_grant_create,
             runtime_manager::g5_reviews_pending,

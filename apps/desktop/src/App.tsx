@@ -60,6 +60,7 @@ function App() {
   const [reviewGrant, setReviewGrant] = useState(false);
   const [pendingReviews, setPendingReviews] = useState<{ id: string; revision: number; sha256: string; title: string }[]>([]);
   const [approveArmed, setApproveArmed] = useState<string | null>(null);
+  const [editingId, setEditingId] = useState<string | null>(null);
   const runtimeAvailable = isTauri();
   const grantActive = g5Status ? grantIsDisplayedActive(g5Status, nowMs) : false;
 
@@ -220,7 +221,9 @@ function App() {
     setG5Busy(true);
     setG5Error("");
     try {
-      const saved = await g5Ipc.createCapture(content);
+      const saved = editingId
+        ? await g5Ipc.editCapture(editingId, content)
+        : await g5Ipc.createCapture(content);
       if (!saved.ok) {
         setG5Error(saved.error ?? "A captura não foi gravada.");
         return;
@@ -232,9 +235,35 @@ function App() {
       }
       setCaptures(listed.captures ?? []);
       setText("");
-      setNotice("Ideia gravada no banco local sintético. Nenhuma missão, e-mail ou evento foi criado.");
+      setEditingId(null);
+      setNotice(editingId
+        ? "Ideia atualizada no banco local. Nada foi enviado para fora."
+        : "Ideia gravada no banco local sintético. Nenhuma missão, e-mail ou evento foi criado.");
     } catch {
       setG5Error("Não foi possível gravar a ideia no banco local.");
+    } finally {
+      setG5Busy(false);
+    }
+  }
+
+  async function removeCapture(captureId: string) {
+    setG5Busy(true);
+    setG5Error("");
+    try {
+      const removed = await g5Ipc.deleteCapture(captureId);
+      if (!removed.ok) {
+        setG5Error(removed.error ?? "A ideia não foi apagada.");
+        return;
+      }
+      const listed = await g5Ipc.listCaptures();
+      setCaptures(listed.ok ? listed.captures ?? [] : []);
+      if (editingId === captureId) {
+        setEditingId(null);
+        setText("");
+      }
+      setNotice("Ideia apagada do banco local. Nada foi enviado para fora.");
+    } catch {
+      setG5Error("Não foi possível apagar a ideia.");
     } finally {
       setG5Busy(false);
     }
@@ -344,9 +373,15 @@ function App() {
         {g5Status?.session_active ? <form onSubmit={(event) => void saveCapture(event)}>
           <label htmlFor="agora-capture">Ideia sintética</label>
           <textarea id="agora-capture" maxLength={80} value={text} onChange={(event) => setText(event.currentTarget.value)} placeholder="Ex.: revisar a missão sintética amanhã" />
-          <button className="action" type="submit" disabled={g5Busy || !text.trim() || [...text.trim()].length > 80}>Gravar no banco local</button>
+          <button className="action" type="submit" disabled={g5Busy || !text.trim() || [...text.trim()].length > 80}>{editingId ? "Atualizar ideia" : "Gravar no banco local"}</button>
         </form> : <p>Abra a sessão em Missões para gravar a ideia no SQLite. O texto abaixo permanece só neste formulário até lá.</p>}
-        {captures.length > 0 && <ul className="capture-list">{captures.map((item) => <li key={item.id}><span>{item.text}</span><small>{item.created_at}</small></li>)}</ul>}
+        {captures.length > 0 && <ul className="capture-list">{captures.map((item) => <li key={item.id}>
+          <span>{item.text}</span><small>{item.created_at}</small>
+          <span>
+            <button className="action secondary" type="button" disabled={g5Busy} onClick={() => { setEditingId(item.id); setText(item.text); }}>Editar</button>
+            <button className="action secondary" type="button" disabled={g5Busy} onClick={() => void removeCapture(item.id)}>Apagar</button>
+          </span>
+        </li>)}</ul>}
       </article>}
       {section === "Inbox" && <article className="card"><p className="badge">FONTES REAIS DESTE CLIENTE</p>
         <h2>O que está ligado</h2>

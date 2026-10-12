@@ -80,6 +80,7 @@ export type G5CommandResult = {
   id?: string;
   created_at?: string;
   cleared?: boolean;
+  deleted?: boolean;
 };
 
 type G5Invoke = (command: string, args?: Record<string, unknown>) => Promise<string>;
@@ -104,6 +105,10 @@ export function createG5Ipc(invokeG5: G5Invoke) {
       parseG5CommandResult(await invokeG5("g5_capture_list")),
     clearCaptures: async (): Promise<G5CommandResult> =>
       parseG5CommandResult(await invokeG5("g5_capture_clear")),
+    editCapture: async (captureId: string, text: string): Promise<G5CommandResult> =>
+      parseG5CommandResult(await invokeG5("g5_capture_edit", { capture_id: captureId, text })),
+    deleteCapture: async (captureId: string): Promise<G5CommandResult> =>
+      parseG5CommandResult(await invokeG5("g5_capture_delete", { capture_id: captureId })),
     connectorStatus: async (): Promise<ConnectorStatus> =>
       parseConnectorStatus(await invokeG5("g5_connectors_status")),
     createReviewGrant: async (): Promise<G5CommandResult> =>
@@ -250,6 +255,10 @@ export function parseG5CommandResult(value: string): G5CommandResult {
   if (record.cleared !== undefined) {
     if (record.cleared !== true) throw new Error("Limpeza de captura inválida.");
     result.cleared = true;
+  }
+  if (record.deleted !== undefined) {
+    if (record.deleted !== true) throw new Error("Apagar captura inválido.");
+    result.deleted = true;
   }
   if (record.review_grant !== undefined) {
     if (record.review_grant !== true) throw new Error("Concessão de revisão inválida.");

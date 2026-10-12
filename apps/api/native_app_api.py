@@ -25,7 +25,14 @@ from local_security import (
     mission_review_confirmed,
 )
 from external_connectors import public_status
-from local_captures import clear_captures, create_capture, encode_capture_items, list_captures
+from local_captures import (
+    clear_captures,
+    create_capture,
+    delete_capture,
+    encode_capture_items,
+    list_captures,
+    update_capture,
+)
 from mission_repository import MissionConflict, MissionCorrupt, MissionDenied, MissionRejected, MissionRepository
 
 router = APIRouter()
@@ -42,6 +49,8 @@ EXPECTED_FIELDS = {
     "/v1/app/grants/mission-read/revoke": ("session_token", "csrf_token", "grant_id"),
     "/v1/app/missions/list": ("session_token", "domain_id"),
     "/v1/app/captures/create": ("session_token", "csrf_token", "text"),
+    "/v1/app/captures/edit": ("session_token", "csrf_token", "capture_id", "text"),
+    "/v1/app/captures/delete": ("session_token", "csrf_token", "capture_id"),
     "/v1/app/captures/list": ("session_token",),
     "/v1/app/captures/clear": ("session_token", "csrf_token"),
     "/v1/app/connectors/status": ("session_token",),
@@ -293,6 +302,34 @@ async def create_native_capture(request: Request) -> PlainTextResponse:
     except HTTPException as exc:
         return _error_for(exc)
     return _success(id=saved["id"], created_at=saved["created_at"], domain_id=saved["domain_id"])
+
+
+@router.post("/v1/app/captures/edit")
+async def edit_native_capture(request: Request) -> PlainTextResponse:
+    try:
+        fields = await _read_fields(request, EXPECTED_FIELDS[request.url.path])
+        session = _native_session(fields["session_token"], fields["csrf_token"], mutation=True)
+        saved = update_capture(
+            request.app.state.memory_store, session.principal, fields["capture_id"], fields["text"]
+        )
+    except (ValueError, UnicodeError):
+        return _error("capture_rejected")
+    except HTTPException as exc:
+        return _error_for(exc)
+    return _success(id=saved["id"], created_at=saved["created_at"], domain_id=saved["domain_id"])
+
+
+@router.post("/v1/app/captures/delete")
+async def delete_native_capture(request: Request) -> PlainTextResponse:
+    try:
+        fields = await _read_fields(request, EXPECTED_FIELDS[request.url.path])
+        session = _native_session(fields["session_token"], fields["csrf_token"], mutation=True)
+        delete_capture(request.app.state.memory_store, session.principal, fields["capture_id"])
+    except (ValueError, UnicodeError):
+        return _error("capture_rejected")
+    except HTTPException as exc:
+        return _error_for(exc)
+    return _success(deleted="true")
 
 
 @router.post("/v1/app/captures/list")

@@ -56,6 +56,41 @@ def list_captures(store: SQLiteMemoryStore, owner: str) -> list[dict[str, str]]:
     return [{"id": row[0], "text": row[1], "created_at": row[2]} for row in rows]
 
 
+def update_capture(store: SQLiteMemoryStore, owner: str, capture_id: str, text: str) -> dict[str, str]:
+    if owner != "owner" or not isinstance(capture_id, str) or not isinstance(text, str):
+        raise ValueError("captura recusada")
+    if len(capture_id) != 32 or any(character not in "0123456789abcdef" for character in capture_id):
+        raise ValueError("captura recusada")
+    if _TEXT.fullmatch(text) is None or len(text) > MAX_TEXT_CHARS:
+        raise ValueError("captura recusada")
+    with store.transaction() as connection:
+        row = connection.execute(
+            "SELECT created_at FROM local_captures WHERE id = ? AND owner = ? AND domain_id = ?",
+            (capture_id, owner, DOMAIN_ID),
+        ).fetchone()
+        if row is None:
+            raise ValueError("captura recusada")
+        connection.execute(
+            "UPDATE local_captures SET body = ? WHERE id = ? AND owner = ?",
+            (text, capture_id, owner),
+        )
+    return {"id": capture_id, "created_at": row[0], "domain_id": DOMAIN_ID, "text": text}
+
+
+def delete_capture(store: SQLiteMemoryStore, owner: str, capture_id: str) -> None:
+    if owner != "owner" or not isinstance(capture_id, str):
+        raise ValueError("captura recusada")
+    if len(capture_id) != 32 or any(character not in "0123456789abcdef" for character in capture_id):
+        raise ValueError("captura recusada")
+    with store.transaction() as connection:
+        deleted = connection.execute(
+            "DELETE FROM local_captures WHERE id = ? AND owner = ? AND domain_id = ?",
+            (capture_id, owner, DOMAIN_ID),
+        ).rowcount
+    if deleted != 1:
+        raise ValueError("captura recusada")
+
+
 def clear_captures(store: SQLiteMemoryStore, owner: str) -> int:
     if owner != "owner":
         raise ValueError("captura recusada")

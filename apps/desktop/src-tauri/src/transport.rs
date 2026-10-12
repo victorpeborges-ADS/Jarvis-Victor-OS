@@ -35,6 +35,8 @@ const APP_GRANT_CREATE_ROUTE: &str = "/v1/app/grants/mission-read";
 const APP_GRANT_REVOKE_ROUTE: &str = "/v1/app/grants/mission-read/revoke";
 const APP_MISSIONS_LIST_ROUTE: &str = "/v1/app/missions/list";
 const APP_CAPTURE_CREATE_ROUTE: &str = "/v1/app/captures/create";
+const APP_CAPTURE_EDIT_ROUTE: &str = "/v1/app/captures/edit";
+const APP_CAPTURE_DELETE_ROUTE: &str = "/v1/app/captures/delete";
 const APP_CAPTURE_LIST_ROUTE: &str = "/v1/app/captures/list";
 const APP_CAPTURE_CLEAR_ROUTE: &str = "/v1/app/captures/clear";
 const APP_CONNECTORS_STATUS_ROUTE: &str = "/v1/app/connectors/status";
@@ -42,13 +44,15 @@ const APP_REVIEW_GRANT_ROUTE: &str = "/v1/app/grants/mission-review";
 const APP_REVIEWS_PENDING_ROUTE: &str = "/v1/app/reviews/pending";
 const APP_REVIEW_DRAFT_ROUTE: &str = "/v1/app/reviews/draft";
 const APP_REVIEW_APPROVE_ROUTE: &str = "/v1/app/reviews/approve";
-const APP_ROUTES: [&str; 13] = [
+const APP_ROUTES: [&str; 15] = [
     APP_SESSION_OPEN_ROUTE,
     APP_SESSION_CLOSE_ROUTE,
     APP_GRANT_CREATE_ROUTE,
     APP_GRANT_REVOKE_ROUTE,
     APP_MISSIONS_LIST_ROUTE,
     APP_CAPTURE_CREATE_ROUTE,
+    APP_CAPTURE_EDIT_ROUTE,
+    APP_CAPTURE_DELETE_ROUTE,
     APP_CAPTURE_LIST_ROUTE,
     APP_CAPTURE_CLEAR_ROUTE,
     APP_CONNECTORS_STATUS_ROUTE,

@@ -502,6 +502,14 @@ def test_native_capture_persists_for_the_session_and_does_not_open_a_mission(nat
     listed = fields(native_client.post("/v1/app/captures/list", content=body(session_token=token), headers=HEADERS))
     assert listed["count"] == "1"
     assert listed["items"] == f"{saved['id']}\t{saved['created_at']}\tIdeia sintética do dia"
+    edited = fields(native_client.post("/v1/app/captures/edit", content=body(
+        session_token=token, csrf_token=csrf, capture_id=saved["id"], text="Ideia editada local"), headers=HEADERS))
+    assert edited["id"] == saved["id"] and edited["created_at"] == saved["created_at"]
+    listed_edit = fields(native_client.post("/v1/app/captures/list", content=body(session_token=token), headers=HEADERS))
+    assert listed_edit["items"].endswith("\tIdeia editada local")
+    deleted = fields(native_client.post("/v1/app/captures/delete", content=body(
+        session_token=token, csrf_token=csrf, capture_id=saved["id"]), headers=HEADERS))
+    assert deleted == {"ok": "true", "deleted": "true"}
     missions = fields(native_client.post("/v1/app/missions/list", content=body(
         session_token=token, domain_id="dom_synthetic_a"), headers=HEADERS))
     assert missions == {"ok": "false", "code": "grant_required"}
