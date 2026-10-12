@@ -56,6 +56,7 @@ function App() {
   const [localConfig, setLocalConfig] = useState<LocalRuntimeConfig | null>(null);
   const [nowMs, setNowMs] = useState(() => Date.now());
   const [reviewConfirmed, setReviewConfirmed] = useState(false);
+  const [draftConfirmed, setDraftConfirmed] = useState(false);
   const [reviewGrant, setReviewGrant] = useState(false);
   const [pendingReviews, setPendingReviews] = useState<{ id: string; revision: number; sha256: string; title: string }[]>([]);
   const [approveArmed, setApproveArmed] = useState<string | null>(null);
@@ -265,6 +266,27 @@ function App() {
     }
   }
 
+  async function queueReviewDraft() {
+    if (!draftConfirmed) return;
+    setG5Busy(true);
+    setG5Error("");
+    try {
+      const queued = await g5Ipc.queueReviewDraft();
+      if (!queued.ok) {
+        setG5Error(queued.error ?? "O rascunho local não foi criado.");
+        return;
+      }
+      const pending = await g5Ipc.pendingReviews();
+      setPendingReviews(pending.ok ? pending.reviews ?? [] : []);
+      setDraftConfirmed(false);
+      setNotice(queued.queued ? "Rascunho sintético colocado na fila. Nada foi enviado para fora." : "Já existe uma revisão pendente. Nenhuma nova foi criada.");
+    } catch {
+      setG5Error("Não foi possível criar o rascunho local.");
+    } finally {
+      setG5Busy(false);
+    }
+  }
+
   async function approveListedReview(review: { id: string; revision: number; sha256: string; title: string }) {
     if (approveArmed !== review.id) return;
     setG5Busy(true);
@@ -384,7 +406,11 @@ function App() {
         {g5Status?.session_active && <>
           <label className="confirm"><input type="checkbox" checked={reviewConfirmed} onChange={(event) => setReviewConfirmed(event.currentTarget.checked)} /> Confirmo a concessão de revisão só para decisões locais em <code>dom_synthetic_a</code>.</label>
           <button className="action" type="button" disabled={g5Busy || !reviewConfirmed} onClick={() => void requestReviewGrant()}>Solicitar revisão local</button>
-          {reviewGrant && pendingReviews.length === 0 && <p>Nenhuma revisão pendente. Nada será enviado para fora.</p>}
+          {reviewGrant && pendingReviews.length === 0 && <>
+            <p>Nenhuma revisão pendente. Nada será enviado para fora.</p>
+            <label className="confirm"><input type="checkbox" checked={draftConfirmed} onChange={(event) => setDraftConfirmed(event.currentTarget.checked)} /> Confirmo criar um único rascunho sintético para revisar aqui.</label>
+            <button className="action secondary" type="button" disabled={g5Busy || !draftConfirmed} onClick={() => void queueReviewDraft()}>Criar rascunho sintético</button>
+          </>}
           {pendingReviews.length > 0 && <ul>{pendingReviews.map((review) => <li key={review.id}>
             <span>{review.title} · revisão {review.revision}</span>
             <span>

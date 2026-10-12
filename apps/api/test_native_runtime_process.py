@@ -37,6 +37,7 @@ APP_PATHS = {
     "/v1/app/connectors/status",
     "/v1/app/grants/mission-review",
     "/v1/app/reviews/pending",
+    "/v1/app/reviews/draft",
     "/v1/app/reviews/approve",
 }
 

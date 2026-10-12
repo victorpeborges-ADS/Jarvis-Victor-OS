@@ -74,6 +74,7 @@ export type G5CommandResult = {
   captures?: LocalCapture[];
   reviews?: { id: string; revision: number; sha256: string; title: string }[];
   review_grant?: boolean;
+  queued?: boolean;
   approved?: boolean;
   replayed?: boolean;
   id?: string;
@@ -109,6 +110,8 @@ export function createG5Ipc(invokeG5: G5Invoke) {
       parseG5CommandResult(await invokeG5("g5_review_grant_create")),
     pendingReviews: async (): Promise<G5CommandResult> =>
       parseG5CommandResult(await invokeG5("g5_reviews_pending")),
+    queueReviewDraft: async (): Promise<G5CommandResult> =>
+      parseG5CommandResult(await invokeG5("g5_review_draft")),
     approveReview: async (reviewId: string, expectedRevision: number, expectedSha256: string): Promise<G5CommandResult> =>
       parseG5CommandResult(await invokeG5("g5_review_approve", {
         review_id: reviewId,
@@ -251,6 +254,10 @@ export function parseG5CommandResult(value: string): G5CommandResult {
   if (record.review_grant !== undefined) {
     if (record.review_grant !== true) throw new Error("Concessão de revisão inválida.");
     result.review_grant = true;
+  }
+  if (record.queued !== undefined) {
+    if (typeof record.queued !== "boolean") throw new Error("Rascunho de revisão inválido.");
+    result.queued = record.queued;
   }
   if (record.approved !== undefined) {
     if (record.approved !== true) throw new Error("Aprovação inválida.");

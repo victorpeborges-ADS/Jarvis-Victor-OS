@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import re
 from datetime import datetime, timedelta, timezone
 from urllib.parse import quote, unquote_to_bytes
@@ -46,6 +47,7 @@ EXPECTED_FIELDS = {
     "/v1/app/connectors/status": ("session_token",),
     "/v1/app/grants/mission-review": ("session_token", "csrf_token", "domain_id", "confirm"),
     "/v1/app/reviews/pending": ("session_token", "domain_id"),
+    "/v1/app/reviews/draft": ("session_token", "csrf_token", "confirm"),
     "/v1/app/reviews/approve": (
         "session_token",
         "csrf_token",
@@ -413,6 +415,53 @@ async def list_native_pending_reviews(request: Request) -> PlainTextResponse:
     except PermissionError:
         return _error("grant_required")
     except MissionCorrupt:
+        return _error("operation_failed")
+
+
+@router.post("/v1/app/reviews/draft")
+async def queue_native_review_draft(request: Request) -> PlainTextResponse:
+    try:
+        fields = await _read_fields(request, EXPECTED_FIELDS[request.url.path])
+        session = _native_session(fields["session_token"], fields["csrf_token"], mutation=True)
+        if fields["confirm"] != "draft-local":
+            return _error("scope_invalid")
+        with mission_review_confirmed(session.principal, NATIVE_DOMAIN, session.token):
+            repo = MissionRepository(request.app.state.memory_store)
+            page = repo.list_reviews(session.principal, NATIVE_DOMAIN, "pending", 1, None, frozenset({NATIVE_DOMAIN}))
+            if page["corrupt"]:
+                return _error("operation_failed")
+            if page["items"]:
+                return _success(queued="false")
+            record, _replayed = repo.create(
+                session.principal,
+                "Rascunho sintético local",
+                NATIVE_DOMAIN,
+                "draft-local-fixed",
+            )
+            mission = record["mission"]
+            now = mission["created_at"]
+            artifact = repo._draft_artifact(
+                mission,
+                now,
+                "report",
+                "Rascunho sintético local",
+                "Rascunho determinístico aguardando revisão humana. Nenhuma aprovação foi marcada.",
+            )
+            mission["artifacts"].append(artifact)
+            with request.app.state.memory_store.transaction() as connection:
+                repo._sync_artifact_review(connection, mission, session.principal, artifact, now)
+                connection.execute(
+                    "UPDATE missions SET document_json=?, updated_at=? WHERE id=? AND owner=?",
+                    (json.dumps(mission, ensure_ascii=False), now, mission["id"], session.principal),
+                )
+        return _success(queued="true")
+    except (ValueError, UnicodeError, ValidationError):
+        return _error("scope_invalid")
+    except HTTPException as exc:
+        return _error_for(exc)
+    except PermissionError:
+        return _error("grant_required")
+    except (MissionConflict, MissionCorrupt, MissionRejected):
         return _error("operation_failed")
 
 

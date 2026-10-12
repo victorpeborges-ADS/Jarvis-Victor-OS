@@ -1333,6 +1333,58 @@ impl RuntimeManager {
         result
     }
 
+    fn g5_review_draft(&self) -> String {
+        let _operation = self
+            .g5_operation
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let (instance_id, transport, token, csrf_token) = match self.g5_credentials_for_active() {
+            Ok(value) => value,
+            Err(error) => return g5_error_json(error),
+        };
+        let body = SecretBytes::new(encode_application_fields(&[
+            ("session_token", token.as_str()),
+            ("csrf_token", csrf_token.as_str()),
+            ("confirm", "draft-local"),
+        ]));
+        let response = match transport.call_g5_application("/v1/app/reviews/draft", body.as_slice())
+        {
+            Ok(value) => SecretBytes::new(value),
+            Err(_) => return g5_error_json("transport_failure"),
+        };
+        let fields = match parse_application_response(response.as_slice()) {
+            Ok(value) => value,
+            Err(()) => return g5_error_json("protocol_failure"),
+        };
+        if let Some(error) = app_response_error(&fields) {
+            clear_cached_authorization_after_rejection(
+                &self.shared,
+                &instance_id,
+                &transport,
+                token.as_str(),
+                error,
+            );
+            return g5_error_json(error);
+        }
+        if !app_fields_match(&fields, &["ok", "queued"])
+            || app_field(&fields, "ok") != Some("true")
+            || !matches!(app_field(&fields, "queued"), Some("true" | "false"))
+        {
+            return g5_error_json("protocol_failure");
+        }
+        let queued = app_field(&fields, "queued") == Some("true");
+        let inner = lock_inner(&self.shared);
+        if !g5_generation_matches(&inner, &instance_id, &transport)
+            || inner
+                .g5_session
+                .as_ref()
+                .is_none_or(|session| session.token.as_str() != token.as_str())
+        {
+            return g5_error_json("stale_generation");
+        }
+        format!("{{\"ok\":true,\"queued\":{queued}}}")
+    }
+
     fn g5_review_approve(
         &self,
         review_id: String,
@@ -3972,6 +4024,11 @@ pub fn g5_review_grant_create(manager: tauri::State<'_, RuntimeManager>) -> Stri
 #[tauri::command]
 pub fn g5_reviews_pending(manager: tauri::State<'_, RuntimeManager>) -> String {
     manager.g5_reviews_pending()
+}
+
+#[tauri::command]
+pub fn g5_review_draft(manager: tauri::State<'_, RuntimeManager>) -> String {
+    manager.g5_review_draft()
 }
 
 #[tauri::command]

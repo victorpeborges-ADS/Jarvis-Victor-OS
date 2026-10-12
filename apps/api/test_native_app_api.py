@@ -564,6 +564,36 @@ def test_review_grant_requires_explicit_confirmation_and_does_not_approve(native
     assert missions == {"ok": "false", "code": "grant_required"}
 
 
+def test_explicit_draft_becomes_one_pending_review_and_can_be_approved(native_client):
+    token, csrf = login(native_client)
+    denied = fields(native_client.post("/v1/app/reviews/draft", content=body(
+        session_token=token, csrf_token=csrf, confirm="draft-local"), headers=HEADERS))
+    assert denied == {"ok": "false", "code": "grant_required"}
+    opened = fields(native_client.post("/v1/app/grants/mission-review", content=body(
+        session_token=token, csrf_token=csrf, domain_id="dom_synthetic_a", confirm="review-local"), headers=HEADERS))
+    assert opened["ok"] == "true"
+    wrong = fields(native_client.post("/v1/app/reviews/draft", content=body(
+        session_token=token, csrf_token=csrf, confirm="no"), headers=HEADERS))
+    assert wrong == {"ok": "false", "code": "scope_invalid"}
+    queued = fields(native_client.post("/v1/app/reviews/draft", content=body(
+        session_token=token, csrf_token=csrf, confirm="draft-local"), headers=HEADERS))
+    assert queued == {"ok": "true", "queued": "true"}
+    again = fields(native_client.post("/v1/app/reviews/draft", content=body(
+        session_token=token, csrf_token=csrf, confirm="draft-local"), headers=HEADERS))
+    assert again == {"ok": "true", "queued": "false"}
+    pending = fields(native_client.post("/v1/app/reviews/pending", content=body(
+        session_token=token, domain_id="dom_synthetic_a"), headers=HEADERS))
+    assert pending["count"] == "1" and pending["title"] == "Rascunho sintético local"
+    approved = fields(native_client.post("/v1/app/reviews/approve", content=body(
+        session_token=token, csrf_token=csrf, review_id=pending["review_id"],
+        expected_revision=pending["revision"], expected_sha=pending["sha256"],
+        idempotency_key="approve-draft-local", confirm="approve-local"), headers=HEADERS))
+    assert approved == {"ok": "true", "approved": "true", "replayed": "false"}
+    empty = fields(native_client.post("/v1/app/reviews/pending", content=body(
+        session_token=token, domain_id="dom_synthetic_a"), headers=HEADERS))
+    assert empty == {"ok": "true", "count": "0"}
+
+
 def test_epoch_microseconds_preserves_datetime_precision_without_float_rounding():
     from datetime import timezone
     from native_app_api import _epoch_microseconds
