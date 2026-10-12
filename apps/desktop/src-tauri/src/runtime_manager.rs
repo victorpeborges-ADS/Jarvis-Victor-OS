@@ -1425,10 +1425,13 @@ impl RuntimeManager {
             let revision = app_field(&fields, "revision").unwrap_or_default();
             let sha = app_field(&fields, "sha256").unwrap_or_default();
             let title = app_field(&fields, "title").unwrap_or_default();
-            if review_id.len() < 8
-                || revision.parse::<u64>().is_err()
-                || sha.len() != 64
-                || title.is_empty()
+            let Ok(revision_number) = revision.parse::<u64>() else {
+                return g5_error_json("protocol_failure");
+            };
+            if !is_review_identifier(review_id)
+                || revision_number == 0
+                || !is_lower_hex_sha256(sha)
+                || !is_safe_review_title(title)
             {
                 return g5_error_json("protocol_failure");
             }
@@ -1504,31 +1507,113 @@ impl RuntimeManager {
         format!("{{\"ok\":true,\"queued\":{queued}}}")
     }
 
+    fn g5_review_detail(&self, review_id: String, revision: u64, sha256: String) -> String {
+        let _operation = self
+            .g5_operation
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if !is_review_identifier(&review_id) || revision == 0 || !is_lower_hex_sha256(&sha256) {
+            return g5_error_json("scope_invalid");
+        }
+        let (instance_id, transport, token, _csrf) = match self.g5_credentials_for_active() {
+            Ok(value) => value,
+            Err(error) => return g5_error_json(error),
+        };
+        let revision_text = revision.to_string();
+        let body = SecretBytes::new(encode_application_fields(&[
+            ("session_token", token.as_str()),
+            ("domain_id", "dom_synthetic_a"),
+            ("review_id", review_id.as_str()),
+            ("expected_revision", revision_text.as_str()),
+            ("expected_sha256", sha256.as_str()),
+        ]));
+        let response =
+            match transport.call_g5_application("/v1/app/reviews/detail", body.as_slice()) {
+                Ok(value) => SecretBytes::new(value),
+                Err(_) => return g5_error_json("transport_failure"),
+            };
+        let fields = match parse_application_response(response.as_slice()) {
+            Ok(value) => value,
+            Err(()) => return g5_error_json("protocol_failure"),
+        };
+        if let Some(error) = app_response_error(&fields) {
+            clear_cached_authorization_after_rejection(
+                &self.shared,
+                &instance_id,
+                &transport,
+                token.as_str(),
+                error,
+            );
+            return g5_error_json(error);
+        }
+        if !app_fields_match(
+            &fields,
+            &["ok", "review_id", "revision", "sha256", "title", "content"],
+        ) || app_field(&fields, "ok") != Some("true")
+            || app_field(&fields, "review_id") != Some(review_id.as_str())
+            || app_field(&fields, "revision") != Some(revision_text.as_str())
+            || app_field(&fields, "sha256") != Some(sha256.as_str())
+        {
+            return g5_error_json("protocol_failure");
+        }
+        let title = app_field(&fields, "title").unwrap_or_default();
+        let content = app_field(&fields, "content").unwrap_or_default();
+        if !is_safe_review_title(title) || !is_safe_review_content(content) {
+            return g5_error_json("protocol_failure");
+        }
+        let result = format!(
+            "{{\"ok\":true,\"review_detail\":{{\"id\":{},\"revision\":{},\"sha256\":{},\"title\":{},\"content\":{}}}}}",
+            json_string(&review_id),
+            revision,
+            json_string(&sha256),
+            json_string(title),
+            json_string(content),
+        );
+        let inner = lock_inner(&self.shared);
+        if !g5_generation_matches(&inner, &instance_id, &transport)
+            || inner
+                .g5_session
+                .as_ref()
+                .is_none_or(|session| session.token.as_str() != token.as_str())
+        {
+            return g5_error_json("stale_generation");
+        }
+        result
+    }
+
     fn g5_review_approve(
         &self,
         review_id: String,
-        expected_revision: u64,
-        expected_sha256: String,
+        revision: u64,
+        sha256: String,
+        confirmed: bool,
     ) -> String {
         let _operation = self
             .g5_operation
             .lock()
             .unwrap_or_else(|error| error.into_inner());
-        if !closed_review_target(&review_id, expected_revision, &expected_sha256) {
+        if !confirmed
+            || !is_review_identifier(&review_id)
+            || revision == 0
+            || !is_lower_hex_sha256(&sha256)
+        {
             return g5_error_json("scope_invalid");
         }
-        let (instance_id, transport, token, csrf_token) = match self.g5_credentials_for_active() {
+        let idempotency_key = format!("desktop-{review_id}-{revision}");
+        if idempotency_key.len() > 160 {
+            return g5_error_json("scope_invalid");
+        }
+        let (instance_id, transport, token, csrf) = match self.g5_credentials_for_active() {
             Ok(value) => value,
             Err(error) => return g5_error_json(error),
         };
-        let idempotency_key = local_approve_key();
-        let revision = expected_revision.to_string();
+        let revision_text = revision.to_string();
         let body = SecretBytes::new(encode_application_fields(&[
             ("session_token", token.as_str()),
-            ("csrf_token", csrf_token.as_str()),
+            ("csrf_token", csrf.as_str()),
             ("review_id", review_id.as_str()),
-            ("expected_revision", revision.as_str()),
-            ("expected_sha", expected_sha256.as_str()),
+            ("expected_revision", revision_text.as_str()),
+            ("expected_sha256", sha256.as_str()),
             ("idempotency_key", idempotency_key.as_str()),
             ("confirm", "approve-local"),
         ]));
@@ -2136,6 +2221,26 @@ impl Drop for ProductionSupervisorTestCleanup {
     }
 }
 
+#[cfg(feature = "mac003-production-supervisor-test")]
+fn integration_json_string<'a>(value: &'a str, name: &str) -> Option<&'a str> {
+    let marker = format!("\"{name}\":\"");
+    let start = value.find(&marker)? + marker.len();
+    let rest = &value[start..];
+    let end = rest.find('"')?;
+    Some(&rest[..end])
+}
+
+#[cfg(feature = "mac003-production-supervisor-test")]
+fn integration_json_u64(value: &str, name: &str) -> Option<u64> {
+    let marker = format!("\"{name}\":");
+    let start = value.find(&marker)? + marker.len();
+    let digits: String = value[start..]
+        .chars()
+        .take_while(|character| character.is_ascii_digit())
+        .collect();
+    digits.parse().ok()
+}
+
 /// Integration entrypoint compiled into the library dependency without `cfg(test)`.
 /// The manager therefore selects the same Python/serve.py launcher as the Tauri release build.
 #[cfg(feature = "mac003-production-supervisor-test")]
@@ -2173,9 +2278,42 @@ pub fn run_production_supervisor_integration() -> Result<(), &'static str> {
     let seed = std::process::Command::new(&python)
         .arg("-B")
         .arg("-c")
-        .arg("from memory_store import SQLiteMemoryStore; from mission_repository import MissionRepository; import os; store=SQLiteMemoryStore(os.environ['JARVIS_DATABASE_PATH']); store.initialize(); MissionRepository(store).create('owner', 'MAC003 synthetic supervisor mission', 'dom_synthetic_a', 'mac003-production-supervisor-seed')")
+        .arg(
+            r#"
+import os
+from datetime import datetime, timedelta, timezone
+from fastapi.testclient import TestClient
+from main import create_app
+from server_config import LocalServerConfig
+app = create_app(LocalServerConfig(), database_path=os.environ['JARVIS_DATABASE_PATH'])
+with TestClient(app, base_url='http://127.0.0.1', client=('127.0.0.1', 50999)) as client:
+    headers = {'origin': 'http://127.0.0.1:3000'}
+    opened = client.post('/real/session', json={'passphrase': os.environ['JARVIS_LOCAL_PASSPHRASE']}, headers=headers)
+    assert opened.status_code == 201
+    csrf = opened.json()['csrf_token']
+    mutation_headers = {**headers, 'x-csrf-token': csrf}
+    grant = client.post('/real/grants', headers=mutation_headers, json={
+        'connector': 'mission_sim', 'permission': 'read', 'resource_ids': ['mission:write'],
+        'domain_ids': ['dom_synthetic_a'],
+        'expires_at': (datetime.now(timezone.utc) + timedelta(days=1)).isoformat(),
+    })
+    assert grant.status_code == 201
+    created = client.post('/real/missions', headers=mutation_headers, json={
+        'title': 'MAC003 synthetic supervisor mission', 'domain_id': 'dom_synthetic_a',
+        'idempotency_key': 'mac003-production-supervisor-seed',
+    })
+    assert created.status_code == 201
+    mission_id = created.json()['mission']['id']
+    stepped = client.post(f'/real/missions/{mission_id}/transition', headers=mutation_headers, json={
+        'action': 'run_next', 'expected_revision': 1,
+        'idempotency_key': f'mac003-production-supervisor-step-{mission_id}',
+    })
+    assert stepped.status_code == 200
+"#
+        )
         .current_dir(&api_root)
         .env_clear()
+        .env("JARVIS_LOCAL_PASSPHRASE", &passphrase)
         .env("JARVIS_DATABASE_PATH", &database)
         .env("PYTHONDONTWRITEBYTECODE", "1")
         .stdout(Stdio::null())
@@ -2260,10 +2398,62 @@ pub fn run_production_supervisor_integration() -> Result<(), &'static str> {
         }
         eprintln!("production_supervisor stage=ready_g5_grant_read_revoke PASS");
 
+        if !manager
+            .g5_review_grant_create()
+            .contains("\"review_grant\":true")
+        {
+            return Err("explicit mission:review grant creation failed");
+        }
+        let pending = manager.g5_reviews_pending();
+        let review_id = integration_json_string(&pending, "id")
+            .ok_or("G5 pending review omitted its identifier")?
+            .to_owned();
+        let review_revision = integration_json_u64(&pending, "revision")
+            .ok_or("G5 pending review omitted its revision")?;
+        let review_sha = integration_json_string(&pending, "sha256")
+            .ok_or("G5 pending review omitted its artifact digest")?
+            .to_owned();
+        let detail =
+            manager.g5_review_detail(review_id.clone(), review_revision, review_sha.clone());
+        if !detail.contains("\"review_detail\":") || !detail.contains("\"content\":") {
+            return Err("G5 review detail did not return the complete synthetic artifact");
+        }
+        if !manager
+            .g5_review_approve(
+                review_id.clone(),
+                review_revision,
+                review_sha.clone(),
+                false,
+            )
+            .contains("\"ok\":false")
+        {
+            return Err("G5 review approval did not require explicit confirmation");
+        }
+        let approved = manager.g5_review_approve(review_id, review_revision, review_sha, true);
+        if !approved.contains("\"approved\":true")
+            || !approved.contains("\"replayed\":false")
+            || !manager.g5_reviews_pending().contains("\"reviews\":[]")
+        {
+            return Err("G5 local review decision did not approve and clear the synthetic queue");
+        }
+        eprintln!("production_supervisor stage=review_detail_explicit_approval PASS");
+
+        let draft = manager.g5_review_draft();
+        if !draft.contains("\"queued\":true") {
+            return Err(
+                "explicit synthetic review draft did not traverse the production UDS route",
+            );
+        }
+        let draft_pending = manager.g5_reviews_pending();
+        if !draft_pending.contains("Rascunho sintético local") {
+            return Err("production UDS draft was not visible in the pending G5 queue");
+        }
+        eprintln!("production_supervisor stage=explicit_synthetic_draft_over_uds PASS");
+
         let direct_probe = run_same_uid_uds_probe(&python, first_session.directory_path())?;
         eprintln!("same_uid_uds_probe={direct_probe}");
         if direct_probe.trim_end()
-            != "health=200;version=200;proof=200;open=404;close=404;grant=404;revoke=404;read=404"
+            != "health=200;version=200;proof=200;open=404;close=404;grant=404;revoke=404;read=404;review_draft=404;review_detail=404;review_approve=404"
         {
             return Err("same-UID direct UDS probe crossed an unexpected authorization boundary");
         }
@@ -2572,7 +2762,13 @@ try:
     revoked = request("POST", "/v1/app/grants/mission-read/revoke", b"session_token=fake-session\ncsrf_token=fake-csrf\ngrant_id=fake-grant\n")
     stage = "read"
     listed = request("POST", "/v1/app/missions/list", b"session_token=fake-session\ndomain_id=dom_synthetic_a\n")
-    print(f"health={health};version={version};proof={proof};open={opened};close={closed};grant={granted};revoke={revoked};read={listed}")
+    stage = "review_draft"
+    drafted = request("POST", "/v1/app/reviews/draft", b"session_token=fake-session\ncsrf_token=fake-csrf\nconfirm=draft-local\n")
+    stage = "review_detail"
+    detail = request("POST", "/v1/app/reviews/detail", b"session_token=fake-session\ndomain_id=dom_synthetic_a\nreview_id=review_12345678\nexpected_revision=1\nexpected_sha256=" + b"a" * 64 + b"\n")
+    stage = "review_approve"
+    approved = request("POST", "/v1/app/reviews/approve", b"session_token=fake-session\ncsrf_token=fake-csrf\nreview_id=review_12345678\nexpected_revision=1\nexpected_sha256=" + b"a" * 64 + b"\nidempotency_key=desktop-review_12345678-1\nconfirm=approve-local\n")
+    print(f"health={health};version={version};proof={proof};open={opened};close={closed};grant={granted};revoke={revoked};read={listed};review_draft={drafted};review_detail={detail};review_approve={approved}")
 except Exception as exc:
     print("probe_error=" + type(exc).__name__ + ";stage=" + stage + ";step=" + probe_step)
     raise SystemExit(2)
@@ -3393,26 +3589,6 @@ fn parse_rfc3339_micros(value: &str) -> Option<u64> {
         .checked_add(u64::from(micros))
 }
 
-fn closed_review_target(review_id: &str, revision: u64, sha: &str) -> bool {
-    (8..=128).contains(&review_id.len())
-        && review_id
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
-        && revision >= 1
-        && sha.len() == 64
-        && sha
-            .bytes()
-            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
-}
-
-fn local_approve_key() -> String {
-    format!(
-        "localapprove{:x}{:x}",
-        unix_time_microseconds(),
-        std::process::id()
-    )
-}
-
 fn parse_capture_items(raw: &str, count: usize) -> Option<Vec<(String, String, String)>> {
     if count == 0 {
         return if raw.is_empty() {
@@ -3565,10 +3741,13 @@ fn parse_application_response(body: &[u8]) -> Result<Vec<(String, SecretText)>, 
             return Err(());
         }
         let (name, encoded) = line.split_once('=').ok_or(())?;
-        if name.is_empty()
+        if !name
+            .bytes()
+            .next()
+            .is_some_and(|byte| byte.is_ascii_lowercase())
             || !name
                 .bytes()
-                .all(|byte| byte.is_ascii_lowercase() || byte == b'_')
+                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
             || parsed.iter().any(|(existing, _)| existing == name)
         {
             return Err(());
@@ -3670,6 +3849,32 @@ fn is_hex_identifier(value: &str) -> bool {
         && value
             .bytes()
             .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+}
+
+fn is_review_identifier(value: &str) -> bool {
+    (8..=128).contains(&value.len())
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+}
+
+fn is_lower_hex_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn is_safe_review_title(value: &str) -> bool {
+    !value.is_empty() && value.chars().count() <= 80 && !value.chars().any(char::is_control)
+}
+
+fn is_safe_review_content(value: &str) -> bool {
+    !value.is_empty()
+        && value.chars().count() <= 2048
+        && !value
+            .chars()
+            .any(|character| character.is_control() && !matches!(character, '\n' | '\t'))
 }
 
 fn is_safe_mission_status(value: &str) -> bool {
@@ -4165,13 +4370,24 @@ pub fn g5_review_draft(manager: tauri::State<'_, RuntimeManager>) -> String {
 }
 
 #[tauri::command]
+pub fn g5_review_detail(
+    manager: tauri::State<'_, RuntimeManager>,
+    review_id: String,
+    revision: u64,
+    sha256: String,
+) -> String {
+    manager.g5_review_detail(review_id, revision, sha256)
+}
+
+#[tauri::command]
 pub fn g5_review_approve(
     manager: tauri::State<'_, RuntimeManager>,
     review_id: String,
-    expected_revision: u64,
-    expected_sha256: String,
+    revision: u64,
+    sha256: String,
+    confirmed: bool,
 ) -> String {
-    manager.g5_review_approve(review_id, expected_revision, expected_sha256)
+    manager.g5_review_approve(review_id, revision, sha256, confirmed)
 }
 
 #[tauri::command]
@@ -4292,6 +4508,12 @@ mod tests {
             parse_application_response(b"ok=true\ntitle=Miss%C3%A3o%20sint%C3%A9tica\n").unwrap();
         assert!(app_fields_match(&fields, &["ok", "title"]));
         assert_eq!(app_field(&fields, "title"), Some("Missão sintética"));
+        let digest_fields = parse_application_response(
+            b"ok=true\nsha256=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n",
+        )
+        .unwrap();
+        assert!(app_fields_match(&digest_fields, &["ok", "sha256"]));
+        assert!(parse_application_response(b"9bad=value\n").is_err());
         assert!(parse_application_response(b"ok=true\nok=false\n").is_err());
         assert!(parse_application_response(b"title=%c3%a3\n").is_err());
         assert!(parse_application_response(b"title=bad+space\n").is_err());
@@ -5469,10 +5691,7 @@ mod tests {
 
 #[cfg(test)]
 mod local_use_tests {
-    use super::{
-        closed_review_target, expiry_matches, local_approve_key, parse_capture_items,
-        parse_rfc3339_micros, resolve_api_root,
-    };
+    use super::{expiry_matches, parse_capture_items, parse_rfc3339_micros, resolve_api_root};
     use std::fs;
 
     #[test]
@@ -5498,22 +5717,5 @@ mod local_use_tests {
         fs::write(root.join("serve.py"), b"# synthetic\n").unwrap();
         assert!(resolve_api_root(&root).unwrap().join("serve.py").is_file());
         let _ = fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn review_approval_rejects_open_targets_and_keeps_its_key_local() {
-        let sha = "a".repeat(64);
-        assert!(closed_review_target("review_local_01", 1, &sha));
-        assert!(!closed_review_target(
-            "https://example.invalid/approve",
-            1,
-            &sha
-        ));
-        assert!(!closed_review_target("review_local_01", 0, &sha));
-        assert!(!closed_review_target("review_local_01", 1, "AA"));
-        let key = local_approve_key();
-        assert!(key.starts_with("localapprove"));
-        assert!(key.bytes().all(|byte| byte.is_ascii_alphanumeric()));
-        assert!((8..=160).contains(&key.len()));
     }
 }

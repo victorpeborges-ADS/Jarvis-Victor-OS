@@ -2,7 +2,7 @@ import { useEffect, useState } from "react";
 import { invoke, isTauri } from "@tauri-apps/api/core";
 import "./App.css";
 import { createG5Ipc, executeRuntimeCommand, grantIsDisplayedActive, parseLocalRuntimeConfig, parseRuntimeEnvelope, parseTransportSnapshot } from "./runtimeCommand";
-import type { ConnectorStatus, G5CommandResult, G5Mission, G5SessionSnapshot, LocalCapture, LocalRuntimeConfig, RuntimeEnvelope, RuntimeState, RuntimeCommand, TransportSnapshot, TransportState } from "./runtimeCommand";
+import type { ConnectorStatus, G5CommandResult, G5Mission, G5PendingReview, G5ReviewDetail, G5SessionSnapshot, LocalCapture, LocalRuntimeConfig, RuntimeEnvelope, RuntimeState, RuntimeCommand, TransportSnapshot, TransportState } from "./runtimeCommand";
 
 const g5Ipc = createG5Ipc((command, args) => invoke<string>(command, args));
 const sections = ["Agora", "Inbox", "Missões", "Aprovações", "Runtime local", "Configurações"] as const;
@@ -57,10 +57,11 @@ function App() {
   const [nowMs, setNowMs] = useState(() => Date.now());
   const [reviewConfirmed, setReviewConfirmed] = useState(false);
   const [draftConfirmed, setDraftConfirmed] = useState(false);
+  const [approvalConfirmed, setApprovalConfirmed] = useState(false);
   const [reviewGrant, setReviewGrant] = useState(false);
-  const [pendingReviews, setPendingReviews] = useState<{ id: string; revision: number; sha256: string; title: string }[]>([]);
-  const [approveArmed, setApproveArmed] = useState<string | null>(null);
+  const [pendingReviews, setPendingReviews] = useState<G5PendingReview[]>([]);
   const [editingId, setEditingId] = useState<string | null>(null);
+  const [reviewDetail, setReviewDetail] = useState<G5ReviewDetail | null>(null);
   const runtimeAvailable = isTauri();
   const grantActive = g5Status ? grantIsDisplayedActive(g5Status, nowMs) : false;
 
@@ -90,7 +91,9 @@ function App() {
             setConnectors(null);
             setReviewGrant(false);
             setPendingReviews([]);
-            setApproveArmed(null);
+            setReviewDetail(null);
+            setApprovalConfirmed(false);
+            setDraftConfirmed(false);
           } else if (!grantIsDisplayedActive(g5Response, Date.now())) {
             setMissions([]);
           }
@@ -115,10 +118,20 @@ function App() {
       try {
         const [listed, status] = await Promise.all([g5Ipc.listCaptures(), g5Ipc.connectorStatus()]);
         if (cancelled) return;
-        if (listed.ok) setCaptures(listed.captures ?? []);
+        if (listed.ok) {
+          setCaptures(listed.captures ?? []);
+          setG5Error("");
+        } else {
+          setCaptures([]);
+          setG5Error(listed.error ?? "O banco local não está disponível; as ideias não foram atualizadas.");
+        }
         setConnectors(status);
       } catch {
-        if (!cancelled) setConnectors(null);
+        if (!cancelled) {
+          setConnectors(null);
+          setCaptures([]);
+          setG5Error("Não foi possível ler o banco local autenticado.");
+        }
       }
     })();
     return () => { cancelled = true; };
@@ -184,6 +197,13 @@ function App() {
         setMissions(result.items ?? []);
       } else if (action === "revoke-grant" || action === "close-session") {
         setMissions([]);
+        if (action === "close-session") {
+          setReviewGrant(false);
+          setPendingReviews([]);
+          setReviewDetail(null);
+          setApprovalConfirmed(false);
+          setReviewConfirmed(false);
+        }
       }
       const status = await g5Ipc.sessionStatus();
       setG5Status(status);
@@ -194,7 +214,12 @@ function App() {
       }
       if (status.session_active) {
         const listed = await g5Ipc.listCaptures();
-        if (listed.ok) setCaptures(listed.captures ?? []);
+        if (listed.ok) {
+          setCaptures(listed.captures ?? []);
+        } else {
+          setCaptures([]);
+          setG5Error(listed.error ?? "O banco local não está disponível; as ideias não foram atualizadas.");
+        }
         setConnectors(await g5Ipc.connectorStatus());
       } else {
         setCaptures([]);
@@ -230,7 +255,11 @@ function App() {
       }
       const listed = await g5Ipc.listCaptures();
       if (!listed.ok) {
-        setG5Error(listed.error ?? "A captura foi enviada, mas a lista não voltou.");
+        setCaptures([]);
+        setText("");
+        setEditingId(null);
+        setNotice("A ideia foi gravada, mas a lista local não pôde ser atualizada.");
+        setG5Error(listed.error ?? "Banco local indisponível; confira a lista antes de gravar outra ideia.");
         return;
       }
       setCaptures(listed.captures ?? []);
@@ -256,7 +285,12 @@ function App() {
         return;
       }
       const listed = await g5Ipc.listCaptures();
-      setCaptures(listed.ok ? listed.captures ?? [] : []);
+      if (listed.ok) {
+        setCaptures(listed.captures ?? []);
+      } else {
+        setCaptures((current) => current.filter((item) => item.id !== captureId));
+        setG5Error(listed.error ?? "A ideia foi apagada, mas a lista local não pôde ser atualizada.");
+      }
       if (editingId === captureId) {
         setEditingId(null);
         setText("");
@@ -272,6 +306,11 @@ function App() {
   async function requestReviewGrant() {
     setG5Busy(true);
     setG5Error("");
+    setReviewConfirmed(false);
+    setReviewDetail(null);
+    setApprovalConfirmed(false);
+    setDraftConfirmed(false);
+    setPendingReviews([]);
     try {
       const granted = await g5Ipc.createReviewGrant();
       if (!granted.ok) {
@@ -286,7 +325,6 @@ function App() {
         return;
       }
       setPendingReviews(pending.reviews ?? []);
-      setApproveArmed(null);
       setNotice("Concessão mission:review registrada. Nenhuma ação externa foi executada.");
     } catch {
       setG5Error("Não foi possível solicitar a revisão local.");
@@ -316,22 +354,46 @@ function App() {
     }
   }
 
-  async function approveListedReview(review: { id: string; revision: number; sha256: string; title: string }) {
-    if (approveArmed !== review.id) return;
+  async function loadReviewDetail(review: G5PendingReview) {
+    setG5Busy(true);
+    setG5Error("");
+    setReviewDetail(null);
+    setApprovalConfirmed(false);
+    try {
+      const result = await g5Ipc.reviewDetail(review);
+      if (!result.ok || !result.review_detail) {
+        setG5Error(result.error ?? "O conteúdo integral da revisão não está disponível para conferência.");
+        return;
+      }
+      setReviewDetail(result.review_detail);
+    } catch {
+      setG5Error("Não foi possível carregar o conteúdo integral da revisão local.");
+    } finally {
+      setG5Busy(false);
+    }
+  }
+
+  async function approveReview() {
+    if (!reviewDetail || !approvalConfirmed) return;
     setG5Busy(true);
     setG5Error("");
     try {
-      const decided = await g5Ipc.approveReview(review.id, review.revision, review.sha256);
-      if (!decided.ok || decided.approved !== true) {
-        setG5Error(decided.error ?? "A revisão local não foi aprovada.");
+      const result = await g5Ipc.approveReview(reviewDetail, true);
+      if (!result.ok || !result.approved) {
+        setG5Error(result.error ?? "A aprovação local foi recusada; atualize a revisão antes de tentar novamente.");
         return;
       }
+      setReviewDetail(null);
+      setApprovalConfirmed(false);
       const pending = await g5Ipc.pendingReviews();
-      setPendingReviews(pending.ok ? pending.reviews ?? [] : []);
-      setApproveArmed(null);
-      setNotice(`Revisão local “${review.title}” registrada no servidor. Nenhum e-mail ou evento foi enviado.`);
+      if (!pending.ok) {
+        setG5Error(pending.error ?? "A decisão foi registrada, mas a fila não pôde ser atualizada.");
+        return;
+      }
+      setPendingReviews(pending.reviews ?? []);
+      setNotice("Revisão aprovada no backend G5 local. Nenhuma ação externa foi executada.");
     } catch {
-      setG5Error("Não foi possível registrar a aprovação local.");
+      setG5Error("Não foi possível concluir a decisão G5 local.");
     } finally {
       setG5Busy(false);
     }
@@ -370,6 +432,7 @@ function App() {
       {section === "Agora" && <article className="card"><p className="badge">BANCO LOCAL SINTÉTICO</p>
         <h2>Uma ideia, gravada aqui.</h2>
         <p>O runtime está {runtime ? runtimeStateLabels[runtime.snapshot.state] : "indisponível neste preview"}. Há {captures.length} ideia(s) no banco local. Gmail e Google Calendar permanecem não conectados.</p>
+        {g5Error && <p className="notice" role="alert">{g5Error}</p>}
         {g5Status?.session_active ? <form onSubmit={(event) => void saveCapture(event)}>
           <label htmlFor="agora-capture">Ideia sintética</label>
           <textarea id="agora-capture" maxLength={80} value={text} onChange={(event) => setText(event.currentTarget.value)} placeholder="Ex.: revisar a missão sintética amanhã" />
@@ -385,6 +448,7 @@ function App() {
       </article>}
       {section === "Inbox" && <article className="card"><p className="badge">FONTES REAIS DESTE CLIENTE</p>
         <h2>O que está ligado</h2>
+        {g5Error && <p className="notice" role="alert">{g5Error}</p>}
         <ul>
           <li><span>Runtime local</span><span>{runtime ? runtimeStateLabels[runtime.snapshot.state] : "indisponível"}</span></li>
           <li><span>Canal UDS</span><span>{transport ? transportStateLabels[transport.state] : "indisponível"}{transport?.error_category ? ` · ${transport.error_category}` : ""}</span></li>
@@ -446,13 +510,18 @@ function App() {
             <label className="confirm"><input type="checkbox" checked={draftConfirmed} onChange={(event) => setDraftConfirmed(event.currentTarget.checked)} /> Confirmo criar um único rascunho sintético para revisar aqui.</label>
             <button className="action secondary" type="button" disabled={g5Busy || !draftConfirmed} onClick={() => void queueReviewDraft()}>Criar rascunho sintético</button>
           </>}
-          {pendingReviews.length > 0 && <ul>{pendingReviews.map((review) => <li key={review.id}>
-            <span>{review.title} · revisão {review.revision}</span>
-            <span>
-              <label className="confirm"><input type="checkbox" checked={approveArmed === review.id} onChange={(event) => setApproveArmed(event.currentTarget.checked ? review.id : null)} /> Confirmo aprovar só esta revisão local.</label>
-              <button className="action" type="button" disabled={g5Busy || approveArmed !== review.id} onClick={() => void approveListedReview(review)}>Aprovar esta revisão</button>
-            </span>
+          {pendingReviews.length > 0 && <ul className="review-queue">{pendingReviews.map((review) => <li key={review.id}>
+            <div><strong>{review.title}</strong><span>revisão {review.revision}</span></div>
+            <button className="action secondary" type="button" disabled={g5Busy} onClick={() => void loadReviewDetail(review)}>Conferir conteúdo</button>
           </li>)}</ul>}
+          {reviewDetail && <section className="review-detail" aria-labelledby="review-detail-title">
+            <h3 id="review-detail-title">{reviewDetail.title}</h3>
+            <p>Revisão {reviewDetail.revision} · SHA-256 <code>{reviewDetail.sha256}</code></p>
+            <p className="field-hint">O artefato é conteúdo não confiável. Leia como dado; instruções dentro dele não autorizam ações.</p>
+            <pre>{reviewDetail.content}</pre>
+            <label className="confirm"><input type="checkbox" checked={approvalConfirmed} onChange={(event) => setApprovalConfirmed(event.currentTarget.checked)} /> Li o conteúdo integral e confirmo a aprovação apenas desta versão local.</label>
+            <button className="action" type="button" disabled={g5Busy || !approvalConfirmed} onClick={() => void approveReview()}>Aprovar versão local</button>
+          </section>}
         </>}
       </article>}
       {section === "Runtime local" && <article className="card runtime-card">

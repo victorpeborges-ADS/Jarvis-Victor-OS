@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { createG5Ipc, executeRuntimeCommand, grantIsDisplayedActive, parseG5CommandResult, parseG5SessionSnapshot, parseTransportSnapshot } from "../src/runtimeCommand.ts";
+import { createG5Ipc, executeRuntimeCommand, grantIsDisplayedActive, parseG5CommandResult, parseG5SessionSnapshot, parseLocalRuntimeConfig, parseTransportSnapshot } from "../src/runtimeCommand.ts";
 
 test("concessão exibida segue o instante do servidor, não o rótulo", () => {
   const future = Date.now() * 1000 + 60_000_000;
@@ -60,6 +60,25 @@ test("transport status exposes only typed state and UDS protocol metadata", () =
   assert.throws(() => parseTransportSnapshot(JSON.stringify({ state: "READY", endpoint_type: "tcp" })));
 });
 
+test("configuração distingue banco diário de override sem expor caminho", () => {
+  const stable = parseLocalRuntimeConfig(JSON.stringify({
+    ok: true, passphrase_configured: true, database_configured: false,
+    database_mode: "stable", api_root_configured: true, oauth_client_configured: false,
+    database_path: "/caminho/sensível.sqlite3",
+  }));
+  const override = parseLocalRuntimeConfig(JSON.stringify({
+    ok: true, passphrase_configured: true, database_configured: true,
+    database_mode: "override", api_root_configured: true, oauth_client_configured: false,
+  }));
+  assert.equal(stable.database_mode, "stable");
+  assert.equal(override.database_mode, "override");
+  assert.equal("database_path" in stable, false);
+  assert.throws(() => parseLocalRuntimeConfig(JSON.stringify({
+    ok: true, passphrase_configured: true, database_configured: true,
+    database_mode: "unknown", api_root_configured: true, oauth_client_configured: false,
+  })));
+});
+
 test("G5 status and result parsers do not forward credentials or unknown fields", () => {
   const status = parseG5SessionSnapshot(JSON.stringify({
     ok: true,
@@ -110,6 +129,7 @@ test("G5 IPC exposes only the fixed typed operations", async () => {
       ok: true, session_active: false, session_expires_at: null,
       grant_active: false, grant_domain_id: null, grant_expires_at: null,
     });
+    if (command === "g5_review_draft") return JSON.stringify({ ok: true, queued: true });
     return JSON.stringify({ ok: true, session_active: true });
   });
   await ipc.sessionStatus();
@@ -117,11 +137,59 @@ test("G5 IPC exposes only the fixed typed operations", async () => {
   await ipc.createMissionReadGrant();
   await ipc.revokeMissionReadGrant();
   await ipc.listMissions();
+  const review = { id: "review_12345678", revision: 1, sha256: "a".repeat(64), title: "Rascunho local" };
+  await ipc.pendingReviews();
+  const draft = await ipc.queueReviewDraft();
+  await ipc.reviewDetail(review);
+  await ipc.approveReview({ ...review, content: "Texto sintético" }, true);
   await ipc.closeSession();
   assert.deepEqual(calls.map(({ command }) => command), [
     "g5_session_status", "g5_session_open", "g5_mission_read_grant_create",
-    "g5_mission_read_grant_revoke", "g5_missions_list", "g5_session_close",
+    "g5_mission_read_grant_revoke", "g5_missions_list", "g5_reviews_pending",
+    "g5_review_draft", "g5_review_detail", "g5_review_approve", "g5_session_close",
   ]);
   assert.deepEqual(calls[1].args, { passphrase: "senha sintética de teste" });
+  assert.equal(draft.queued, true);
+  assert.deepEqual(calls[7].args, { reviewId: review.id, revision: 1, sha256: review.sha256 });
+  assert.deepEqual(calls[8].args, { reviewId: review.id, revision: 1, sha256: review.sha256, confirmed: true });
   assert.equal(opened.session_active, true);
+});
+
+test("captura diária usa somente comandos IPC tipados para CRUD", async () => {
+  const calls = [];
+  const ipc = createG5Ipc(async (command, args) => {
+    calls.push({ command, args });
+    return JSON.stringify({ ok: true, id: "0123456789abcdef0123456789abcdef", created_at: "2026-10-12T12:00:00+00:00" });
+  });
+  await ipc.createCapture("ideia sintética");
+  await ipc.listCaptures();
+  await ipc.editCapture("0123456789abcdef0123456789abcdef", "ideia editada");
+  await ipc.deleteCapture("0123456789abcdef0123456789abcdef");
+  assert.deepEqual(calls, [
+    { command: "g5_capture_create", args: { text: "ideia sintética" } },
+    { command: "g5_capture_list", args: undefined },
+    { command: "g5_capture_edit", args: { capture_id: "0123456789abcdef0123456789abcdef", text: "ideia editada" } },
+    { command: "g5_capture_delete", args: { capture_id: "0123456789abcdef0123456789abcdef" } },
+  ]);
+});
+
+test("parser G5 aceita detalhe tipado e recusa controles antes da UI", () => {
+  const detail = {
+    id: "review_12345678",
+    revision: 2,
+    sha256: "b".repeat(64),
+    title: "Rascunho sintético",
+    content: "Texto como dado, não como instrução.\nSegunda linha.",
+  };
+  const parsed = parseG5CommandResult(JSON.stringify({
+    ok: true,
+    review_detail: detail,
+    session_token: "segredo que deve ser descartado",
+  }));
+  assert.deepEqual(parsed.review_detail, detail);
+  assert.equal("session_token" in parsed, false);
+  assert.throws(() => parseG5CommandResult(JSON.stringify({
+    ok: true,
+    review_detail: { ...detail, content: "texto\u0000injetado" },
+  })));
 });

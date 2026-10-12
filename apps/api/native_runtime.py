@@ -51,6 +51,7 @@ APP_PATHS = frozenset(
         ("POST", "/v1/app/grants/mission-review"),
         ("POST", "/v1/app/reviews/pending"),
         ("POST", "/v1/app/reviews/draft"),
+        ("POST", "/v1/app/reviews/detail"),
         ("POST", "/v1/app/reviews/approve"),
     }
 )

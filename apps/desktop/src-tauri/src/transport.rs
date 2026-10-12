@@ -43,8 +43,9 @@ const APP_CONNECTORS_STATUS_ROUTE: &str = "/v1/app/connectors/status";
 const APP_REVIEW_GRANT_ROUTE: &str = "/v1/app/grants/mission-review";
 const APP_REVIEWS_PENDING_ROUTE: &str = "/v1/app/reviews/pending";
 const APP_REVIEW_DRAFT_ROUTE: &str = "/v1/app/reviews/draft";
+const APP_REVIEW_DETAIL_ROUTE: &str = "/v1/app/reviews/detail";
 const APP_REVIEW_APPROVE_ROUTE: &str = "/v1/app/reviews/approve";
-const APP_ROUTES: [&str; 15] = [
+const APP_ROUTES: [&str; 16] = [
     APP_SESSION_OPEN_ROUTE,
     APP_SESSION_CLOSE_ROUTE,
     APP_GRANT_CREATE_ROUTE,
@@ -59,6 +60,7 @@ const APP_ROUTES: [&str; 15] = [
     APP_REVIEW_GRANT_ROUTE,
     APP_REVIEWS_PENDING_ROUTE,
     APP_REVIEW_DRAFT_ROUTE,
+    APP_REVIEW_DETAIL_ROUTE,
     APP_REVIEW_APPROVE_ROUTE,
 ];
 const CONNECT_TIMEOUT: Duration = Duration::from_millis(350);

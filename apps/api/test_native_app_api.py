@@ -1,7 +1,8 @@
 from __future__ import annotations
 
+import sqlite3
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from urllib.parse import quote, unquote
 
 import httpx
@@ -9,7 +10,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from local_security import reset_state
-from main import create_native_app
+from main import create_app, create_native_app
 from mission_repository import MissionRepository
 from native_runtime import (
     ENVELOPE_ROUTE,
@@ -18,6 +19,7 @@ from native_runtime import (
     _open_application_envelope,
     _seal_application_envelope,
 )
+from server_config import LocalServerConfig
 
 PASSPHRASE = "senha-sintetica-mac003"
 HEADERS = {"content-type": "text/plain", "connection": "close"}
@@ -125,6 +127,51 @@ def login(client: TestClient) -> tuple[str, str]:
     assert result["ok"] == "true"
     assert int(result["expires_at_epoch_us"]) > time.time_ns() // 1000
     return result["session_token"], result["csrf_token"]
+
+
+def create_pending_review_for_native_api(client: AuthenticatedNativeTestClient) -> None:
+    origin = "http://127.0.0.1:3000"
+    api = create_app(LocalServerConfig(), database_path=client.app.state.memory_store.path)
+    with TestClient(api, base_url="http://127.0.0.1", client=("127.0.0.1", 50994)) as normal_client:
+        opened = normal_client.post(
+            "/real/session", json={"passphrase": PASSPHRASE}, headers={"origin": origin}
+        )
+        assert opened.status_code == 201, (opened.request.url.path, opened.status_code, opened.text)
+        csrf = opened.json()["csrf_token"]
+        mutation_headers = {"origin": origin, "x-csrf-token": csrf}
+        granted = normal_client.post(
+            "/real/grants",
+            headers=mutation_headers,
+            json={
+                "connector": "mission_sim",
+                "permission": "read",
+                "resource_ids": ["mission:write"],
+                "domain_ids": ["dom_synthetic_a"],
+                "expires_at": (datetime.now().astimezone() + timedelta(days=1)).isoformat(),
+            },
+        )
+        assert granted.status_code == 201, granted.text
+        created = normal_client.post(
+            "/real/missions",
+            headers=mutation_headers,
+            json={
+                "title": "Revisão sintética MAC-003",
+                "domain_id": "dom_synthetic_a",
+                "idempotency_key": "native-review-detail-create",
+            },
+        )
+        assert created.status_code == 201, created.text
+        mission_id = created.json()["mission"]["id"]
+        stepped = normal_client.post(
+            f"/real/missions/{mission_id}/transition",
+            headers=mutation_headers,
+            json={
+                "action": "run_next",
+                "expected_revision": 1,
+                "idempotency_key": f"native-review-detail-step-{mission_id}",
+            },
+        )
+        assert stepped.status_code == 200, stepped.text
 
 
 def test_native_g5_requires_explicit_session_and_grant(native_client):
@@ -523,6 +570,58 @@ def test_native_capture_persists_for_the_session_and_does_not_open_a_mission(nat
     assert after["count"] == "0"
 
 
+def test_capture_storage_failure_returns_safe_local_error(native_client, monkeypatch):
+    token, csrf = login(native_client)
+    marker = "private-temp-path-and-idea-must-not-leak"
+
+    def fail_connect():
+        raise sqlite3.OperationalError(marker)
+
+    monkeypatch.setattr(native_client.app.state.memory_store, "_connect", fail_connect)
+    response = native_client.post(
+        "/v1/app/captures/create",
+        content=body(session_token=token, csrf_token=csrf, text="ideia sintética local"),
+        headers=HEADERS,
+    )
+    assert fields(response) == {"ok": "false", "code": "operation_failed"}
+    assert marker not in response.text
+    assert "ideia sintética local" not in response.text
+
+
+def test_capture_crud_stays_off_network_and_mission_dispatch(native_client, monkeypatch):
+    import socket
+
+    import native_app_api
+
+    def forbidden(*_args, **_kwargs):
+        raise AssertionError("captura local tentou sair do fluxo SQLite")
+
+    monkeypatch.setattr(socket.socket, "connect", forbidden)
+    monkeypatch.setattr(socket, "create_connection", forbidden)
+    monkeypatch.setattr(native_app_api, "public_status", forbidden)
+    monkeypatch.setattr(native_app_api, "MissionRepository", forbidden)
+    token, csrf = login(native_client)
+    saved = fields(native_client.post(
+        "/v1/app/captures/create",
+        content=body(session_token=token, csrf_token=csrf, text="somente local"),
+        headers=HEADERS,
+    ))
+    assert saved["ok"] == "true"
+    assert fields(native_client.post(
+        "/v1/app/captures/list", content=body(session_token=token), headers=HEADERS
+    ))["count"] == "1"
+    assert fields(native_client.post(
+        "/v1/app/captures/edit",
+        content=body(session_token=token, csrf_token=csrf, capture_id=saved["id"], text="editada local"),
+        headers=HEADERS,
+    ))["ok"] == "true"
+    assert fields(native_client.post(
+        "/v1/app/captures/delete",
+        content=body(session_token=token, csrf_token=csrf, capture_id=saved["id"]),
+        headers=HEADERS,
+    ))["deleted"] == "true"
+
+
 def test_connector_status_stays_disconnected_without_printing_client_id(native_client, monkeypatch):
     token, _csrf = login(native_client)
     monkeypatch.delenv("JARVIS_GOOGLE_OAUTH_CLIENT_ID", raising=False)
@@ -564,12 +663,124 @@ def test_review_grant_requires_explicit_confirmation_and_does_not_approve(native
     assert pending == {"ok": "true", "count": "0"}
     denied = fields(native_client.post("/v1/app/reviews/approve", content=body(
         session_token=token, csrf_token=csrf, review_id="review_missing_local",
-        expected_revision="1", expected_sha="a" * 64, idempotency_key="approve-local-1",
+        expected_revision="1", expected_sha256="a" * 64, idempotency_key="approve-local-1",
         confirm="approve-local"), headers=HEADERS))
-    assert denied == {"ok": "false", "code": "operation_failed"}
+    assert denied["ok"] == "false"
+    assert denied["code"] in {"operation_failed", "scope_invalid"}
     missions = fields(native_client.post("/v1/app/missions/list", content=body(
         session_token=token, domain_id="dom_synthetic_a"), headers=HEADERS))
     assert missions == {"ok": "false", "code": "grant_required"}
+
+
+def test_native_review_detail_and_approval_are_bound_to_pending_snapshot(native_client):
+    create_pending_review_for_native_api(native_client)
+    token, csrf = login(native_client)
+    pending_without_grant = fields(native_client.post(
+        "/v1/app/reviews/pending", content=body(
+            session_token=token, domain_id="dom_synthetic_a"), headers=HEADERS))
+    assert pending_without_grant == {"ok": "false", "code": "grant_required"}
+
+    granted = fields(native_client.post("/v1/app/grants/mission-review", content=body(
+        session_token=token, csrf_token=csrf, domain_id="dom_synthetic_a", confirm="review-local"), headers=HEADERS))
+    assert granted["ok"] == "true"
+    pending = fields(native_client.post("/v1/app/reviews/pending", content=body(
+        session_token=token, domain_id="dom_synthetic_a"), headers=HEADERS))
+    assert pending["ok"] == "true" and pending["count"] == "1"
+
+    detail_fields = {
+        "session_token": token,
+        "domain_id": "dom_synthetic_a",
+        "review_id": pending["review_id"],
+        "expected_revision": pending["revision"],
+        "expected_sha256": pending["sha256"],
+    }
+    detail = fields(native_client.post(
+        "/v1/app/reviews/detail", content=body(**detail_fields), headers=HEADERS))
+    assert detail["ok"] == "true", detail
+    assert detail["review_id"] == pending["review_id"]
+    assert detail["revision"] == pending["revision"]
+    assert detail["sha256"] == pending["sha256"]
+    assert detail["title"]
+    stored = MissionRepository(native_client.app.state.memory_store).get_review("owner", pending["review_id"])
+    assert stored is not None
+    assert detail["title"] == stored["artifact"]["title"]
+    assert detail["content"] == stored["artifact"]["content"]
+    assert token not in "".join(detail.values())
+    assert csrf not in "".join(detail.values())
+
+    stale_revision = fields(native_client.post(
+        "/v1/app/reviews/detail", content=body(**{**detail_fields, "expected_revision": "2"}), headers=HEADERS))
+    assert stale_revision == {"ok": "false", "code": "operation_failed"}
+    stale_sha = fields(native_client.post(
+        "/v1/app/reviews/detail", content=body(**{**detail_fields, "expected_sha256": "0" * 64}), headers=HEADERS))
+    assert stale_sha == {"ok": "false", "code": "operation_failed"}
+
+    denied = fields(native_client.post("/v1/app/reviews/approve", content=body(
+        session_token=token, csrf_token=csrf, review_id=pending["review_id"],
+        expected_revision=pending["revision"], expected_sha256=pending["sha256"],
+        idempotency_key=f"desktop-{pending['review_id']}-{pending['revision']}", confirm="no"), headers=HEADERS))
+    assert denied == {"ok": "false", "code": "scope_invalid"}
+    approved_body = body(
+        session_token=token,
+        csrf_token=csrf,
+        review_id=pending["review_id"],
+        expected_revision=pending["revision"],
+        expected_sha256=pending["sha256"],
+        idempotency_key=f"desktop-{pending['review_id']}-{pending['revision']}",
+        confirm="approve-local",
+    )
+    approved = fields(native_client.post("/v1/app/reviews/approve", content=approved_body, headers=HEADERS))
+    assert approved == {"ok": "true", "approved": "true", "replayed": "false"}
+    replayed = fields(native_client.post("/v1/app/reviews/approve", content=approved_body, headers=HEADERS))
+    assert replayed == {"ok": "true", "approved": "true", "replayed": "true"}
+    empty = fields(native_client.post("/v1/app/reviews/pending", content=body(
+        session_token=token, domain_id="dom_synthetic_a"), headers=HEADERS))
+    assert empty == {"ok": "true", "count": "0"}
+
+
+def test_native_review_detail_fails_closed_when_complete_content_exceeds_response_limit(native_client, monkeypatch):
+    create_pending_review_for_native_api(native_client)
+    token, csrf = login(native_client)
+    native_client.post("/v1/app/grants/mission-review", content=body(
+        session_token=token, csrf_token=csrf, domain_id="dom_synthetic_a", confirm="review-local"), headers=HEADERS)
+    pending = fields(native_client.post("/v1/app/reviews/pending", content=body(
+        session_token=token, domain_id="dom_synthetic_a"), headers=HEADERS))
+    original = MissionRepository.get_review
+
+    def oversized_content(repository, owner, review_id):
+        result = original(repository, owner, review_id)
+        result["artifact"]["content"] = "s" * 4096
+        return result
+
+    monkeypatch.setattr(MissionRepository, "get_review", oversized_content)
+    response = fields(native_client.post("/v1/app/reviews/detail", content=body(
+        session_token=token, domain_id="dom_synthetic_a", review_id=pending["review_id"],
+        expected_revision=pending["revision"], expected_sha256=pending["sha256"]), headers=HEADERS))
+    assert response == {"ok": "false", "code": "operation_failed"}
+
+
+def test_native_review_detail_withholds_quarantined_content(native_client, monkeypatch):
+    create_pending_review_for_native_api(native_client)
+    token, csrf = login(native_client)
+    native_client.post("/v1/app/grants/mission-review", content=body(
+        session_token=token, csrf_token=csrf, domain_id="dom_synthetic_a", confirm="review-local"), headers=HEADERS)
+    pending = fields(native_client.post("/v1/app/reviews/pending", content=body(
+        session_token=token, domain_id="dom_synthetic_a"), headers=HEADERS))
+    original = MissionRepository.get_review
+
+    def quarantined_content(repository, owner, review_id):
+        result = original(repository, owner, review_id)
+        result["content_withheld"] = True
+        result["classification"] = "unverified"
+        result["artifact"]["content"] = "conteúdo sintético retido"
+        return result
+
+    monkeypatch.setattr(MissionRepository, "get_review", quarantined_content)
+    response = native_client.post("/v1/app/reviews/detail", content=body(
+        session_token=token, domain_id="dom_synthetic_a", review_id=pending["review_id"],
+        expected_revision=pending["revision"], expected_sha256=pending["sha256"]), headers=HEADERS)
+    assert fields(response) == {"ok": "false", "code": "operation_failed"}
+    assert "conteúdo sintético retido" not in response.text
 
 
 def test_explicit_draft_becomes_one_pending_review_and_can_be_approved(native_client):
@@ -594,7 +805,7 @@ def test_explicit_draft_becomes_one_pending_review_and_can_be_approved(native_cl
     assert pending["count"] == "1" and pending["title"] == "Rascunho sintético local"
     approved = fields(native_client.post("/v1/app/reviews/approve", content=body(
         session_token=token, csrf_token=csrf, review_id=pending["review_id"],
-        expected_revision=pending["revision"], expected_sha=pending["sha256"],
+        expected_revision=pending["revision"], expected_sha256=pending["sha256"],
         idempotency_key="approve-draft-local", confirm="approve-local"), headers=HEADERS))
     assert approved == {"ok": "true", "approved": "true", "replayed": "false"}
     empty = fields(native_client.post("/v1/app/reviews/pending", content=body(

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import re
+import sqlite3
 from datetime import datetime, timedelta, timezone
 from urllib.parse import quote, unquote_to_bytes
 
@@ -34,6 +35,7 @@ from local_captures import (
     update_capture,
 )
 from mission_repository import MissionConflict, MissionCorrupt, MissionDenied, MissionRejected, MissionRepository
+from memory_store import MemoryStoreError
 
 router = APIRouter()
 NATIVE_DOMAIN = "dom_synthetic_a"
@@ -57,12 +59,19 @@ EXPECTED_FIELDS = {
     "/v1/app/grants/mission-review": ("session_token", "csrf_token", "domain_id", "confirm"),
     "/v1/app/reviews/pending": ("session_token", "domain_id"),
     "/v1/app/reviews/draft": ("session_token", "csrf_token", "confirm"),
+    "/v1/app/reviews/detail": (
+        "session_token",
+        "domain_id",
+        "review_id",
+        "expected_revision",
+        "expected_sha256",
+    ),
     "/v1/app/reviews/approve": (
         "session_token",
         "csrf_token",
         "review_id",
         "expected_revision",
-        "expected_sha",
+        "expected_sha256",
         "idempotency_key",
         "confirm",
     ),
@@ -98,7 +107,7 @@ async def _read_fields(request: Request, expected: tuple[str, ...]) -> dict[str,
         names: list[str] = []
         for line in lines:
             name, separator, value = line.partition("=")
-            if not separator or not re.fullmatch(r"[a-z_]+", name) or name in fields:
+            if not separator or not re.fullmatch(r"[a-z][a-z0-9_]*", name) or name in fields:
                 raise ValueError("campo inválido")
             fields[name] = _decode_value(value)
             names.append(name)
@@ -301,6 +310,8 @@ async def create_native_capture(request: Request) -> PlainTextResponse:
         return _error("capture_rejected")
     except HTTPException as exc:
         return _error_for(exc)
+    except (MemoryStoreError, OSError, sqlite3.Error):
+        return _error("operation_failed")
     return _success(id=saved["id"], created_at=saved["created_at"], domain_id=saved["domain_id"])
 
 
@@ -316,6 +327,8 @@ async def edit_native_capture(request: Request) -> PlainTextResponse:
         return _error("capture_rejected")
     except HTTPException as exc:
         return _error_for(exc)
+    except (MemoryStoreError, OSError, sqlite3.Error):
+        return _error("operation_failed")
     return _success(id=saved["id"], created_at=saved["created_at"], domain_id=saved["domain_id"])
 
 
@@ -329,6 +342,8 @@ async def delete_native_capture(request: Request) -> PlainTextResponse:
         return _error("capture_rejected")
     except HTTPException as exc:
         return _error_for(exc)
+    except (MemoryStoreError, OSError, sqlite3.Error):
+        return _error("operation_failed")
     return _success(deleted="true")
 
 
@@ -343,6 +358,8 @@ async def list_native_captures(request: Request) -> PlainTextResponse:
         return _error("capture_rejected")
     except HTTPException as exc:
         return _error_for(exc)
+    except (MemoryStoreError, OSError, sqlite3.Error):
+        return _error("operation_failed")
     return _success(count=len(items), items=payload)
 
 
@@ -356,6 +373,8 @@ async def clear_native_captures(request: Request) -> PlainTextResponse:
         return _error("capture_rejected")
     except HTTPException as exc:
         return _error_for(exc)
+    except (MemoryStoreError, OSError, sqlite3.Error):
+        return _error("operation_failed")
     return _success(cleared="true")
 
 
@@ -502,6 +521,70 @@ async def queue_native_review_draft(request: Request) -> PlainTextResponse:
         return _error("operation_failed")
 
 
+@router.post("/v1/app/reviews/detail")
+async def read_native_review_detail(request: Request) -> PlainTextResponse:
+    try:
+        fields = await _read_fields(request, EXPECTED_FIELDS[request.url.path])
+        session = _native_session(fields["session_token"])
+        if fields["domain_id"] != NATIVE_DOMAIN:
+            return _error("scope_invalid")
+        if not re.fullmatch(r"[A-Za-z0-9_-]{8,128}", fields["review_id"]):
+            return _error("scope_invalid")
+        if not re.fullmatch(r"[1-9][0-9]{0,15}", fields["expected_revision"]):
+            return _error("scope_invalid")
+        if not re.fullmatch(r"[0-9a-f]{64}", fields["expected_sha256"]):
+            return _error("scope_invalid")
+        expected_revision = int(fields["expected_revision"])
+        if expected_revision > 9_007_199_254_740_991:
+            return _error("scope_invalid")
+        with mission_review_confirmed(session.principal, NATIVE_DOMAIN, session.token):
+            review = MissionRepository(request.app.state.memory_store).get_review(
+                session.principal, fields["review_id"]
+            )
+        if (
+            review is None
+            or review.get("domain_id") != NATIVE_DOMAIN
+            or review.get("state") != "pending"
+            or review.get("content_withheld") is not False
+            or review.get("classification") is not None
+            or review.get("revision") != expected_revision
+            or review.get("artifact_sha256") != fields["expected_sha256"]
+        ):
+            return _error("operation_failed")
+        artifact = review.get("artifact")
+        if not isinstance(artifact, dict):
+            return _error("operation_failed")
+        title = artifact.get("title")
+        content = artifact.get("content")
+        if (
+            not isinstance(title, str)
+            or not 1 <= len(title) <= MAX_MISSION_TITLE
+            or any(ord(character) < 32 or ord(character) == 127 for character in title)
+            or not isinstance(content, str)
+            or not content
+            or any(
+                (ord(character) < 32 and character not in "\n\t") or ord(character) == 127
+                for character in content
+            )
+        ):
+            return _error("operation_failed")
+        return _success(
+            review_id=fields["review_id"],
+            revision=expected_revision,
+            sha256=fields["expected_sha256"],
+            title=title,
+            content=content,
+        )
+    except (ValueError, UnicodeError, ValidationError):
+        return _error("scope_invalid")
+    except HTTPException as exc:
+        return _error_for(exc)
+    except (PermissionError, MissionDenied):
+        return _error("grant_required")
+    except MissionCorrupt:
+        return _error("operation_failed")
+
+
 @router.post("/v1/app/reviews/approve")
 async def approve_native_review(request: Request) -> PlainTextResponse:
     try:
@@ -509,12 +592,16 @@ async def approve_native_review(request: Request) -> PlainTextResponse:
         session = _native_session(fields["session_token"], fields["csrf_token"], mutation=True)
         if fields["confirm"] != "approve-local":
             return _error("scope_invalid")
-        if not re.fullmatch(r"[0-9a-f]{64}", fields["expected_sha"]):
+        if not re.fullmatch(r"[A-Za-z0-9_-]{8,128}", fields["review_id"]):
+            return _error("scope_invalid")
+        if not re.fullmatch(r"[0-9a-f]{64}", fields["expected_sha256"]):
             return _error("scope_invalid")
         if not 8 <= len(fields["idempotency_key"]) <= 160:
             return _error("scope_invalid")
+        if not re.fullmatch(r"[1-9][0-9]{0,15}", fields["expected_revision"]):
+            return _error("scope_invalid")
         revision = int(fields["expected_revision"])
-        if revision < 1:
+        if revision > 9_007_199_254_740_991:
             return _error("scope_invalid")
         with mission_review_confirmed(session.principal, NATIVE_DOMAIN, session.token):
             record, replayed = MissionRepository(request.app.state.memory_store).decide_review(
@@ -522,7 +609,7 @@ async def approve_native_review(request: Request) -> PlainTextResponse:
                 fields["review_id"],
                 "approved",
                 revision,
-                fields["expected_sha"],
+                fields["expected_sha256"],
                 None,
                 fields["idempotency_key"],
                 session.token,

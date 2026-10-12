@@ -33,6 +33,8 @@ export type G5SessionSnapshot = {
 };
 
 export type LocalCapture = { id: string; text: string; created_at: string };
+export type G5PendingReview = { id: string; revision: number; sha256: string; title: string };
+export type G5ReviewDetail = G5PendingReview & { content: string };
 
 export type ConnectorStatus = {
   ok: true;
@@ -72,11 +74,12 @@ export type G5CommandResult = {
   dataset?: "api_synthetic";
   items?: G5Mission[];
   captures?: LocalCapture[];
-  reviews?: { id: string; revision: number; sha256: string; title: string }[];
-  review_grant?: boolean;
-  queued?: boolean;
+  reviews?: G5PendingReview[];
+  review_detail?: G5ReviewDetail;
   approved?: boolean;
   replayed?: boolean;
+  review_grant?: boolean;
+  queued?: boolean;
   id?: string;
   created_at?: string;
   cleared?: boolean;
@@ -117,11 +120,18 @@ export function createG5Ipc(invokeG5: G5Invoke) {
       parseG5CommandResult(await invokeG5("g5_reviews_pending")),
     queueReviewDraft: async (): Promise<G5CommandResult> =>
       parseG5CommandResult(await invokeG5("g5_review_draft")),
-    approveReview: async (reviewId: string, expectedRevision: number, expectedSha256: string): Promise<G5CommandResult> =>
+    reviewDetail: async (review: G5PendingReview): Promise<G5CommandResult> =>
+      parseG5CommandResult(await invokeG5("g5_review_detail", {
+        reviewId: review.id,
+        revision: review.revision,
+        sha256: review.sha256,
+      })),
+    approveReview: async (review: G5ReviewDetail, confirmed: boolean): Promise<G5CommandResult> =>
       parseG5CommandResult(await invokeG5("g5_review_approve", {
-        review_id: reviewId,
-        expected_revision: expectedRevision,
-        expected_sha256: expectedSha256,
+        reviewId: review.id,
+        revision: review.revision,
+        sha256: review.sha256,
+        confirmed,
       })),
   };
 }
@@ -268,12 +278,34 @@ export function parseG5CommandResult(value: string): G5CommandResult {
     if (typeof record.queued !== "boolean") throw new Error("Rascunho de revisão inválido.");
     result.queued = record.queued;
   }
+  if (record.review_detail !== undefined) {
+    if (typeof record.review_detail !== "object" || record.review_detail === null) {
+      throw new Error("Detalhe de revisão inválido.");
+    }
+    const review = record.review_detail as Record<string, unknown>;
+    if (typeof review.id !== "string" || !/^[A-Za-z0-9_-]{8,128}$/.test(review.id) ||
+        typeof review.title !== "string" || [...review.title].length < 1 || [...review.title].length > 80 ||
+        /[\u0000-\u001f\u007f]/.test(review.title) ||
+        typeof review.sha256 !== "string" || !/^[0-9a-f]{64}$/.test(review.sha256) ||
+        typeof review.revision !== "number" || !Number.isSafeInteger(review.revision) || review.revision < 1 ||
+        typeof review.content !== "string" || review.content.length === 0 || [...review.content].length > 2048 ||
+        /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/.test(review.content)) {
+      throw new Error("Detalhe de revisão inválido.");
+    }
+    result.review_detail = {
+      id: review.id,
+      revision: review.revision,
+      sha256: review.sha256,
+      title: review.title,
+      content: review.content,
+    };
+  }
   if (record.approved !== undefined) {
-    if (record.approved !== true) throw new Error("Aprovação inválida.");
+    if (record.approved !== true) throw new Error("Decisão de revisão inválida.");
     result.approved = true;
   }
   if (record.replayed !== undefined) {
-    if (typeof record.replayed !== "boolean") throw new Error("Aprovação inválida.");
+    if (typeof record.replayed !== "boolean") throw new Error("Repetição de revisão inválida.");
     result.replayed = record.replayed;
   }
   if (record.reviews !== undefined) {
@@ -281,9 +313,11 @@ export function parseG5CommandResult(value: string): G5CommandResult {
     result.reviews = record.reviews.map((item) => {
       if (typeof item !== "object" || item === null) throw new Error("Revisão inválida.");
       const review = item as Record<string, unknown>;
-      if (typeof review.id !== "string" || typeof review.title !== "string" ||
+      if (typeof review.id !== "string" || !/^[A-Za-z0-9_-]{8,128}$/.test(review.id) ||
+          typeof review.title !== "string" || [...review.title].length < 1 || [...review.title].length > 80 ||
+          /[\u0000-\u001f\u007f]/.test(review.title) ||
           typeof review.sha256 !== "string" || !/^[0-9a-f]{64}$/.test(review.sha256) ||
-          typeof review.revision !== "number" || !Number.isSafeInteger(review.revision)) {
+          typeof review.revision !== "number" || !Number.isSafeInteger(review.revision) || review.revision < 1) {
         throw new Error("Revisão inválida.");
       }
       return { id: review.id, revision: review.revision, sha256: review.sha256, title: review.title };
