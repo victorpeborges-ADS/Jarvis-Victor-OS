@@ -69,3 +69,25 @@ Validação executada nesta composição:
 - Nenhuma suíte selecionada foi ignorada; os 93 filtros acima são casos fora dos dois testes focados de biblioteca.
 
 O build nativo Tauri compilou, mas não foi iniciado e nenhuma janela foi observada. Antes de chamar a tela pronta, o proprietário deve abrir o app com banco sintético temporário, consentir com mission:review em dom_synthetic_a, criar o rascunho único, conferir texto/revisão/SHA, aprovar explicitamente e confirmar que a fila esvaziou sem ação externa; fechar/reabrir a sessão e confirmar que a concessão não foi herdada. Registrar capturas sem passphrase, tokens ou dados de usuário. A candidata não está integrada à main.
+
+## Hardening da confirmação local — 12/10/2026
+
+Esta seção registra uma continuação isolada, sem reescrever o histórico acima. A main conferida é `21f1537e14706a42e8272f92cb4f4b6dab746640`. O SHA diário `3d3444dde9d25ab67426f1c5575063dc5652caed` informado inicialmente é anterior; a candidata diária limpa mais recente encontrada é `52917d5a5092174b35dd0d991043f61cfb71b0ec`, descendente da main e paralela à linha de `3d3444d`. Esta alteração parte de `52917d5` em `feat/jarvis-g5-approval-native-consent`; worktrees sujas da automação e do planejador permaneceram intactas.
+
+O risco confirmado era que o WebView pudesse chamar `g5_review_approve` diretamente e fornecer `confirmed: true`, contornando o checkbox React. O comando agora não recebe confirmação do renderer. Ele busca o snapshot da revisão na API G5 por rota fixa, abre um diálogo nativo com título, ID, revisão, SHA-256 e conteúdo não confiável escapado para exibição, e só após a resposta afirmativa chama a operação de aprovação Rust, que usa a rota fixa `/v1/app/reviews/approve`. O diálogo não mantém o mutex de operação enquanto aguarda; a chamada de aprovação readquire-o e o servidor revalida sessão, grant, estado pendente, revisão e hash. Cancelamento retorna `approval_cancelled` e não chama a operação de aprovação. Não há efeito externo.
+
+`tauri-plugin-dialog` foi adicionado como dependência direta para obter confirmação do sistema fora do WebView; a decisão continua persistida pelo backend G5. O diálogo é mostrado fora da thread principal via `spawn_blocking`. Não foi feito smoke manual da janela nesta implementação, nem integração, push, tag ou deploy. Os resultados dos testes desta candidata e eventuais limitações serão registrados antes da revisão.
+
+Validação desta candidata:
+
+- `cargo test --locked --lib native_review` — PASS, 2 testes aprovados, 94 filtrados. Cobrem vínculo do prompt ao snapshot não confiável e cancelamento sem chamar a aprovação.
+- `uv run --locked --offline pytest -q test_native_app_api.py -k review` — PASS, 5 aprovados, 18 deselected; um aviso de depreciação preexistente de Starlette/httpx.
+- `cargo test --locked --features mac003-production-supervisor-test --test mac003_production_supervisor` — PASS, 1 teste de integração do supervisor/UDS de produção.
+- `node --test tests/runtimeCommand.test.mjs` — PASS, 9 testes.
+- `npm ci --ignore-scripts --offline` — PASS, 27 pacotes locais e 0 vulnerabilidades reportadas; `npm run build` — PASS (TypeScript e Vite). `package-lock.json` não foi alterado.
+- `cargo build --release --locked --manifest-path src-tauri/Cargo.toml` — PASS, compilação Release do executável Tauri (`target/release/desktop`), 20 crates compilados em 3m12s. O binário foi compilado, não iniciado.
+- `cargo fmt --all -- --check` e `git diff --check` — PASS no estado final da candidata.
+
+Falhas intermediárias corrigidas: os primeiros testes Rust encontraram incompatibilidades de tipos na API assíncrona Tauri e no vínculo de referências de estado; o fluxo foi ajustado e os testes focados passaram. O primeiro teste de cancelamento esperava um campo JSON que o contrato de erros não expõe; foi substituído por uma mensagem genérica e fixa, sem detalhes sensíveis. A primeira resolução da dependência tentou atualizar a família Tauri; o lock foi ajustado para manter as versões já usadas pelo projeto e acrescentar somente `tauri-plugin-dialog` 2.7.3 e dependências transitivas necessárias. Quatro tentativas de `npm run tauri -- build --no-bundle` (duas com `--verbose`) não produziram saída/artefato observável; foram interrompidas sem deixar processo ativo. A compilação Release direta por Cargo acima concluiu com sucesso.
+
+Limite de evidência: não foi aberto o binário nem observado o diálogo nativo em uma janela real. Os testes provam que o comando IPC não aceita `confirmed` e que o caminho de cancelamento não chama a aprovação, mas não verificam visualmente o sistema de diálogo nem sua interação no macOS. Smoke manual do proprietário continua necessário antes de considerar a jornada visual confirmada. Não houve chamada a Google, provider remoto ou efeito externo.

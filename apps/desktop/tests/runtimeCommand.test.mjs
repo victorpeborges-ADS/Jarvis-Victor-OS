@@ -141,7 +141,7 @@ test("G5 IPC exposes only the fixed typed operations", async () => {
   await ipc.pendingReviews();
   const draft = await ipc.queueReviewDraft();
   await ipc.reviewDetail(review);
-  await ipc.approveReview({ ...review, content: "Texto sintético" }, true);
+  await ipc.approveReview({ ...review, content: "Texto sintético" });
   await ipc.closeSession();
   assert.deepEqual(calls.map(({ command }) => command), [
     "g5_session_status", "g5_session_open", "g5_mission_read_grant_create",
@@ -151,7 +151,7 @@ test("G5 IPC exposes only the fixed typed operations", async () => {
   assert.deepEqual(calls[1].args, { passphrase: "senha sintética de teste" });
   assert.equal(draft.queued, true);
   assert.deepEqual(calls[7].args, { reviewId: review.id, revision: 1, sha256: review.sha256 });
-  assert.deepEqual(calls[8].args, { reviewId: review.id, revision: 1, sha256: review.sha256, confirmed: true });
+  assert.deepEqual(calls[8].args, { reviewId: review.id, revision: 1, sha256: review.sha256 });
   assert.equal(opened.session_active, true);
 });
 

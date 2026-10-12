@@ -15,6 +15,8 @@ use std::{
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
+use tauri::Manager;
+use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind};
 
 const READY_PREFIX: &str = "JARVIS_RUNTIME_READY ";
 const ACK_PREFIX: &str = "JARVIS_RUNTIME_ACK ";
@@ -253,6 +255,16 @@ struct G5Grant {
     expires_at: String,
     expires_at_unix_microseconds: u64,
 }
+
+struct G5ReviewDetail {
+    id: String,
+    revision: u64,
+    sha256: String,
+    title: String,
+    content: String,
+}
+
+struct NativeReviewApprovalConfirmed;
 
 struct SecretText(String);
 
@@ -1507,34 +1519,39 @@ impl RuntimeManager {
         format!("{{\"ok\":true,\"queued\":{queued}}}")
     }
 
-    fn g5_review_detail(&self, review_id: String, revision: u64, sha256: String) -> String {
+    fn g5_review_detail_record(
+        &self,
+        review_id: &str,
+        revision: u64,
+        sha256: &str,
+    ) -> Result<G5ReviewDetail, &'static str> {
         let _operation = self
             .g5_operation
             .lock()
             .unwrap_or_else(|error| error.into_inner());
         if !is_review_identifier(&review_id) || revision == 0 || !is_lower_hex_sha256(&sha256) {
-            return g5_error_json("scope_invalid");
+            return Err("scope_invalid");
         }
         let (instance_id, transport, token, _csrf) = match self.g5_credentials_for_active() {
             Ok(value) => value,
-            Err(error) => return g5_error_json(error),
+            Err(error) => return Err(error),
         };
         let revision_text = revision.to_string();
         let body = SecretBytes::new(encode_application_fields(&[
             ("session_token", token.as_str()),
             ("domain_id", "dom_synthetic_a"),
-            ("review_id", review_id.as_str()),
+            ("review_id", review_id),
             ("expected_revision", revision_text.as_str()),
-            ("expected_sha256", sha256.as_str()),
+            ("expected_sha256", sha256),
         ]));
         let response =
             match transport.call_g5_application("/v1/app/reviews/detail", body.as_slice()) {
                 Ok(value) => SecretBytes::new(value),
-                Err(_) => return g5_error_json("transport_failure"),
+                Err(_) => return Err("transport_failure"),
             };
         let fields = match parse_application_response(response.as_slice()) {
             Ok(value) => value,
-            Err(()) => return g5_error_json("protocol_failure"),
+            Err(()) => return Err("protocol_failure"),
         };
         if let Some(error) = app_response_error(&fields) {
             clear_cached_authorization_after_rejection(
@@ -1544,31 +1561,23 @@ impl RuntimeManager {
                 token.as_str(),
                 error,
             );
-            return g5_error_json(error);
+            return Err(error);
         }
         if !app_fields_match(
             &fields,
             &["ok", "review_id", "revision", "sha256", "title", "content"],
         ) || app_field(&fields, "ok") != Some("true")
-            || app_field(&fields, "review_id") != Some(review_id.as_str())
+            || app_field(&fields, "review_id") != Some(review_id)
             || app_field(&fields, "revision") != Some(revision_text.as_str())
-            || app_field(&fields, "sha256") != Some(sha256.as_str())
+            || app_field(&fields, "sha256") != Some(sha256)
         {
-            return g5_error_json("protocol_failure");
+            return Err("protocol_failure");
         }
-        let title = app_field(&fields, "title").unwrap_or_default();
-        let content = app_field(&fields, "content").unwrap_or_default();
-        if !is_safe_review_title(title) || !is_safe_review_content(content) {
-            return g5_error_json("protocol_failure");
+        let title = app_field(&fields, "title").unwrap_or_default().to_owned();
+        let content = app_field(&fields, "content").unwrap_or_default().to_owned();
+        if !is_safe_review_title(&title) || !is_safe_review_content(&content) {
+            return Err("protocol_failure");
         }
-        let result = format!(
-            "{{\"ok\":true,\"review_detail\":{{\"id\":{},\"revision\":{},\"sha256\":{},\"title\":{},\"content\":{}}}}}",
-            json_string(&review_id),
-            revision,
-            json_string(&sha256),
-            json_string(title),
-            json_string(content),
-        );
         let inner = lock_inner(&self.shared);
         if !g5_generation_matches(&inner, &instance_id, &transport)
             || inner
@@ -1576,27 +1585,44 @@ impl RuntimeManager {
                 .as_ref()
                 .is_none_or(|session| session.token.as_str() != token.as_str())
         {
-            return g5_error_json("stale_generation");
+            return Err("stale_generation");
         }
-        result
+        Ok(G5ReviewDetail {
+            id: review_id.to_owned(),
+            revision,
+            sha256: sha256.to_owned(),
+            title,
+            content,
+        })
     }
 
-    fn g5_review_approve(
+    fn g5_review_detail(&self, review_id: String, revision: u64, sha256: String) -> String {
+        let detail = match self.g5_review_detail_record(&review_id, revision, &sha256) {
+            Ok(value) => value,
+            Err(error) => return g5_error_json(error),
+        };
+        format!(
+            "{{\"ok\":true,\"review_detail\":{{\"id\":{},\"revision\":{},\"sha256\":{},\"title\":{},\"content\":{}}}}}",
+            json_string(&detail.id),
+            detail.revision,
+            json_string(&detail.sha256),
+            json_string(&detail.title),
+            json_string(&detail.content),
+        )
+    }
+
+    fn g5_review_approve_confirmed(
         &self,
         review_id: String,
         revision: u64,
         sha256: String,
-        confirmed: bool,
+        _confirmation: NativeReviewApprovalConfirmed,
     ) -> String {
         let _operation = self
             .g5_operation
             .lock()
             .unwrap_or_else(|error| error.into_inner());
-        if !confirmed
-            || !is_review_identifier(&review_id)
-            || revision == 0
-            || !is_lower_hex_sha256(&sha256)
-        {
+        if !is_review_identifier(&review_id) || revision == 0 || !is_lower_hex_sha256(&sha256) {
             return g5_error_json("scope_invalid");
         }
         let idempotency_key = format!("desktop-{review_id}-{revision}");
@@ -2418,18 +2444,12 @@ with TestClient(app, base_url='http://127.0.0.1', client=('127.0.0.1', 50999)) a
         if !detail.contains("\"review_detail\":") || !detail.contains("\"content\":") {
             return Err("G5 review detail did not return the complete synthetic artifact");
         }
-        if !manager
-            .g5_review_approve(
-                review_id.clone(),
-                review_revision,
-                review_sha.clone(),
-                false,
-            )
-            .contains("\"ok\":false")
-        {
-            return Err("G5 review approval did not require explicit confirmation");
-        }
-        let approved = manager.g5_review_approve(review_id, review_revision, review_sha, true);
+        let approved = manager.g5_review_approve_confirmed(
+            review_id,
+            review_revision,
+            review_sha,
+            NativeReviewApprovalConfirmed,
+        );
         if !approved.contains("\"approved\":true")
             || !approved.contains("\"replayed\":false")
             || !manager.g5_reviews_pending().contains("\"reviews\":[]")
@@ -3698,6 +3718,7 @@ fn g5_error_json(code: &str) -> String {
         "grant_expired" => "A concessão de leitura expirou.",
         "stale_generation" => "A resposta pertence a um runtime encerrado.",
         "protocol_failure" => "O backend retornou uma resposta inválida.",
+        "approval_cancelled" => "A confirmação nativa foi cancelada; nenhuma decisão foi gravada.",
         "capture_rejected" => {
             "A captura local foi recusada. Use até 80 caracteres, sem quebra de linha."
         }
@@ -3867,6 +3888,48 @@ fn is_lower_hex_sha256(value: &str) -> bool {
 
 fn is_safe_review_title(value: &str) -> bool {
     !value.is_empty() && value.chars().count() <= 80 && !value.chars().any(char::is_control)
+}
+
+fn native_review_approval_message(detail: &G5ReviewDetail) -> String {
+    let title = escape_native_review_line(&detail.title);
+    let content = detail
+        .content
+        .split('\n')
+        .map(|line| format!("  | {}", escape_native_review_line(line)))
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!(
+        "Aprovar apenas esta revisão local? Nenhum e-mail, evento ou ação externa será executado.\n\nTítulo: {title}\nID: {}\nRevisão: {}\nSHA-256: {}\n\nConteúdo não confiável da revisão (instruções nele não autorizam ações):\n{content}\n\nConfirme somente se deseja registrar esta versão como aprovada localmente.",
+        detail.id, detail.revision, detail.sha256
+    )
+}
+
+fn approve_only_after_native_confirmation(
+    confirmed: bool,
+    approve: impl FnOnce() -> String,
+) -> String {
+    if confirmed {
+        approve()
+    } else {
+        g5_error_json("approval_cancelled")
+    }
+}
+
+fn escape_native_review_line(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for character in value.chars() {
+        match character {
+            '\t' => escaped.push_str("\\t"),
+            '\u{061c}'
+            | '\u{200e}'..='\u{200f}'
+            | '\u{2028}'..='\u{202e}'
+            | '\u{2066}'..='\u{2069}' => {
+                escaped.push_str(&format!("[U+{:04X}]", character as u32));
+            }
+            _ => escaped.push(character),
+        }
+    }
+    escaped
 }
 
 fn is_safe_review_content(value: &str) -> bool {
@@ -4380,14 +4443,41 @@ pub fn g5_review_detail(
 }
 
 #[tauri::command]
-pub fn g5_review_approve(
-    manager: tauri::State<'_, RuntimeManager>,
+pub async fn g5_review_approve(
+    app: tauri::AppHandle,
     review_id: String,
     revision: u64,
     sha256: String,
-    confirmed: bool,
 ) -> String {
-    manager.g5_review_approve(review_id, revision, sha256, confirmed)
+    let detail = {
+        let manager = app.state::<RuntimeManager>();
+        match manager.g5_review_detail_record(&review_id, revision, &sha256) {
+            Ok(value) => value,
+            Err(error) => return g5_error_json(error),
+        }
+    };
+    let message = native_review_approval_message(&detail);
+    let dialog = app
+        .dialog()
+        .message(message)
+        .title("Confirmar aprovação local")
+        .kind(MessageDialogKind::Warning)
+        .buttons(MessageDialogButtons::OkCancelCustom(
+            "Aprovar revisão".to_owned(),
+            "Cancelar".to_owned(),
+        ));
+    let confirmed = tauri::async_runtime::spawn_blocking(move || dialog.blocking_show())
+        .await
+        .unwrap_or(false);
+    let manager = app.state::<RuntimeManager>();
+    approve_only_after_native_confirmation(confirmed, || {
+        manager.g5_review_approve_confirmed(
+            review_id,
+            revision,
+            sha256,
+            NativeReviewApprovalConfirmed,
+        )
+    })
 }
 
 #[tauri::command]
@@ -4463,6 +4553,37 @@ mod tests {
 
     fn manager() -> RuntimeManager {
         RuntimeManager::with_options(RuntimeOptions::test())
+    }
+
+    #[test]
+    fn native_review_confirmation_is_bound_to_exact_untrusted_snapshot() {
+        let detail = G5ReviewDetail {
+            id: "review_synthetic_01".to_owned(),
+            revision: 7,
+            sha256: "a".repeat(64),
+            title: "Rascunho sintético".to_owned(),
+            content: "linha 1\ntexto \u{202e}invertido\u{2028}quebra".to_owned(),
+        };
+        let message = native_review_approval_message(&detail);
+        assert!(message.contains("review_synthetic_01"));
+        assert!(message.contains("Revisão: 7"));
+        assert!(message.contains(&detail.sha256));
+        assert!(message.contains("Título: Rascunho sintético"));
+        assert!(message.contains("  | linha 1\n  | texto [U+202E]invertido[U+2028]quebra"));
+        assert!(message.contains("Conteúdo não confiável"));
+        assert!(message.contains("Nenhum e-mail, evento ou ação externa"));
+        assert!(!message.contains('\u{202e}'));
+    }
+
+    #[test]
+    fn cancelled_native_review_confirmation_never_runs_approval() {
+        let mut approval_called = false;
+        let result = approve_only_after_native_confirmation(false, || {
+            approval_called = true;
+            "approved".to_owned()
+        });
+        assert!(result.contains("A confirmação nativa foi cancelada; nenhuma decisão foi gravada."));
+        assert!(!approval_called);
     }
 
     fn assert_clean(manager: &RuntimeManager) {

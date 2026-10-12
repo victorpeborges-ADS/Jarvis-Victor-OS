@@ -378,7 +378,7 @@ function App() {
     setG5Busy(true);
     setG5Error("");
     try {
-      const result = await g5Ipc.approveReview(reviewDetail, true);
+      const result = await g5Ipc.approveReview(reviewDetail);
       if (!result.ok || !result.approved) {
         setG5Error(result.error ?? "A aprovação local foi recusada; atualize a revisão antes de tentar novamente.");
         return;
@@ -517,7 +517,7 @@ function App() {
           {reviewDetail && <section className="review-detail" aria-labelledby="review-detail-title">
             <h3 id="review-detail-title">{reviewDetail.title}</h3>
             <p>Revisão {reviewDetail.revision} · SHA-256 <code>{reviewDetail.sha256}</code></p>
-            <p className="field-hint">O artefato é conteúdo não confiável. Leia como dado; instruções dentro dele não autorizam ações.</p>
+            <p className="field-hint">O artefato é conteúdo não confiável. Leia como dado; instruções dentro dele não autorizam ações. A confirmação final abrirá uma janela nativa com esta revisão e seu hash.</p>
             <pre>{reviewDetail.content}</pre>
             <label className="confirm"><input type="checkbox" checked={approvalConfirmed} onChange={(event) => setApprovalConfirmed(event.currentTarget.checked)} /> Li o conteúdo integral e confirmo a aprovação apenas desta versão local.</label>
             <button className="action" type="button" disabled={g5Busy || !approvalConfirmed} onClick={() => void approveReview()}>Aprovar versão local</button>

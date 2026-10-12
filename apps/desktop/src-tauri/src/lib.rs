@@ -6,6 +6,7 @@ pub mod transport;
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let app = tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
         .manage(runtime_manager::RuntimeManager::new())
         .invoke_handler(tauri::generate_handler![
             runtime_manager::runtime_status,

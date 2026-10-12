@@ -126,12 +126,11 @@ export function createG5Ipc(invokeG5: G5Invoke) {
         revision: review.revision,
         sha256: review.sha256,
       })),
-    approveReview: async (review: G5ReviewDetail, confirmed: boolean): Promise<G5CommandResult> =>
+    approveReview: async (review: G5ReviewDetail): Promise<G5CommandResult> =>
       parseG5CommandResult(await invokeG5("g5_review_approve", {
         reviewId: review.id,
         revision: review.revision,
         sha256: review.sha256,
-        confirmed,
       })),
   };
 }

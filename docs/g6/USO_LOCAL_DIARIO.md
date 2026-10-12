@@ -11,7 +11,7 @@ O aplicativo continua em UDS, protocolo 3, com HMAC antes da descriptografia. N�
 - Agora grava, edita e apaga ideias de até 80 caracteres no SQLite. Sem `JARVIS_DATABASE_PATH`, o arquivo é `~/Library/Application Support/Jarvis/memory.sqlite3`, com diretório `0700`, arquivo `0600` e sem fixtures.
 - Inbox mostra runtime, canal UDS, Gmail, Google Calendar e o calendário simulado. Os dois primeiros conectores reais ficam não conectados.
 - Missões lê só com `mission:read` explícito em `dom_synthetic_a`.
-- Aprovações pede `mission:review` somente depois da confirmação `review-local`. Se a fila estiver vazia, uma confirmação separada permite criar um único rascunho sintético local. “Conferir conteúdo” busca o snapshot completo pela revisão e SHA esperadas; conteúdo retido, divergente ou grande demais é recusado sem truncamento. A aprovação exige uma segunda confirmação após ler o conteúdo e o backend G5 registra a decisão com controle de revisão e idempotência. É uma decisão local: não envia e-mail nem altera calendário.
+- Aprovações pede `mission:review` somente depois da confirmação `review-local`. Se a fila estiver vazia, uma confirmação separada permite criar um único rascunho sintético local. “Conferir conteúdo” busca o snapshot completo pela revisão e SHA esperadas; conteúdo retido, divergente ou grande demais é recusado sem truncamento. Após ler o conteúdo, a aprovação exige confirmação em diálogo nativo do macOS, montado no Rust a partir do snapshot autoritativo; o WebView não envia um booleano de confirmação. Só então o backend G5 registra a decisão com controle de revisão e idempotência. É uma decisão local: não envia e-mail nem altera calendário.
 - O runtime inicia quando a janela abre. Parar encerra o processo e o supervisor remove o socket da geração.
 - Configurações diz se o banco é o estável ou um override de teste. A passphrase não aparece.
 
@@ -97,5 +97,11 @@ Em 12/10/2026: `uv run --locked pytest -q test_daily_capture_gate.py test_native
 | `source-map-js@1.2.1` | Permanece. Dependência transitiva de build. Lockfile não foi atualizado. |
 | Processo do mesmo UID | Permanece. |
 | Diretórios `.jv-*` vazios | Permanecem. |
+
+## Atualização de confiança da aprovação — 12/10/2026
+
+A revisão do estado anterior encontrou que uma chamada direta ao comando IPC podia enviar `confirmed: true` sem passar pelo checkbox do React. Na candidata isolada `feat/jarvis-g5-approval-native-consent`, baseada na candidata diária limpa `52917d5a5092174b35dd0d991043f61cfb71b0ec`, o comando não aceita esse campo. Antes de aprovar, o Rust consulta o detalhe pela rota fixa, mostra título, ID, revisão, SHA-256 e conteúdo marcado como não confiável num diálogo nativo, e só continua após a confirmação nativa. Cancelar não envia a decisão. A sessão, o grant e a versão continuam revalidados pelo backend G5 no momento da escrita; nenhuma rota ou URL vem do WebView.
+
+O diálogo nativo usa `tauri-plugin-dialog`, dependência adicionada porque o checkbox do WebView não é uma fronteira de confiança. O corpo não contém tokens, passphrase ou segredos; os testes não iniciam uma janela. O smoke visual com a janela real e cancelamento/confirmação do diálogo continua pendente do proprietário.
 
 O aceite histórico em `G6_MAC_002_2_MAC_003_ACEITE.md` não foi reescrito. Gmail e Calendar continuam desconectados. O smoke visual da jornada nova de Aprovações ainda precisa ser executado pelo proprietário.
