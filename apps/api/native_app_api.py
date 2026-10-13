@@ -24,6 +24,9 @@ from local_security import (
     _close_session_for,
     mission_read_scope_confirmed,
     mission_review_confirmed,
+    native_session_confirmed,
+    native_review_grant_confirmed,
+    revoke_native_review_grants,
 )
 from external_connectors import public_status
 from local_captures import (
@@ -36,12 +39,14 @@ from local_captures import (
 )
 from mission_repository import MissionConflict, MissionCorrupt, MissionDenied, MissionRejected, MissionRepository
 from memory_store import MemoryStoreError
+from workflow_executor import WorkflowError, WorkflowExecutor, session_binding
 
 router = APIRouter()
 NATIVE_DOMAIN = "dom_synthetic_a"
 NATIVE_GRANT_TTL = timedelta(minutes=60)
 MAX_REQUEST_BYTES = 1024
 MAX_RESPONSE_BYTES = 2048
+MAX_WORKFLOW_LIST_ITEMS = 4
 MAX_PASSPHRASE_BYTES = 128
 MAX_MISSION_TITLE = 80
 EXPECTED_FIELDS = {
@@ -57,6 +62,7 @@ EXPECTED_FIELDS = {
     "/v1/app/captures/clear": ("session_token", "csrf_token"),
     "/v1/app/connectors/status": ("session_token",),
     "/v1/app/grants/mission-review": ("session_token", "csrf_token", "domain_id", "confirm"),
+    "/v1/app/grants/mission-review/revoke": ("session_token", "csrf_token", "domain_id", "confirm"),
     "/v1/app/reviews/pending": ("session_token", "domain_id"),
     "/v1/app/reviews/draft": ("session_token", "csrf_token", "confirm"),
     "/v1/app/reviews/detail": (
@@ -75,6 +81,14 @@ EXPECTED_FIELDS = {
         "idempotency_key",
         "confirm",
     ),
+    "/v1/app/workflows/submit": ("session_token", "csrf_token", "tool_id", "arguments_json", "idempotency_key"),
+    "/v1/app/workflows/list": ("session_token",),
+    "/v1/app/workflows/detail": ("session_token", "task_id"),
+    "/v1/app/workflows/approve": ("session_token", "csrf_token", "task_id", "expected_sha256", "confirm"),
+    "/v1/app/workflows/execute": ("session_token", "csrf_token", "task_id", "idempotency_key"),
+    "/v1/app/workflows/pause": ("session_token", "csrf_token", "task_id"),
+    "/v1/app/workflows/resume": ("session_token", "csrf_token", "task_id"),
+    "/v1/app/workflows/cancel": ("session_token", "csrf_token", "task_id"),
 }
 
 
@@ -141,6 +155,12 @@ def _error(code: str) -> PlainTextResponse:
         "grant_expired",
         "operation_failed",
         "capture_rejected",
+        "workflow_rejected",
+        "recommendation_rejected", "tool_blocked", "schema_rejected", "limit_exceeded",
+        "idempotency_key_rejected", "idempotency_conflict", "owner_rejected", "clock_rejected",
+        "task_not_found", "task_corrupt", "state_rejected", "approval_not_required",
+        "approval_required", "approval_rejected", "approval_replayed", "approval_expired",
+        "parameters_changed", "result_corrupt", "retry_exhausted", "timeout",
     }
     safe_code = code if code in allowed else "operation_failed"
     return _response((("ok", "false"), ("code", safe_code)))
@@ -432,6 +452,23 @@ async def create_native_review_grant(request: Request) -> PlainTextResponse:
     )
 
 
+@router.post("/v1/app/grants/mission-review/revoke")
+async def revoke_native_review_grant(request: Request) -> PlainTextResponse:
+    try:
+        fields = await _read_fields(request, EXPECTED_FIELDS[request.url.path])
+        session = _native_session(fields["session_token"], fields["csrf_token"], mutation=True)
+        if fields["domain_id"] != NATIVE_DOMAIN or fields["confirm"] != "revoke-review-local":
+            return _error("scope_invalid")
+        count = revoke_native_review_grants(session.token)
+        return _success(revoked="true", count=count)
+    except (ValueError, UnicodeError):
+        return _error("scope_invalid")
+    except HTTPException as exc:
+        return _error_for(exc)
+    except PermissionError:
+        return _error("session_required")
+
+
 @router.post("/v1/app/reviews/pending")
 async def list_native_pending_reviews(request: Request) -> PlainTextResponse:
     try:
@@ -627,3 +664,162 @@ async def approve_native_review(request: Request) -> PlainTextResponse:
         return _error("grant_required")
     except (MissionConflict, MissionCorrupt, MissionRejected):
         return _error("operation_failed")
+
+
+def _workflow_error(exc: WorkflowError) -> PlainTextResponse:
+    return _error(exc.code)
+
+
+@router.post("/v1/app/workflows/submit")
+async def submit_native_workflow(request: Request) -> PlainTextResponse:
+    try:
+        fields = await _read_fields(request, EXPECTED_FIELDS[request.url.path])
+        session = _native_session(fields["session_token"], fields["csrf_token"], mutation=True)
+        if len(fields["arguments_json"].encode("utf-8")) > 700:
+            return _error("limit_exceeded")
+        recommendation = {"tool_id": fields["tool_id"], "arguments": json.loads(fields["arguments_json"])}
+        with native_session_confirmed(session.token) as current:
+            task = WorkflowExecutor(request.app.state.memory_store).submit(
+                current.principal, recommendation, fields["idempotency_key"], _now()
+            )
+        return _success(task_json=json.dumps(task, ensure_ascii=False, sort_keys=True, separators=(",", ":")))
+    except (ValueError, UnicodeError, json.JSONDecodeError):
+        return _error("scope_invalid")
+    except HTTPException as exc:
+        return _error_for(exc)
+    except PermissionError:
+        return _error("session_required")
+    except WorkflowError as exc:
+        return _workflow_error(exc)
+
+
+@router.post("/v1/app/workflows/list")
+async def list_native_workflows(request: Request) -> PlainTextResponse:
+    try:
+        fields = await _read_fields(request, EXPECTED_FIELDS[request.url.path])
+        session = _native_session(fields["session_token"])
+        with native_session_confirmed(session.token) as current:
+            tasks = WorkflowExecutor(request.app.state.memory_store).list_tasks(
+                current.principal, _now(), limit=MAX_WORKFLOW_LIST_ITEMS
+            )
+        return _success(tasks_json=json.dumps(tasks, ensure_ascii=False, sort_keys=True, separators=(",", ":")))
+    except (ValueError, UnicodeError):
+        return _error("session_required")
+    except HTTPException as exc:
+        return _error_for(exc)
+    except PermissionError:
+        return _error("session_required")
+    except WorkflowError as exc:
+        return _workflow_error(exc)
+
+
+@router.post("/v1/app/workflows/detail")
+async def read_native_workflow(request: Request) -> PlainTextResponse:
+    try:
+        fields = await _read_fields(request, EXPECTED_FIELDS[request.url.path])
+        session = _native_session(fields["session_token"])
+        with native_session_confirmed(session.token) as current:
+            task = WorkflowExecutor(request.app.state.memory_store).detail(current.principal, fields["task_id"], _now())
+        return _success(task_json=json.dumps(task, ensure_ascii=False, sort_keys=True, separators=(",", ":")))
+    except (ValueError, UnicodeError):
+        return _error("session_required")
+    except HTTPException as exc:
+        return _error_for(exc)
+    except PermissionError:
+        return _error("session_required")
+    except WorkflowError as exc:
+        return _workflow_error(exc)
+
+
+@router.post("/v1/app/workflows/approve")
+async def approve_native_workflow(request: Request) -> PlainTextResponse:
+    try:
+        fields = await _read_fields(request, EXPECTED_FIELDS[request.url.path])
+        session = _native_session(fields["session_token"], fields["csrf_token"], mutation=True)
+        if fields["confirm"] != "approve-workflow-local":
+            return _error("scope_invalid")
+        with native_review_grant_confirmed(session.token) as (current, grant):
+            approved = WorkflowExecutor(request.app.state.memory_store).approve(
+                current.principal, fields["task_id"], fields["expected_sha256"],
+                session_binding(current.token), grant.id, _now(),
+            )
+        return _success(arguments_sha=approved["arguments_sha"], expires_at=approved["expires_at"])
+    except (ValueError, UnicodeError):
+        return _error("scope_invalid")
+    except HTTPException as exc:
+        return _error_for(exc)
+    except PermissionError:
+        return _error("grant_required")
+    except WorkflowError as exc:
+        return _workflow_error(exc)
+
+
+@router.post("/v1/app/workflows/execute")
+async def execute_native_workflow(request: Request) -> PlainTextResponse:
+    try:
+        fields = await _read_fields(request, EXPECTED_FIELDS[request.url.path])
+        session = _native_session(fields["session_token"], fields["csrf_token"], mutation=True)
+        executor = WorkflowExecutor(request.app.state.memory_store)
+        with native_session_confirmed(session.token) as current:
+            detail = executor.detail(current.principal, fields["task_id"], _now())
+        if detail["tool_id"] == "simulate_action":
+            grant_id = executor.approval_grant_id(session.principal, fields["task_id"], _now())
+            with native_review_grant_confirmed(session.token, grant_id) as (current, grant):
+                result = executor.execute(
+                    current.principal, fields["task_id"], fields["idempotency_key"],
+                    session_binding(current.token), grant.id, _now(),
+                )
+        else:
+            with native_session_confirmed(session.token) as current:
+                result = executor.execute(
+                    current.principal, fields["task_id"], fields["idempotency_key"],
+                    session_binding(current.token), None, _now(),
+                )
+        return _success(task_json=json.dumps(result, ensure_ascii=False, sort_keys=True, separators=(",", ":")))
+    except (ValueError, UnicodeError):
+        return _error("scope_invalid")
+    except HTTPException as exc:
+        return _error_for(exc)
+    except PermissionError:
+        return _error("grant_required")
+    except WorkflowError as exc:
+        return _workflow_error(exc)
+
+
+async def _change_native_workflow(request: Request, action: str) -> PlainTextResponse:
+    try:
+        path = request.url.path
+        fields = await _read_fields(request, EXPECTED_FIELDS[path])
+        session = _native_session(fields["session_token"], fields["csrf_token"], mutation=True)
+        with native_session_confirmed(session.token) as current:
+            executor = WorkflowExecutor(request.app.state.memory_store)
+            if action == "pause":
+                task = executor.pause(current.principal, fields["task_id"], _now())
+            elif action == "resume":
+                task = executor.resume(current.principal, fields["task_id"], _now())
+            else:
+                task = executor.cancel(current.principal, fields["task_id"], _now())
+        return _success(task_json=json.dumps(task, ensure_ascii=False, sort_keys=True, separators=(",", ":")))
+    except (ValueError, UnicodeError):
+        return _error("scope_invalid")
+    except HTTPException as exc:
+        return _error_for(exc)
+    except PermissionError:
+        return _error("session_required")
+    except WorkflowError as exc:
+        return _workflow_error(exc)
+
+
+@router.post("/v1/app/workflows/pause")
+async def pause_native_workflow(request: Request) -> PlainTextResponse:
+    return await _change_native_workflow(request, "pause")
+
+
+@router.post("/v1/app/workflows/resume")
+async def resume_native_workflow(request: Request) -> PlainTextResponse:
+    return await _change_native_workflow(request, "resume")
+
+
+@router.post("/v1/app/workflows/cancel")
+async def cancel_native_workflow(request: Request) -> PlainTextResponse:
+    return await _change_native_workflow(request, "cancel")

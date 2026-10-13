@@ -1,8 +1,9 @@
 import { useEffect, useState } from "react";
+import type { FormEvent } from "react";
 import { invoke, isTauri } from "@tauri-apps/api/core";
 import "./App.css";
 import { createG5Ipc, executeRuntimeCommand, grantIsDisplayedActive, parseLocalRuntimeConfig, parseRuntimeEnvelope, parseTransportSnapshot } from "./runtimeCommand";
-import type { ConnectorStatus, G5CommandResult, G5Mission, G5PendingReview, G5ReviewDetail, G5SessionSnapshot, LocalCapture, LocalRuntimeConfig, RuntimeEnvelope, RuntimeState, RuntimeCommand, TransportSnapshot, TransportState } from "./runtimeCommand";
+import type { ConnectorStatus, G5CommandResult, G5Mission, G5PendingReview, G5ReviewDetail, G5SessionSnapshot, LocalCapture, LocalRuntimeConfig, RuntimeEnvelope, RuntimeState, RuntimeCommand, TransportSnapshot, TransportState, WorkflowState, WorkflowTask, WorkflowTaskSummary } from "./runtimeCommand";
 
 const g5Ipc = createG5Ipc((command, args) => invoke<string>(command, args));
 const sections = ["Agora", "Inbox", "Missões", "Aprovações", "Runtime local", "Configurações"] as const;
@@ -37,6 +38,12 @@ const missionStatusLabels: Record<G5Mission["status"], string> = {
   failed: "Falhou", interrupted: "Interrompida",
 };
 
+const workflowStateLabels: Record<WorkflowState, string> = {
+  proposed: "Proposta", awaiting_approval: "Aguardando confirmação", paused: "Pausada",
+  running: "Em execução", interrupted: "Interrompida", succeeded: "Concluída",
+  failed: "Falhou", cancelled: "Cancelada",
+};
+
 function App() {
   const [section, setSection] = useState<Section>("Agora");
   const [captures, setCaptures] = useState<LocalCapture[]>([]);
@@ -49,7 +56,6 @@ function App() {
   const [g5Status, setG5Status] = useState<G5SessionSnapshot | null>(null);
   const [g5Busy, setG5Busy] = useState(false);
   const [g5Error, setG5Error] = useState("");
-  const [passphrase, setPassphrase] = useState("");
   const [grantConfirmed, setGrantConfirmed] = useState(false);
   const [missions, setMissions] = useState<G5Mission[]>([]);
   const [connectors, setConnectors] = useState<ConnectorStatus | null>(null);
@@ -62,6 +68,12 @@ function App() {
   const [pendingReviews, setPendingReviews] = useState<G5PendingReview[]>([]);
   const [editingId, setEditingId] = useState<string | null>(null);
   const [reviewDetail, setReviewDetail] = useState<G5ReviewDetail | null>(null);
+  const [workflowTasks, setWorkflowTasks] = useState<WorkflowTaskSummary[]>([]);
+  const [workflowDetail, setWorkflowDetail] = useState<WorkflowTask | null>(null);
+  const [workflowTitle, setWorkflowTitle] = useState("");
+  const [workflowBody, setWorkflowBody] = useState("");
+  const [simulationSubject, setSimulationSubject] = useState("");
+  const [simulationBody, setSimulationBody] = useState("");
   const runtimeAvailable = isTauri();
   const grantActive = g5Status ? grantIsDisplayedActive(g5Status, nowMs) : false;
 
@@ -90,6 +102,8 @@ function App() {
             setCaptures([]);
             setConnectors(null);
             setReviewGrant(false);
+            setWorkflowTasks([]);
+            setWorkflowDetail(null);
             setPendingReviews([]);
             setReviewDetail(null);
             setApprovalConfirmed(false);
@@ -116,7 +130,7 @@ function App() {
     let cancelled = false;
     void (async () => {
       try {
-        const [listed, status] = await Promise.all([g5Ipc.listCaptures(), g5Ipc.connectorStatus()]);
+        const [listed, status, workflows] = await Promise.all([g5Ipc.listCaptures(), g5Ipc.connectorStatus(), g5Ipc.workflowList()]);
         if (cancelled) return;
         if (listed.ok) {
           setCaptures(listed.captures ?? []);
@@ -126,10 +140,12 @@ function App() {
           setG5Error(listed.error ?? "O banco local não está disponível; as ideias não foram atualizadas.");
         }
         setConnectors(status);
+        setWorkflowTasks(workflows.ok ? workflows.tasks ?? [] : []);
       } catch {
         if (!cancelled) {
           setConnectors(null);
           setCaptures([]);
+          setWorkflowTasks([]);
           setG5Error("Não foi possível ler o banco local autenticado.");
         }
       }
@@ -163,12 +179,7 @@ function App() {
     }
   }
 
-  async function runG5Command(action: "open-session", passphrase: string): Promise<void>;
-  async function runG5Command(action: "create-grant" | "revoke-grant" | "close-session" | "list-missions"): Promise<void>;
-  async function runG5Command(
-    action: "open-session" | "create-grant" | "revoke-grant" | "close-session" | "list-missions",
-    passphrase?: string,
-  ) {
+  async function runG5Command(action: "open-session" | "create-grant" | "revoke-grant" | "close-session" | "list-missions") {
     setG5Busy(true);
     setG5Error("");
     if (action === "create-grant") setGrantConfirmed(false);
@@ -176,7 +187,7 @@ function App() {
       let result: G5CommandResult;
       switch (action) {
         case "open-session":
-          result = await g5Ipc.openSession(passphrase ?? "");
+          result = await g5Ipc.openSession();
           break;
         case "create-grant":
           result = await g5Ipc.createMissionReadGrant();
@@ -230,13 +241,6 @@ function App() {
     } finally {
       setG5Busy(false);
     }
-  }
-
-  async function openG5Session(event: React.FormEvent<HTMLFormElement>) {
-    event.preventDefault();
-    const value = passphrase;
-    setPassphrase("");
-    await runG5Command("open-session", value);
   }
 
   async function saveCapture(event: React.FormEvent<HTMLFormElement>) {
@@ -333,6 +337,22 @@ function App() {
     }
   }
 
+  async function revokeReviewGrant() {
+    setG5Busy(true);
+    setG5Error("");
+    try {
+      const result = await g5Ipc.revokeReviewGrant();
+      if (!result.ok || !result.review_grant_revoked) throw new Error(result.error ?? "A concessão de revisão não foi revogada.");
+      setReviewGrant(false);
+      setWorkflowDetail(null);
+      setNotice("Concessão mission:review revogada. Tarefas pendentes não podem executar sem novo consentimento.");
+    } catch (error) {
+      setG5Error(error instanceof Error ? error.message : "Não foi possível revogar a concessão de revisão.");
+    } finally {
+      setG5Busy(false);
+    }
+  }
+
   async function queueReviewDraft() {
     if (!draftConfirmed) return;
     setG5Busy(true);
@@ -399,6 +419,84 @@ function App() {
     }
   }
 
+  async function refreshWorkflowTasks() {
+    const listed = await g5Ipc.workflowList();
+    if (!listed.ok) throw new Error(listed.error ?? "Não foi possível listar as tarefas locais.");
+    setWorkflowTasks(listed.tasks ?? []);
+  }
+
+  async function submitDraftWorkflow(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    setG5Busy(true);
+    setG5Error("");
+    try {
+      const submitted = await g5Ipc.workflowSubmitDraft(workflowTitle.trim(), workflowBody.trim());
+      if (!submitted.ok) throw new Error(submitted.error ?? "O rascunho foi recusado.");
+      setWorkflowTitle("");
+      setWorkflowBody("");
+      setNotice("Tarefa de rascunho persistida localmente; nenhum serviço externo foi chamado.");
+      await refreshWorkflowTasks();
+    } catch (error) {
+      setG5Error(error instanceof Error ? error.message : "Não foi possível criar a tarefa local.");
+    } finally {
+      setG5Busy(false);
+    }
+  }
+
+  async function submitSimulationWorkflow(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (!reviewGrant) return;
+    setG5Busy(true);
+    setG5Error("");
+    try {
+      const submitted = await g5Ipc.workflowSubmitSimulation(simulationSubject.trim(), simulationBody.trim());
+      if (!submitted.ok) throw new Error(submitted.error ?? "A simulação foi recusada.");
+      setSimulationSubject("");
+      setSimulationBody("");
+      setWorkflowDetail(submitted.task ?? null);
+      setNotice("Proposta de simulação persistida. Confira o payload; nada será enviado.");
+      await refreshWorkflowTasks();
+    } catch (error) {
+      setG5Error(error instanceof Error ? error.message : "Não foi possível criar a simulação local.");
+    } finally {
+      setG5Busy(false);
+    }
+  }
+
+  async function inspectWorkflow(taskId: string) {
+    setG5Busy(true);
+    setG5Error("");
+    try {
+      const detail = await g5Ipc.workflowDetail(taskId);
+      if (!detail.ok || !detail.task) throw new Error(detail.error ?? "A tarefa não pôde ser aberta.");
+      setWorkflowDetail(detail.task);
+    } catch (error) {
+      setG5Error(error instanceof Error ? error.message : "A tarefa local não pôde ser aberta.");
+    } finally {
+      setG5Busy(false);
+    }
+  }
+
+  async function runWorkflowAction(action: "execute-draft" | "execute-simulation" | "pause" | "resume" | "cancel", taskId: string) {
+    setG5Busy(true);
+    setG5Error("");
+    try {
+      const result = action === "execute-draft" ? await g5Ipc.workflowExecuteDraft(taskId)
+        : action === "execute-simulation" ? await g5Ipc.workflowExecuteSimulation(taskId)
+          : action === "pause" ? await g5Ipc.workflowPause(taskId)
+            : action === "resume" ? await g5Ipc.workflowResume(taskId)
+              : await g5Ipc.workflowCancel(taskId);
+      if (!result.ok) throw new Error(result.error ?? "A transição da tarefa foi recusada.");
+      setWorkflowDetail(result.task ?? null);
+      setNotice(action === "execute-simulation" ? "Simulação local concluída sem envio de dados." : "Estado da tarefa local atualizado.");
+      await refreshWorkflowTasks();
+    } catch (error) {
+      setG5Error(error instanceof Error ? error.message : "Não foi possível atualizar a tarefa local.");
+    } finally {
+      setG5Busy(false);
+    }
+  }
+
   async function clearCaptures() {
     setG5Busy(true);
     setG5Error("");
@@ -422,7 +520,7 @@ function App() {
       <div className="brand" aria-label="JARVIS"><span className="mark">JV</span><span>JARVIS</span></div>
       <nav aria-label="Seções do JARVIS">{sections.map((item) => <button
         aria-current={section === item ? "page" : undefined} className={section === item ? "nav-item active" : "nav-item"}
-        key={item} onClick={() => { setSection(item); setNotice(""); if (item !== "Missões") { setPassphrase(""); setGrantConfirmed(false); } }} type="button">{item}</button>)}</nav>
+        key={item} onClick={() => { setSection(item); setNotice(""); if (item !== "Missões") { setGrantConfirmed(false); } }} type="button">{item}</button>)}</nav>
       <p className="rail-note">macOS local · banco sintético · sem conta externa</p>
     </aside>
     <main className="content" id="conteudo">
@@ -465,13 +563,10 @@ function App() {
         <h2>Leitura autorizada de Missões</h2>
         <p>O backend local atende somente por UDS. Uma sessão aberta não concede leitura: confirme separadamente a concessão para <code>mission:read</code> no domínio sintético <code>dom_synthetic_a</code>.</p>
         {!runtimeAvailable && <p className="runtime-hint">Este preview web não inicia processos locais nem abre sessões G5.</p>}
-        {runtimeAvailable && !g5Status?.session_active && <form className="g5-form" onSubmit={(event) => void openG5Session(event)}>
-          <label htmlFor="g5-passphrase">Credencial local G5</label>
-          <input id="g5-passphrase" type="password" autoComplete="off" maxLength={128} value={passphrase}
-            onChange={(event) => setPassphrase(event.currentTarget.value)} aria-describedby="g5-passphrase-help" />
-          <p id="g5-passphrase-help" className="field-hint">Usada somente para abrir a sessão local. O campo é limpo ao enviar e a credencial não fica salva.</p>
-          <button className="action" type="submit" disabled={g5Busy || runtime?.snapshot.state !== "READY" || transport?.state !== "READY" || new TextEncoder().encode(passphrase).length < 12 || new TextEncoder().encode(passphrase).length > 128}>Abrir sessão local</button>
-        </form>}
+        {runtimeAvailable && !g5Status?.session_active && <div className="g5-form">
+          <p className="field-hint">A passphrase será solicitada em uma janela nativa segura do macOS e não passa pelo WebView.</p>
+          <button className="action" type="button" disabled={g5Busy || runtime?.snapshot.state !== "READY" || transport?.state !== "READY"} onClick={() => void runG5Command("open-session")}>Abrir sessão local</button>
+        </div>}
         {runtimeAvailable && g5Status?.session_active && <section className="g5-state" aria-live="polite">
           <p><strong>Sessão aberta.</strong> Válida até {g5Status.session_expires_at ? new Date(g5Status.session_expires_at).toLocaleString("pt-BR") : "expirar no servidor"}.</p>
           {g5Status.grant_active && grantActive ? <>
@@ -505,6 +600,7 @@ function App() {
         {g5Status?.session_active && <>
           <label className="confirm"><input type="checkbox" checked={reviewConfirmed} onChange={(event) => setReviewConfirmed(event.currentTarget.checked)} /> Confirmo a concessão de revisão só para decisões locais em <code>dom_synthetic_a</code>.</label>
           <button className="action" type="button" disabled={g5Busy || !reviewConfirmed} onClick={() => void requestReviewGrant()}>Solicitar revisão local</button>
+          {reviewGrant && <button className="action secondary" type="button" disabled={g5Busy} onClick={() => void revokeReviewGrant()}>Revogar mission:review</button>}
           {reviewGrant && pendingReviews.length === 0 && <>
             <p>Nenhuma revisão pendente. Nada será enviado para fora.</p>
             <label className="confirm"><input type="checkbox" checked={draftConfirmed} onChange={(event) => setDraftConfirmed(event.currentTarget.checked)} /> Confirmo criar um único rascunho sintético para revisar aqui.</label>
@@ -522,6 +618,52 @@ function App() {
             <label className="confirm"><input type="checkbox" checked={approvalConfirmed} onChange={(event) => setApprovalConfirmed(event.currentTarget.checked)} /> Li o conteúdo integral e confirmo a aprovação apenas desta versão local.</label>
             <button className="action" type="button" disabled={g5Busy || !approvalConfirmed} onClick={() => void approveReview()}>Aprovar versão local</button>
           </section>}
+          <section className="workflow-panel" aria-labelledby="workflow-title">
+            <p className="badge">EXECUTOR TIPADO · EFEITOS LOCAIS</p>
+            <h3 id="workflow-title">Tarefas de missão locais</h3>
+            <p>O modelo pode apenas recomendar uma ferramenta fechada e argumentos tipados. Rascunho e simulação ficam no SQLite local. Envio, pagamento, exclusão e convite estão bloqueados.</p>
+            <p className="field-hint">A lista mostra as quatro tarefas recentes para respeitar o limite de resposta MAC-003; tarefas antigas ficam armazenadas, sem paginação nesta versão.</p>
+            <form className="g5-form" onSubmit={(event) => void submitDraftWorkflow(event)}>
+              <label htmlFor="workflow-draft-title">Título do rascunho local</label>
+              <input id="workflow-draft-title" maxLength={80} value={workflowTitle} onChange={(event) => setWorkflowTitle(event.currentTarget.value)} required />
+              <label htmlFor="workflow-draft-body">Conteúdo</label>
+              <textarea id="workflow-draft-body" maxLength={80} value={workflowBody} onChange={(event) => setWorkflowBody(event.currentTarget.value)} required />
+              <button className="action secondary" type="submit" disabled={g5Busy || !workflowTitle.trim() || !workflowBody.trim()}>Salvar proposta de rascunho</button>
+            </form>
+            {reviewGrant && <form className="g5-form" onSubmit={(event) => void submitSimulationWorkflow(event)}>
+              <h4>Simulação sem envio</h4>
+              <p>Usa somente a conta fixa <code>operator@example.test</code> e a caixa sintética local.</p>
+              <label htmlFor="workflow-sim-subject">Assunto simulado</label>
+              <input id="workflow-sim-subject" maxLength={30} value={simulationSubject} onChange={(event) => setSimulationSubject(event.currentTarget.value)} required />
+              <label htmlFor="workflow-sim-body">Payload completo</label>
+              <textarea id="workflow-sim-body" maxLength={80} value={simulationBody} onChange={(event) => setSimulationBody(event.currentTarget.value)} required />
+              <button className="action secondary" type="submit" disabled={g5Busy || !simulationSubject.trim() || !simulationBody.trim()}>Preparar simulação</button>
+            </form>}
+            {workflowTasks.length === 0 ? <p>Nenhuma tarefa persistida nesta sessão.</p> : <ul className="workflow-list">{workflowTasks.map((task) => <li key={task.task_id}>
+              <div><strong>{task.tool_id === "draft_note" ? "Rascunho local" : "Simulação local"}</strong><span>{workflowStateLabels[task.state]} · {task.risk} · {task.expected_effect}</span></div>
+              {task.tool_id === "draft_note" && task.state === "proposed" && <button className="action" type="button" disabled={g5Busy} onClick={() => void runWorkflowAction("execute-draft", task.task_id)}>Executar localmente</button>}
+              {task.tool_id === "simulate_action" && ["awaiting_approval", "interrupted"].includes(task.state) && <button className="action secondary" type="button" disabled={g5Busy} onClick={() => void inspectWorkflow(task.task_id)}>Conferir payload</button>}
+              {task.state === "succeeded" && <button className="action secondary" type="button" disabled={g5Busy} onClick={() => void inspectWorkflow(task.task_id)}>Ver resultado verificável</button>}
+              {task.state === "paused" && <button className="action secondary" type="button" disabled={g5Busy} onClick={() => void runWorkflowAction("resume", task.task_id)}>Retomar</button>}
+              {["proposed", "awaiting_approval"].includes(task.state) && <button className="action secondary" type="button" disabled={g5Busy} onClick={() => void runWorkflowAction("pause", task.task_id)}>Pausar</button>}
+              {["proposed", "awaiting_approval", "paused", "interrupted", "failed"].includes(task.state) && <button className="action secondary" type="button" disabled={g5Busy} onClick={() => void runWorkflowAction("cancel", task.task_id)}>Cancelar</button>}
+            </li>)}</ul>}
+            {workflowDetail && <section className="review-detail" aria-label="Detalhe da tarefa local">
+              <h4>Detalhe da tarefa · {workflowStateLabels[workflowDetail.state]}</h4>
+              <p>Hash dos parâmetros: <code>{workflowDetail.arguments_sha}</code></p>
+              {workflowDetail.preview && <>
+                <p><strong>{workflowDetail.preview.service}</strong> · conta {workflowDetail.preview.account} · alvo {workflowDetail.preview.target}</p>
+                <p>Payload completo:</p><pre>{JSON.stringify(workflowDetail.preview.payload, null, 2)}</pre>
+                <p>{workflowDetail.preview.consequence}</p>
+                <p>Dados enviados: nenhum. Efeito esperado: {workflowDetail.expected_effect}.</p>
+                {["awaiting_approval", "interrupted"].includes(workflowDetail.state) && <button className="action" type="button" disabled={g5Busy || !reviewGrant} onClick={() => void runWorkflowAction("execute-simulation", workflowDetail.task_id)}>Confirmar na janela nativa e simular</button>}
+              </>}
+              {workflowDetail.result && <>
+                <p>Resultado local:</p><pre>{JSON.stringify(workflowDetail.result, null, 2)}</pre>
+                {workflowDetail.result_sha && <p>Hash SHA-256 do resultado: <code>{workflowDetail.result_sha}</code></p>}
+              </>}
+            </section>}
+          </section>
         </>}
       </article>}
       {section === "Runtime local" && <article className="card runtime-card">

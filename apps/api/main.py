@@ -1,4 +1,5 @@
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 import hashlib
 import hmac
 import os
@@ -35,6 +36,7 @@ from native_runtime import NativeProtocolBoundary, NativeRuntimeIdentity, create
 from loopback import ALLOWED_ORIGINS, is_allowed_host_header, is_loopback_address
 from memory_store import MemoryStoreError, SQLiteMemoryStore
 from mission_engine import recover_interrupted
+from workflow_executor import WorkflowExecutor
 from server_config import LocalServerConfig, validate_local_server_config
 
 demo_router = APIRouter()
@@ -125,6 +127,7 @@ def create_app(config: LocalServerConfig, *, database_path: str | Path | None = 
         from source_admission import reconcile_legacy_selected_sources
         reconcile_legacy_selected_sources(store)
         recover_interrupted(store)
+        WorkflowExecutor(store).recover(datetime.now(timezone.utc))
         yield
 
     app = FastAPI(

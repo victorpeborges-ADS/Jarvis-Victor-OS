@@ -35,6 +35,39 @@ export type G5SessionSnapshot = {
 export type LocalCapture = { id: string; text: string; created_at: string };
 export type G5PendingReview = { id: string; revision: number; sha256: string; title: string };
 export type G5ReviewDetail = G5PendingReview & { content: string };
+export type WorkflowState = "proposed" | "awaiting_approval" | "paused" | "running" | "interrupted" | "succeeded" | "failed" | "cancelled";
+export type WorkflowPreview = {
+  service: string;
+  account: string;
+  target: string;
+  payload: { subject: string; body: string };
+  consequence: string;
+  data_sent: string[];
+  risk: "medium";
+};
+export type WorkflowTaskSummary = {
+  task_id: string;
+  tool_id: "draft_note" | "simulate_action";
+  state: WorkflowState;
+  arguments_sha: string;
+  created_at: string;
+  updated_at: string;
+  risk: "low" | "medium";
+  expected_effect: string;
+};
+export type WorkflowTask = WorkflowTaskSummary & {
+  idempotency_key: string;
+  permission: string;
+  timeout_ms: number;
+  limit: number;
+  retry: { max_attempts: number; retryable: string[] };
+  enabled: boolean;
+  preview?: WorkflowPreview;
+  result?: Record<string, unknown>;
+  result_sha?: string;
+  effect?: string;
+  attempts?: number;
+};
 
 export type ConnectorStatus = {
   ok: true;
@@ -79,6 +112,9 @@ export type G5CommandResult = {
   approved?: boolean;
   replayed?: boolean;
   review_grant?: boolean;
+  review_grant_revoked?: boolean;
+  task?: WorkflowTask;
+  tasks?: WorkflowTaskSummary[];
   queued?: boolean;
   id?: string;
   created_at?: string;
@@ -92,8 +128,8 @@ export function createG5Ipc(invokeG5: G5Invoke) {
   return {
     sessionStatus: async (): Promise<G5SessionSnapshot> =>
       parseG5SessionSnapshot(await invokeG5("g5_session_status")),
-    openSession: async (passphrase: string): Promise<G5CommandResult> =>
-      parseG5CommandResult(await invokeG5("g5_session_open", { passphrase })),
+    openSession: async (): Promise<G5CommandResult> =>
+      parseG5CommandResult(await invokeG5("g5_session_open")),
     createMissionReadGrant: async (): Promise<G5CommandResult> =>
       parseG5CommandResult(await invokeG5("g5_mission_read_grant_create")),
     revokeMissionReadGrant: async (): Promise<G5CommandResult> =>
@@ -116,6 +152,8 @@ export function createG5Ipc(invokeG5: G5Invoke) {
       parseConnectorStatus(await invokeG5("g5_connectors_status")),
     createReviewGrant: async (): Promise<G5CommandResult> =>
       parseG5CommandResult(await invokeG5("g5_review_grant_create")),
+    revokeReviewGrant: async (): Promise<G5CommandResult> =>
+      parseG5CommandResult(await invokeG5("g5_review_grant_revoke")),
     pendingReviews: async (): Promise<G5CommandResult> =>
       parseG5CommandResult(await invokeG5("g5_reviews_pending")),
     queueReviewDraft: async (): Promise<G5CommandResult> =>
@@ -132,6 +170,24 @@ export function createG5Ipc(invokeG5: G5Invoke) {
         revision: review.revision,
         sha256: review.sha256,
       })),
+    workflowList: async (): Promise<G5CommandResult> =>
+      parseG5CommandResult(await invokeG5("g5_workflow_list")),
+    workflowDetail: async (taskId: string): Promise<G5CommandResult> =>
+      parseG5CommandResult(await invokeG5("g5_workflow_detail", { taskId })),
+    workflowSubmitDraft: async (title: string, body: string): Promise<G5CommandResult> =>
+      parseG5CommandResult(await invokeG5("g5_workflow_submit_draft", { title, body })),
+    workflowSubmitSimulation: async (subject: string, body: string): Promise<G5CommandResult> =>
+      parseG5CommandResult(await invokeG5("g5_workflow_submit_simulation", { subject, body })),
+    workflowExecuteDraft: async (taskId: string): Promise<G5CommandResult> =>
+      parseG5CommandResult(await invokeG5("g5_workflow_execute_draft", { taskId })),
+    workflowExecuteSimulation: async (taskId: string): Promise<G5CommandResult> =>
+      parseG5CommandResult(await invokeG5("g5_workflow_execute_simulation", { taskId })),
+    workflowPause: async (taskId: string): Promise<G5CommandResult> =>
+      parseG5CommandResult(await invokeG5("g5_workflow_pause", { taskId })),
+    workflowResume: async (taskId: string): Promise<G5CommandResult> =>
+      parseG5CommandResult(await invokeG5("g5_workflow_resume", { taskId })),
+    workflowCancel: async (taskId: string): Promise<G5CommandResult> =>
+      parseG5CommandResult(await invokeG5("g5_workflow_cancel", { taskId })),
   };
 }
 
@@ -220,6 +276,11 @@ export function parseG5CommandResult(value: string): G5CommandResult {
   }
   const record = parsed as Record<string, unknown>;
   const result: G5CommandResult = { ok: record.ok as boolean };
+  if (record.task !== undefined) result.task = parseWorkflowTask(record.task);
+  if (record.tasks !== undefined) {
+    if (!Array.isArray(record.tasks) || record.tasks.length > 4) throw new Error("Lista de workflows inválida.");
+    result.tasks = record.tasks.map(parseWorkflowTaskSummary);
+  }
   if (record.error !== undefined) {
     if (typeof record.error !== "string") throw new Error("Erro G5 inválido.");
     result.error = record.error;
@@ -272,6 +333,10 @@ export function parseG5CommandResult(value: string): G5CommandResult {
   if (record.review_grant !== undefined) {
     if (record.review_grant !== true) throw new Error("Concessão de revisão inválida.");
     result.review_grant = true;
+  }
+  if (record.review_grant_revoked !== undefined) {
+    if (record.review_grant_revoked !== true) throw new Error("Revogação de revisão inválida.");
+    result.review_grant_revoked = true;
   }
   if (record.queued !== undefined) {
     if (typeof record.queued !== "boolean") throw new Error("Rascunho de revisão inválido.");
@@ -344,6 +409,58 @@ export function parseG5CommandResult(value: string): G5CommandResult {
     throw new Error("Resposta de missões inválida.");
   }
   return result;
+}
+
+function parseWorkflowTaskSummary(value: unknown): WorkflowTaskSummary {
+  if (typeof value !== "object" || value === null) throw new Error("Tarefa local inválida.");
+  const item = value as Record<string, unknown>;
+  const states: WorkflowState[] = ["proposed", "awaiting_approval", "paused", "running", "interrupted", "succeeded", "failed", "cancelled"];
+  if (typeof item.task_id !== "string" || !/^[0-9a-f]{32}$/.test(item.task_id) ||
+      (item.tool_id !== "draft_note" && item.tool_id !== "simulate_action") ||
+      typeof item.state !== "string" || !states.includes(item.state as WorkflowState) ||
+      typeof item.arguments_sha !== "string" || !/^[0-9a-f]{64}$/.test(item.arguments_sha) ||
+      typeof item.created_at !== "string" || typeof item.updated_at !== "string" ||
+      (item.risk !== "low" && item.risk !== "medium") || typeof item.expected_effect !== "string") {
+    throw new Error("Tarefa local inválida.");
+  }
+  return item as WorkflowTaskSummary;
+}
+
+function parseWorkflowTask(value: unknown): WorkflowTask {
+  const summary = parseWorkflowTaskSummary(value);
+  const item = value as Record<string, unknown>;
+  if (typeof item.idempotency_key !== "string" || !/^[A-Za-z0-9_-]{8,80}$/.test(item.idempotency_key) ||
+      typeof item.permission !== "string" || typeof item.timeout_ms !== "number" ||
+      !Number.isSafeInteger(item.timeout_ms) || item.timeout_ms < 1 ||
+      typeof item.limit !== "number" || item.limit !== 1 || typeof item.enabled !== "boolean" ||
+      typeof item.retry !== "object" || item.retry === null) throw new Error("Metadados de workflow inválidos.");
+  const retry = item.retry as Record<string, unknown>;
+  if (typeof retry.max_attempts !== "number" || !Number.isSafeInteger(retry.max_attempts) ||
+      retry.max_attempts < 1 || !Array.isArray(retry.retryable) || retry.retryable.some((entry) => typeof entry !== "string")) {
+    throw new Error("Política de retry inválida.");
+  }
+  let preview: WorkflowPreview | undefined;
+  if (item.preview !== undefined) {
+    if (typeof item.preview !== "object" || item.preview === null) throw new Error("Prévia de simulação inválida.");
+    const candidate = item.preview as Record<string, unknown>;
+    if (typeof candidate.service !== "string" || typeof candidate.account !== "string" ||
+        typeof candidate.target !== "string" || typeof candidate.consequence !== "string" ||
+        candidate.risk !== "medium" || !Array.isArray(candidate.data_sent) || candidate.data_sent.length !== 0 ||
+        typeof candidate.payload !== "object" || candidate.payload === null) throw new Error("Prévia de simulação inválida.");
+    const payload = candidate.payload as Record<string, unknown>;
+    if (typeof payload.subject !== "string" || typeof payload.body !== "string" ||
+        [...payload.subject].length > 30 || [...payload.body].length > 80 ||
+        /[\u0000-\u001f\u007f]/.test(payload.subject + payload.body)) throw new Error("Payload de simulação inválido.");
+    preview = candidate as WorkflowPreview;
+  }
+  return { ...summary, idempotency_key: item.idempotency_key, permission: item.permission,
+    timeout_ms: item.timeout_ms, limit: item.limit, retry: retry as WorkflowTask["retry"],
+    enabled: item.enabled, preview,
+    ...(typeof item.result === "object" && item.result !== null ? { result: item.result as Record<string, unknown> } : {}),
+    ...(typeof item.result_sha === "string" && /^[0-9a-f]{64}$/.test(item.result_sha) ? { result_sha: item.result_sha } : {}),
+    ...(typeof item.effect === "string" ? { effect: item.effect } : {}),
+    ...(typeof item.attempts === "number" && Number.isSafeInteger(item.attempts) ? { attempts: item.attempts } : {}),
+  };
 }
 
 export function parseConnectorStatus(value: string): ConnectorStatus {

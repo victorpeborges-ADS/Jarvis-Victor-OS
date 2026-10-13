@@ -2,6 +2,7 @@ use crate::transport::{
     ChildTransportConfig, TransportError, TransportSession, TransportSnapshot, TransportState,
     PROTOCOL_VERSION,
 };
+use serde_json::Value as JsonValue;
 use std::{
     env,
     io::{self, BufRead, BufReader, Write},
@@ -27,6 +28,16 @@ const STARTUP_TIMEOUT: Duration = Duration::from_secs(5);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(700);
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
 const POLL_INTERVAL: Duration = Duration::from_millis(10);
+const APP_WORKFLOW_SUBMIT_ROUTE: &str = "/v1/app/workflows/submit";
+const APP_WORKFLOW_LIST_ROUTE: &str = "/v1/app/workflows/list";
+const APP_WORKFLOW_DETAIL_ROUTE: &str = "/v1/app/workflows/detail";
+const APP_WORKFLOW_APPROVE_ROUTE: &str = "/v1/app/workflows/approve";
+const APP_WORKFLOW_EXECUTE_ROUTE: &str = "/v1/app/workflows/execute";
+const APP_WORKFLOW_PAUSE_ROUTE: &str = "/v1/app/workflows/pause";
+const APP_WORKFLOW_RESUME_ROUTE: &str = "/v1/app/workflows/resume";
+const APP_WORKFLOW_CANCEL_ROUTE: &str = "/v1/app/workflows/cancel";
+const MAX_WORKFLOW_LIST_ITEMS: usize = 4;
+const APP_REVIEW_GRANT_REVOKE_ROUTE: &str = "/v1/app/grants/mission-review/revoke";
 #[cfg(test)]
 const HELPER_ID_ENV: &str = "JARVIS_RUNTIME_HELPER_ID";
 #[cfg(test)]
@@ -265,6 +276,7 @@ struct G5ReviewDetail {
 }
 
 struct NativeReviewApprovalConfirmed;
+struct NativeWorkflowApprovalConfirmed;
 
 struct SecretText(String);
 
@@ -497,12 +509,35 @@ impl RuntimeManager {
         Ok((instance_id, session))
     }
 
-    fn g5_session_open(&self, passphrase: String) -> String {
+    fn g5_session_open_native(&self) -> String {
+        {
+            let mut inner = lock_inner(&self.shared);
+            expire_cached_authorization(&mut inner);
+            if inner.g5_session.is_some() {
+                return g5_error_json("session_already_open");
+            }
+        }
+        if self.active_transport_for_g5().is_err() {
+            return g5_error_json("runtime_unavailable");
+        }
+        #[cfg(target_os = "macos")]
+        {
+            return match request_native_g5_passphrase() {
+                Ok(passphrase) => self.g5_session_open(passphrase),
+                Err(code) => g5_error_json(code),
+            };
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            g5_error_json("native_input_unavailable")
+        }
+    }
+
+    fn g5_session_open(&self, passphrase: SecretText) -> String {
         let _operation = self
             .g5_operation
             .lock()
             .unwrap_or_else(|error| error.into_inner());
-        let passphrase = SecretText::new(passphrase);
         if passphrase.as_str().len() < 12 || passphrase.as_str().len() > 128 {
             return g5_error_json("credential_rejected");
         }
@@ -1387,6 +1422,61 @@ impl RuntimeManager {
         )
     }
 
+    fn g5_review_grant_revoke(&self) -> String {
+        let _operation = self
+            .g5_operation
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let (instance_id, transport, token, csrf) = match self.g5_credentials_for_active() {
+            Ok(value) => value,
+            Err(error) => return g5_error_json(error),
+        };
+        let body = SecretBytes::new(encode_application_fields(&[
+            ("session_token", token.as_str()),
+            ("csrf_token", csrf.as_str()),
+            ("domain_id", "dom_synthetic_a"),
+            ("confirm", "revoke-review-local"),
+        ]));
+        let response =
+            match transport.call_g5_application(APP_REVIEW_GRANT_REVOKE_ROUTE, body.as_slice()) {
+                Ok(value) => SecretBytes::new(value),
+                Err(_) => return g5_error_json("transport_failure"),
+            };
+        let fields = match parse_application_response(response.as_slice()) {
+            Ok(value) => value,
+            Err(()) => return g5_error_json("protocol_failure"),
+        };
+        if let Some(error) = app_response_error(&fields) {
+            clear_cached_authorization_after_rejection(
+                &self.shared,
+                &instance_id,
+                &transport,
+                token.as_str(),
+                error,
+            );
+            return g5_error_json(error);
+        }
+        if !app_fields_match(&fields, &["ok", "revoked", "count"])
+            || app_field(&fields, "ok") != Some("true")
+            || app_field(&fields, "revoked") != Some("true")
+            || app_field(&fields, "count")
+                .and_then(|value| value.parse::<u8>().ok())
+                .is_none_or(|count| count > 1)
+        {
+            return g5_error_json("protocol_failure");
+        }
+        let inner = lock_inner(&self.shared);
+        if !g5_generation_matches(&inner, &instance_id, &transport)
+            || inner
+                .g5_session
+                .as_ref()
+                .is_none_or(|session| session.token.as_str() != token.as_str())
+        {
+            return g5_error_json("stale_generation");
+        }
+        "{\"ok\":true,\"review_grant_revoked\":true}".to_owned()
+    }
+
     fn g5_reviews_pending(&self) -> String {
         let _operation = self
             .g5_operation
@@ -1680,6 +1770,322 @@ impl RuntimeManager {
             return g5_error_json("stale_generation");
         }
         format!("{{\"ok\":true,\"approved\":true,\"replayed\":{replayed}}}")
+    }
+
+    fn g5_workflow_call_locked(
+        &self,
+        route: &'static str,
+        mutation: bool,
+        extra: &[(&str, &str)],
+    ) -> Result<Vec<(String, SecretText)>, &'static str> {
+        if !matches!(
+            route,
+            APP_WORKFLOW_SUBMIT_ROUTE
+                | APP_WORKFLOW_LIST_ROUTE
+                | APP_WORKFLOW_DETAIL_ROUTE
+                | APP_WORKFLOW_APPROVE_ROUTE
+                | APP_WORKFLOW_EXECUTE_ROUTE
+                | APP_WORKFLOW_PAUSE_ROUTE
+                | APP_WORKFLOW_RESUME_ROUTE
+                | APP_WORKFLOW_CANCEL_ROUTE
+        ) {
+            return Err("scope_invalid");
+        }
+        let (instance_id, transport, token, csrf) = self.g5_credentials_for_active()?;
+        let mut fields = Vec::with_capacity(extra.len() + 2);
+        fields.push(("session_token", token.as_str()));
+        if mutation {
+            fields.push(("csrf_token", csrf.as_str()));
+        }
+        fields.extend_from_slice(extra);
+        let body = SecretBytes::new(encode_application_fields(&fields));
+        let response = transport
+            .call_g5_application(route, body.as_slice())
+            .map(SecretBytes::new)
+            .map_err(|_| "transport_failure")?;
+        let parsed =
+            parse_application_response(response.as_slice()).map_err(|_| "protocol_failure")?;
+        if let Some(error) = app_response_error(&parsed) {
+            clear_cached_authorization_after_rejection(
+                &self.shared,
+                &instance_id,
+                &transport,
+                token.as_str(),
+                error,
+            );
+            return Err(error);
+        }
+        let inner = lock_inner(&self.shared);
+        if !g5_generation_matches(&inner, &instance_id, &transport)
+            || inner
+                .g5_session
+                .as_ref()
+                .is_none_or(|session| session.token.as_str() != token.as_str())
+        {
+            return Err("stale_generation");
+        }
+        Ok(parsed)
+    }
+
+    fn g5_workflow_task_value_locked(&self, task_id: &str) -> Result<JsonValue, &'static str> {
+        if !is_hex_identifier(task_id) {
+            return Err("scope_invalid");
+        }
+        let fields = self.g5_workflow_call_locked(
+            APP_WORKFLOW_DETAIL_ROUTE,
+            false,
+            &[("task_id", task_id)],
+        )?;
+        if !app_fields_match(&fields, &["ok", "task_json"])
+            || app_field(&fields, "ok") != Some("true")
+        {
+            return Err("protocol_failure");
+        }
+        let value: JsonValue =
+            serde_json::from_str(app_field(&fields, "task_json").ok_or("protocol_failure")?)
+                .map_err(|_| "protocol_failure")?;
+        if value.get("task_id").and_then(JsonValue::as_str) != Some(task_id)
+            || value
+                .get("arguments_sha")
+                .and_then(JsonValue::as_str)
+                .is_none_or(|sha| !is_lower_hex_sha256(sha))
+            || value
+                .get("tool_id")
+                .and_then(JsonValue::as_str)
+                .is_none_or(|tool| !matches!(tool, "draft_note" | "simulate_action"))
+        {
+            return Err("protocol_failure");
+        }
+        Ok(value)
+    }
+
+    fn g5_workflow_submit_fixed(&self, tool_id: &'static str, arguments: JsonValue) -> String {
+        if !matches!(tool_id, "draft_note" | "simulate_action") {
+            return g5_error_json("tool_blocked");
+        }
+        let arguments_json = match serde_json::to_string(&arguments) {
+            Ok(value) if value.len() <= 700 => SecretText::new(value),
+            _ => return g5_error_json("limit_exceeded"),
+        };
+        let key = workflow_idempotency_key();
+        let _operation = self
+            .g5_operation
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let fields = match self.g5_workflow_call_locked(
+            APP_WORKFLOW_SUBMIT_ROUTE,
+            true,
+            &[
+                ("tool_id", tool_id),
+                ("arguments_json", arguments_json.as_str()),
+                ("idempotency_key", key.as_str()),
+            ],
+        ) {
+            Ok(value) => value,
+            Err(error) => return g5_error_json(error),
+        };
+        if !app_fields_match(&fields, &["ok", "task_json"])
+            || app_field(&fields, "ok") != Some("true")
+        {
+            return g5_error_json("protocol_failure");
+        }
+        let task_json = app_field(&fields, "task_json").unwrap_or_default();
+        let task: JsonValue = match serde_json::from_str(task_json) {
+            Ok(value) => value,
+            Err(_) => return g5_error_json("protocol_failure"),
+        };
+        if task.get("tool_id").and_then(JsonValue::as_str) != Some(tool_id) {
+            return g5_error_json("protocol_failure");
+        }
+        format!(
+            "{{\"ok\":true,\"task\":{}}}",
+            serde_json::to_string(&task).unwrap_or_else(|_| "null".to_owned())
+        )
+    }
+
+    fn g5_workflow_list(&self) -> String {
+        let _operation = self
+            .g5_operation
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let fields = match self.g5_workflow_call_locked(APP_WORKFLOW_LIST_ROUTE, false, &[]) {
+            Ok(value) => value,
+            Err(error) => return g5_error_json(error),
+        };
+        if !app_fields_match(&fields, &["ok", "tasks_json"])
+            || app_field(&fields, "ok") != Some("true")
+        {
+            return g5_error_json("protocol_failure");
+        }
+        let tasks: JsonValue = match serde_json::from_str::<JsonValue>(
+            app_field(&fields, "tasks_json").unwrap_or_default(),
+        ) {
+            Ok(value)
+                if value.is_array()
+                    && value
+                        .as_array()
+                        .is_some_and(|items| items.len() <= MAX_WORKFLOW_LIST_ITEMS) =>
+            {
+                value
+            }
+            _ => return g5_error_json("protocol_failure"),
+        };
+        format!(
+            "{{\"ok\":true,\"tasks\":{}}}",
+            serde_json::to_string(&tasks).unwrap_or_else(|_| "[]".to_owned())
+        )
+    }
+
+    fn g5_workflow_detail(&self, task_id: &str) -> Result<JsonValue, &'static str> {
+        let _operation = self
+            .g5_operation
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        self.g5_workflow_task_value_locked(task_id)
+    }
+
+    fn g5_workflow_execute_draft(&self, task_id: &str) -> String {
+        let _operation = self
+            .g5_operation
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let detail = match self.g5_workflow_task_value_locked(task_id) {
+            Ok(value) => value,
+            Err(error) => return g5_error_json(error),
+        };
+        if detail.get("tool_id").and_then(JsonValue::as_str) != Some("draft_note")
+            || detail.get("state").and_then(JsonValue::as_str) != Some("proposed")
+        {
+            return g5_error_json("state_rejected");
+        }
+        self.g5_workflow_execute_locked(&detail, task_id)
+    }
+
+    fn g5_workflow_replay_simulation(&self, task_id: &str) -> String {
+        let _operation = self
+            .g5_operation
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let detail = match self.g5_workflow_task_value_locked(task_id) {
+            Ok(value) => value,
+            Err(error) => return g5_error_json(error),
+        };
+        if detail.get("tool_id").and_then(JsonValue::as_str) != Some("simulate_action")
+            || detail.get("state").and_then(JsonValue::as_str) != Some("succeeded")
+        {
+            return g5_error_json("state_rejected");
+        }
+        self.g5_workflow_execute_locked(&detail, task_id)
+    }
+
+    fn g5_workflow_execute_simulation_confirmed(
+        &self,
+        task_id: &str,
+        expected_sha: &str,
+        _confirmation: NativeWorkflowApprovalConfirmed,
+    ) -> String {
+        let _operation = self
+            .g5_operation
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let detail = match self.g5_workflow_task_value_locked(task_id) {
+            Ok(value) => value,
+            Err(error) => return g5_error_json(error),
+        };
+        if detail.get("tool_id").and_then(JsonValue::as_str) != Some("simulate_action")
+            || detail.get("arguments_sha").and_then(JsonValue::as_str) != Some(expected_sha)
+            || !matches!(
+                detail.get("state").and_then(JsonValue::as_str),
+                Some("awaiting_approval" | "interrupted")
+            )
+            || detail
+                .get("preview")
+                .and_then(JsonValue::as_object)
+                .is_none()
+        {
+            return g5_error_json("state_rejected");
+        }
+        let task_id = detail
+            .get("task_id")
+            .and_then(JsonValue::as_str)
+            .unwrap_or_default();
+        let approved = match self.g5_workflow_call_locked(
+            APP_WORKFLOW_APPROVE_ROUTE,
+            true,
+            &[
+                ("task_id", task_id),
+                ("expected_sha256", expected_sha),
+                ("confirm", "approve-workflow-local"),
+            ],
+        ) {
+            Ok(value) => value,
+            Err(error) => return g5_error_json(error),
+        };
+        if !app_fields_match(&approved, &["ok", "arguments_sha", "expires_at"])
+            || app_field(&approved, "ok") != Some("true")
+            || app_field(&approved, "arguments_sha") != Some(expected_sha)
+        {
+            return g5_error_json("protocol_failure");
+        }
+        self.g5_workflow_execute_locked(&detail, task_id)
+    }
+
+    fn g5_workflow_execute_locked(&self, detail: &JsonValue, task_id: &str) -> String {
+        let key = match detail.get("idempotency_key").and_then(JsonValue::as_str) {
+            Some(value) if (8..=80).contains(&value.len()) => SecretText::new(value.to_owned()),
+            _ => return g5_error_json("protocol_failure"),
+        };
+        let fields = match self.g5_workflow_call_locked(
+            APP_WORKFLOW_EXECUTE_ROUTE,
+            true,
+            &[("task_id", task_id), ("idempotency_key", key.as_str())],
+        ) {
+            Ok(value) => value,
+            Err(error) => return g5_error_json(error),
+        };
+        if !app_fields_match(&fields, &["ok", "task_json"])
+            || app_field(&fields, "ok") != Some("true")
+        {
+            return g5_error_json("protocol_failure");
+        }
+        let result: JsonValue = match serde_json::from_str::<JsonValue>(
+            app_field(&fields, "task_json").unwrap_or_default(),
+        ) {
+            Ok(value) if value.get("task_id").and_then(JsonValue::as_str) == Some(task_id) => value,
+            _ => return g5_error_json("protocol_failure"),
+        };
+        format!(
+            "{{\"ok\":true,\"task\":{}}}",
+            serde_json::to_string(&result).unwrap_or_else(|_| "null".to_owned())
+        )
+    }
+
+    fn g5_workflow_transition(&self, route: &'static str, task_id: &str) -> String {
+        if !is_hex_identifier(task_id) {
+            return g5_error_json("scope_invalid");
+        }
+        let _operation = self
+            .g5_operation
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let fields = match self.g5_workflow_call_locked(route, true, &[("task_id", task_id)]) {
+            Ok(value) => value,
+            Err(error) => return g5_error_json(error),
+        };
+        if !app_fields_match(&fields, &["ok", "task_json"])
+            || app_field(&fields, "ok") != Some("true")
+        {
+            return g5_error_json("protocol_failure");
+        }
+        let task: JsonValue =
+            match serde_json::from_str(app_field(&fields, "task_json").unwrap_or_default()) {
+                Ok(value) => value,
+                Err(_) => return g5_error_json("protocol_failure"),
+            };
+        format!(
+            "{{\"ok\":true,\"task\":{}}}",
+            serde_json::to_string(&task).unwrap_or_else(|_| "null".to_owned())
+        )
     }
 
     fn g5_credentials_for_active(
@@ -2405,7 +2811,7 @@ with TestClient(app, base_url='http://127.0.0.1', client=('127.0.0.1', 50999)) a
         eprintln!("mac002_2 stage=real_fastapi_proof_then_socket_swap_rejected PASS");
 
         if !manager
-            .g5_session_open(passphrase.clone())
+            .g5_session_open(SecretText::new(passphrase.clone()))
             .contains("\"session_active\":true")
         {
             return Err("synthetic passphrase did not open a G5 session");
@@ -2500,7 +2906,7 @@ with TestClient(app, base_url='http://127.0.0.1', client=('127.0.0.1', 50999)) a
                 .g5_session_close()
                 .contains("\"session_active\":false")
             || !manager
-                .g5_session_open(passphrase.clone())
+                .g5_session_open(SecretText::new(passphrase.clone()))
                 .contains("\"session_active\":true")
             || !manager
                 .g5_session_status_json()
@@ -3705,6 +4111,37 @@ fn json_optional_number(value: Option<impl std::fmt::Display>) -> String {
         .unwrap_or_else(|| "null".to_owned())
 }
 
+#[cfg(target_os = "macos")]
+fn request_native_g5_passphrase() -> Result<SecretText, &'static str> {
+    const SCRIPT: &str = r#"set dialogResult to display dialog "Digite a passphrase local do JARVIS para abrir uma sessão G5." default answer "" with hidden answer buttons {"Cancelar", "Abrir sessão"} default button "Abrir sessão" cancel button "Cancelar" with title "Jarvis Victor OS"
+return text returned of dialogResult & "JARVIS_NATIVE_G5_END""#;
+
+    let output = Command::new("/usr/bin/osascript")
+        .arg("-e")
+        .arg(SCRIPT)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()
+        .map_err(|_| "native_input_unavailable")?;
+    let success = output.status.success();
+    let stdout = SecretBytes::new(output.stdout);
+    if !success {
+        return Err("native_input_cancelled");
+    }
+    native_g5_secret_from_output(stdout.as_slice())
+}
+
+fn native_g5_secret_from_output(output: &[u8]) -> Result<SecretText, &'static str> {
+    const MARKER: &[u8] = b"JARVIS_NATIVE_G5_END";
+    let output = output.strip_suffix(b"\n").unwrap_or(output);
+    let secret = output
+        .strip_suffix(MARKER)
+        .ok_or("native_input_unavailable")?;
+    let secret = std::str::from_utf8(secret).map_err(|_| "native_input_unavailable")?;
+    Ok(SecretText::new(secret.to_owned()))
+}
+
 fn g5_error_json(code: &str) -> String {
     let message = match code {
         "runtime_unavailable" => "O runtime local autenticado não está pronto.",
@@ -3718,10 +4155,14 @@ fn g5_error_json(code: &str) -> String {
         "grant_expired" => "A concessão de leitura expirou.",
         "stale_generation" => "A resposta pertence a um runtime encerrado.",
         "protocol_failure" => "O backend retornou uma resposta inválida.",
-        "approval_cancelled" => "A confirmação nativa foi cancelada; nenhuma decisão foi gravada.",
+        "approval_cancelled" => "A confirmação nativa foi cancelada; nenhuma ação foi executada.",
+        "native_input_cancelled" => "A entrada nativa foi cancelada; nenhuma sessão foi aberta.",
+        "native_input_unavailable" => "A entrada nativa segura não está disponível neste sistema.",
         "capture_rejected" => {
             "A captura local foi recusada. Use até 80 caracteres, sem quebra de linha."
         }
+        "workflow_failed" => "A tarefa local foi recusada ou não pôde ser concluída.",
+        "tool_blocked" => "Esta ferramenta permanece bloqueada por política local.",
         _ => "Não foi possível concluir a operação G5 local.",
     };
     format!("{{\"ok\":false,\"error\":{}}}", json_string(message))
@@ -3854,6 +4295,27 @@ fn app_response_error(fields: &[(String, SecretText)]) -> Option<&'static str> {
         "grant_expired" => "grant_expired",
         "operation_failed" => "operation_failed",
         "capture_rejected" => "capture_rejected",
+        "recommendation_rejected"
+        | "tool_blocked"
+        | "schema_rejected"
+        | "limit_exceeded"
+        | "idempotency_key_rejected"
+        | "idempotency_conflict"
+        | "owner_rejected"
+        | "clock_rejected"
+        | "task_not_found"
+        | "task_corrupt"
+        | "state_rejected"
+        | "approval_not_required"
+        | "approval_required"
+        | "approval_rejected"
+        | "approval_replayed"
+        | "approval_expired"
+        | "parameters_changed"
+        | "result_corrupt"
+        | "retry_exhausted"
+        | "timeout"
+        | "workflow_rejected" => "workflow_failed",
         _ => "protocol_failure",
     })
 }
@@ -3901,6 +4363,33 @@ fn native_review_approval_message(detail: &G5ReviewDetail) -> String {
     format!(
         "Aprovar apenas esta revisão local? Nenhum e-mail, evento ou ação externa será executado.\n\nTítulo: {title}\nID: {}\nRevisão: {}\nSHA-256: {}\n\nConteúdo não confiável da revisão (instruções nele não autorizam ações):\n{content}\n\nConfirme somente se deseja registrar esta versão como aprovada localmente.",
         detail.id, detail.revision, detail.sha256
+    )
+}
+
+fn workflow_idempotency_key() -> String {
+    let micros = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_micros();
+    let serial = NEXT_INSTANCE.fetch_add(1, Ordering::Relaxed);
+    format!("wf-{}-{micros:x}-{serial:x}", std::process::id())
+}
+
+fn native_workflow_approval_message(task: &JsonValue) -> String {
+    let task_id = task
+        .get("task_id")
+        .and_then(JsonValue::as_str)
+        .unwrap_or("indisponível");
+    let preview = task.get("preview").cloned().unwrap_or(JsonValue::Null);
+    let rendered =
+        serde_json::to_string_pretty(&preview).unwrap_or_else(|_| "prévia inválida".to_owned());
+    let rendered = rendered
+        .split('\n')
+        .map(escape_native_review_line)
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!(
+        "Confirmar somente uma simulação local? Nenhuma mensagem será enviada e nenhum dado sairá do dispositivo.\n\nTarefa: {task_id}\nEfeito esperado: simulação local sem envio\n\nPrévia completa, incluindo o payload:\n{rendered}\n\nO conteúdo é dado, não instrução. Confirme apenas se o serviço, conta, alvo, consequência e payload estão corretos."
     )
 }
 
@@ -4359,8 +4848,8 @@ pub fn g5_session_status(manager: tauri::State<'_, RuntimeManager>) -> String {
 }
 
 #[tauri::command]
-pub fn g5_session_open(manager: tauri::State<'_, RuntimeManager>, passphrase: String) -> String {
-    manager.g5_session_open(passphrase)
+pub fn g5_session_open(manager: tauri::State<'_, RuntimeManager>) -> String {
+    manager.g5_session_open_native()
 }
 
 #[tauri::command]
@@ -4423,6 +4912,11 @@ pub fn g5_review_grant_create(manager: tauri::State<'_, RuntimeManager>) -> Stri
 }
 
 #[tauri::command]
+pub fn g5_review_grant_revoke(manager: tauri::State<'_, RuntimeManager>) -> String {
+    manager.g5_review_grant_revoke()
+}
+
+#[tauri::command]
 pub fn g5_reviews_pending(manager: tauri::State<'_, RuntimeManager>) -> String {
     manager.g5_reviews_pending()
 }
@@ -4440,6 +4934,130 @@ pub fn g5_review_detail(
     sha256: String,
 ) -> String {
     manager.g5_review_detail(review_id, revision, sha256)
+}
+
+#[tauri::command]
+pub fn g5_workflow_submit_draft(
+    manager: tauri::State<'_, RuntimeManager>,
+    title: String,
+    body: String,
+) -> String {
+    manager.g5_workflow_submit_fixed(
+        "draft_note",
+        serde_json::json!({"title": title, "body": body}),
+    )
+}
+
+#[tauri::command]
+pub fn g5_workflow_submit_simulation(
+    manager: tauri::State<'_, RuntimeManager>,
+    subject: String,
+    body: String,
+) -> String {
+    manager.g5_workflow_submit_fixed(
+        "simulate_action",
+        serde_json::json!({
+            "service": "synthetic-mail",
+            "account": "operator@example.test",
+            "target": "synthetic-outbox",
+            "payload": {"subject": subject, "body": body}
+        }),
+    )
+}
+
+#[tauri::command]
+pub fn g5_workflow_list(manager: tauri::State<'_, RuntimeManager>) -> String {
+    manager.g5_workflow_list()
+}
+
+#[tauri::command]
+pub fn g5_workflow_detail(manager: tauri::State<'_, RuntimeManager>, task_id: String) -> String {
+    match manager.g5_workflow_detail(&task_id) {
+        Ok(task) => format!(
+            "{{\"ok\":true,\"task\":{}}}",
+            serde_json::to_string(&task).unwrap_or_else(|_| "null".to_owned())
+        ),
+        Err(error) => g5_error_json(error),
+    }
+}
+
+#[tauri::command]
+pub fn g5_workflow_execute_draft(
+    manager: tauri::State<'_, RuntimeManager>,
+    task_id: String,
+) -> String {
+    manager.g5_workflow_execute_draft(&task_id)
+}
+
+#[tauri::command]
+pub async fn g5_workflow_execute_simulation(app: tauri::AppHandle, task_id: String) -> String {
+    let detail = {
+        let manager = app.state::<RuntimeManager>();
+        match manager.g5_workflow_detail(&task_id) {
+            Ok(value) => value,
+            Err(error) => return g5_error_json(error),
+        }
+    };
+    if detail.get("tool_id").and_then(JsonValue::as_str) != Some("simulate_action")
+        || detail
+            .get("preview")
+            .and_then(JsonValue::as_object)
+            .is_none()
+    {
+        return g5_error_json("state_rejected");
+    }
+    if detail.get("state").and_then(JsonValue::as_str) == Some("succeeded") {
+        let manager = app.state::<RuntimeManager>();
+        return manager.g5_workflow_replay_simulation(&task_id);
+    }
+    if !matches!(
+        detail.get("state").and_then(JsonValue::as_str),
+        Some("awaiting_approval" | "interrupted")
+    ) {
+        return g5_error_json("state_rejected");
+    }
+    let message = native_workflow_approval_message(&detail);
+    let dialog = app
+        .dialog()
+        .message(message)
+        .title("Confirmar simulação local")
+        .kind(MessageDialogKind::Warning)
+        .buttons(MessageDialogButtons::OkCancelCustom(
+            "Confirmar e simular".to_owned(),
+            "Cancelar".to_owned(),
+        ));
+    let confirmed = tauri::async_runtime::spawn_blocking(move || dialog.blocking_show())
+        .await
+        .unwrap_or(false);
+    if !confirmed {
+        return g5_error_json("approval_cancelled");
+    }
+    let expected_sha = detail
+        .get("arguments_sha")
+        .and_then(JsonValue::as_str)
+        .unwrap_or_default()
+        .to_owned();
+    let manager = app.state::<RuntimeManager>();
+    manager.g5_workflow_execute_simulation_confirmed(
+        &task_id,
+        &expected_sha,
+        NativeWorkflowApprovalConfirmed,
+    )
+}
+
+#[tauri::command]
+pub fn g5_workflow_pause(manager: tauri::State<'_, RuntimeManager>, task_id: String) -> String {
+    manager.g5_workflow_transition(APP_WORKFLOW_PAUSE_ROUTE, &task_id)
+}
+
+#[tauri::command]
+pub fn g5_workflow_resume(manager: tauri::State<'_, RuntimeManager>, task_id: String) -> String {
+    manager.g5_workflow_transition(APP_WORKFLOW_RESUME_ROUTE, &task_id)
+}
+
+#[tauri::command]
+pub fn g5_workflow_cancel(manager: tauri::State<'_, RuntimeManager>, task_id: String) -> String {
+    manager.g5_workflow_transition(APP_WORKFLOW_CANCEL_ROUTE, &task_id)
 }
 
 #[tauri::command]
@@ -4576,13 +5194,28 @@ mod tests {
     }
 
     #[test]
+    fn native_passphrase_output_is_delimited_and_preserves_input_whitespace() {
+        let secret = native_g5_secret_from_output(b" synthetic passphrase\nJARVIS_NATIVE_G5_END\n")
+            .expect("synthetic native input should parse");
+        assert_eq!(secret.as_str(), " synthetic passphrase\n");
+    }
+
+    #[test]
+    fn native_passphrase_output_rejects_missing_marker_without_echoing_data() {
+        assert!(matches!(
+            native_g5_secret_from_output(b"synthetic secret without marker\n"),
+            Err("native_input_unavailable")
+        ));
+    }
+
+    #[test]
     fn cancelled_native_review_confirmation_never_runs_approval() {
         let mut approval_called = false;
         let result = approve_only_after_native_confirmation(false, || {
             approval_called = true;
             "approved".to_owned()
         });
-        assert!(result.contains("A confirmação nativa foi cancelada; nenhuma decisão foi gravada."));
+        assert!(result.contains("A confirmação nativa foi cancelada; nenhuma ação foi executada."));
         assert!(!approval_called);
     }
 
@@ -4849,10 +5482,12 @@ mod tests {
             inner.transport_session = Some(Arc::clone(&session));
         }
 
-        let rejected = manager.g5_session_open("senha-incorreta-sintetica".to_owned());
+        let rejected =
+            manager.g5_session_open(SecretText::new("senha-incorreta-sintetica".to_owned()));
         assert!(rejected.contains("Credencial local recusada"));
         assert!(!rejected.contains("senha-incorreta-sintetica"));
-        let opened = manager.g5_session_open("senha-sintetica-rust-mac003".to_owned());
+        let opened =
+            manager.g5_session_open(SecretText::new("senha-sintetica-rust-mac003".to_owned()));
         assert!(opened.contains("\"session_active\":true"));
         assert!(!opened.contains("session_token"));
         assert!(manager.g5_missions_list().contains("concessão de leitura"));
@@ -4882,7 +5517,7 @@ mod tests {
         assert!(closed.contains("\"session_active\":false"));
         assert!(!closed.contains("session_token"));
         assert!(manager
-            .g5_session_open("senha-sintetica-rust-mac003".to_owned())
+            .g5_session_open(SecretText::new("senha-sintetica-rust-mac003".to_owned()))
             .contains("\"session_active\":true"));
         assert!(manager
             .g5_session_status_json()
@@ -4894,6 +5529,48 @@ mod tests {
         assert!(manager
             .g5_missions_list()
             .contains("Missão sintética Rust → FastAPI"));
+        assert!(manager
+            .g5_review_grant_create()
+            .contains("\"review_grant\":true"));
+        let proposed = manager.g5_workflow_submit_fixed(
+            "simulate_action",
+            serde_json::json!({
+                "service": "synthetic-mail",
+                "account": "operator@example.test",
+                "target": "synthetic-outbox",
+                "payload": {"subject": "Teste Rust", "body": "Conteúdo sintético no UDS"}
+            }),
+        );
+        let proposed: JsonValue =
+            serde_json::from_str(&proposed).expect("typed workflow proposal JSON");
+        let task = proposed.get("task").expect("workflow task");
+        let task_id = task
+            .get("task_id")
+            .and_then(JsonValue::as_str)
+            .expect("task id")
+            .to_owned();
+        let digest = task
+            .get("arguments_sha")
+            .and_then(JsonValue::as_str)
+            .expect("parameter hash")
+            .to_owned();
+        assert_eq!(
+            task.get("state").and_then(JsonValue::as_str),
+            Some("awaiting_approval")
+        );
+        assert!(task.get("preview").and_then(JsonValue::as_object).is_some());
+        let completed = manager.g5_workflow_execute_simulation_confirmed(
+            &task_id,
+            &digest,
+            NativeWorkflowApprovalConfirmed,
+        );
+        assert!(completed.contains("\"state\":\"succeeded\""));
+        assert!(completed.contains("\"sent\":false"));
+        assert!(completed.contains("\"data_sent\":[]"));
+        assert!(!completed.contains("session_token"));
+        let workflows = manager.g5_workflow_list();
+        assert!(workflows.contains("simulate_action"));
+        assert!(workflows.contains("succeeded"));
         assert!(manager
             .g5_session_close()
             .contains("\"session_active\":false"));

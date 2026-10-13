@@ -38,10 +38,19 @@ APP_PATHS = {
     "/v1/app/captures/clear",
     "/v1/app/connectors/status",
     "/v1/app/grants/mission-review",
+    "/v1/app/grants/mission-review/revoke",
     "/v1/app/reviews/pending",
     "/v1/app/reviews/draft",
     "/v1/app/reviews/detail",
     "/v1/app/reviews/approve",
+    "/v1/app/workflows/submit",
+    "/v1/app/workflows/list",
+    "/v1/app/workflows/detail",
+    "/v1/app/workflows/approve",
+    "/v1/app/workflows/execute",
+    "/v1/app/workflows/pause",
+    "/v1/app/workflows/resume",
+    "/v1/app/workflows/cancel",
 }
 
 

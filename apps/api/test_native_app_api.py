@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import sqlite3
+import json
+from datetime import timezone
 import time
 from datetime import datetime, timedelta
 from urllib.parse import quote, unquote
@@ -821,3 +823,121 @@ def test_epoch_microseconds_preserves_datetime_precision_without_float_rounding(
     value = datetime(2026, 10, 7, 12, 0, 0, 750_001, tzinfo=timezone.utc)
     delta = value - epoch
     assert _epoch_microseconds(value) == (delta.days * 86400 + delta.seconds) * 1_000_000 + 750_001
+
+
+def _submit_synthetic_workflow(client, token: str, csrf: str, key: str = "workflow-synthetic-01"):
+    args = {
+        "service": "synthetic-mail",
+        "account": "operator@example.test",
+        "target": "synthetic-outbox",
+        "payload": {"subject": "Aviso de teste", "body": "Conteúdo exclusivamente sintético"},
+    }
+    response = fields(client.post("/v1/app/workflows/submit", content=body(
+        session_token=token,
+        csrf_token=csrf,
+        tool_id="simulate_action",
+        arguments_json=json.dumps(args, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
+        idempotency_key=key,
+    ), headers=HEADERS))
+    assert response["ok"] == "true", response
+    return args, json.loads(response["task_json"])
+
+
+def _approve_synthetic_workflow(client, token: str, csrf: str, task: dict):
+    return fields(client.post("/v1/app/workflows/approve", content=body(
+        session_token=token,
+        csrf_token=csrf,
+        task_id=task["task_id"],
+        expected_sha256=task["arguments_sha"],
+        confirm="approve-workflow-local",
+    ), headers=HEADERS))
+
+
+def _execute_synthetic_workflow(client, token: str, csrf: str, task: dict):
+    return fields(client.post("/v1/app/workflows/execute", content=body(
+        session_token=token,
+        csrf_token=csrf,
+        task_id=task["task_id"],
+        idempotency_key=task["idempotency_key"],
+    ), headers=HEADERS))
+
+
+def test_native_workflow_requires_exact_review_grant_and_revalidates_revoke_and_expiry(native_client):
+    import local_security
+
+    token, csrf = login(native_client)
+    _args, task = _submit_synthetic_workflow(native_client, token, csrf)
+    missing = _approve_synthetic_workflow(native_client, token, csrf, task)
+    assert missing == {"ok": "false", "code": "grant_required"}
+
+    grant = fields(native_client.post("/v1/app/grants/mission-review", content=body(
+        session_token=token, csrf_token=csrf, domain_id="dom_synthetic_a", confirm="review-local"), headers=HEADERS))
+    assert grant["ok"] == "true"
+    altered = {**task, "arguments_sha": "0" * 64}
+    assert _approve_synthetic_workflow(native_client, token, csrf, altered) == {
+        "ok": "false", "code": "parameters_changed"
+    }
+    assert _approve_synthetic_workflow(native_client, token, csrf, task)["ok"] == "true"
+
+    with local_security._grant_lock:
+        local_security._grants[grant["grant_id"]].expires_at = datetime.now(timezone.utc) - timedelta(seconds=1)
+    denied_expired = _execute_synthetic_workflow(native_client, token, csrf, task)
+    assert denied_expired == {"ok": "false", "code": "grant_required"}
+    with native_client.app.state.memory_store.transaction() as connection:
+        assert connection.execute("SELECT used_at FROM workflow_approvals WHERE task_id=?", (task["task_id"],)).fetchone()[0] is None
+
+    renewed = fields(native_client.post("/v1/app/grants/mission-review", content=body(
+        session_token=token, csrf_token=csrf, domain_id="dom_synthetic_a", confirm="review-local"), headers=HEADERS))
+    assert renewed["ok"] == "true" and renewed["grant_id"] != grant["grant_id"]
+    assert _approve_synthetic_workflow(native_client, token, csrf, task)["ok"] == "true"
+    completed = _execute_synthetic_workflow(native_client, token, csrf, task)
+    assert completed["ok"] == "true"
+    result = json.loads(completed["task_json"])
+    assert result["state"] == "succeeded" and result["result"]["sent"] is False
+    replay = _execute_synthetic_workflow(native_client, token, csrf, task)
+    assert json.loads(replay["task_json"])["replayed"] is True
+
+    _second_args, second = _submit_synthetic_workflow(native_client, token, csrf, "workflow-synthetic-02")
+    assert _approve_synthetic_workflow(native_client, token, csrf, second)["ok"] == "true"
+    revoked = fields(native_client.post("/v1/app/grants/mission-review/revoke", content=body(
+        session_token=token, csrf_token=csrf, domain_id="dom_synthetic_a", confirm="revoke-review-local"), headers=HEADERS))
+    assert revoked == {"ok": "true", "revoked": "true", "count": "1"}
+    denied_revoked = _execute_synthetic_workflow(native_client, token, csrf, second)
+    assert denied_revoked == {"ok": "false", "code": "grant_required"}
+
+
+def test_native_workflow_rejects_schema_and_resets_durable_state(native_client):
+    token, csrf = login(native_client)
+    invalid = fields(native_client.post("/v1/app/workflows/submit", content=body(
+        session_token=token, csrf_token=csrf, tool_id="simulate_action",
+        arguments_json='{"method":"POST","url":"https://example.test"}',
+        idempotency_key="workflow-invalid-01"), headers=HEADERS))
+    assert invalid == {"ok": "false", "code": "schema_rejected"}
+    blocked = fields(native_client.post("/v1/app/workflows/submit", content=body(
+        session_token=token, csrf_token=csrf, tool_id="send_message", arguments_json="{}",
+        idempotency_key="workflow-blocked-1"), headers=HEADERS))
+    assert blocked == {"ok": "false", "code": "tool_blocked"}
+    listed = fields(native_client.post("/v1/app/workflows/list", content=body(session_token=token), headers=HEADERS))
+    assert json.loads(listed["tasks_json"]) == []
+
+
+def test_native_workflow_list_stays_within_mac003_response_limit(native_client):
+    token, csrf = login(native_client)
+    for index in range(6):
+        arguments = {"title": f"Nota sintética {index}", "body": "Texto de teste"}
+        response = native_client.post("/v1/app/workflows/submit", content=body(
+            session_token=token,
+            csrf_token=csrf,
+            tool_id="draft_note",
+            arguments_json=json.dumps(arguments, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
+            idempotency_key=f"workflow-list-{index:04d}",
+        ), headers=HEADERS)
+        assert fields(response)["ok"] == "true"
+
+    listed_response = native_client.post(
+        "/v1/app/workflows/list", content=body(session_token=token), headers=HEADERS
+    )
+    listed = fields(listed_response)
+    assert listed["ok"] == "true"
+    assert len(json.loads(listed["tasks_json"])) == 4
+    assert len(listed_response.content) <= 2048

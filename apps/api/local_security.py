@@ -31,6 +31,7 @@ from loopback import ALLOWED_ORIGINS, is_loopback_address, require_allowed_origi
 
 SESSION_COOKIE = "jarvis_session"
 CSRF_HEADER = "x-csrf-token"
+NATIVE_DOMAIN_ID = "dom_synthetic_a"
 SESSION_TTL = timedelta(hours=12)
 MAX_LOGIN_FAILURES = 8
 LOGIN_WINDOW = timedelta(minutes=10)
@@ -493,6 +494,67 @@ def mission_review_confirmed(principal: str, domain_id: str, session_token: str 
         if domain_id not in mission_domains(principal, MISSION_REVIEW_RESOURCE, session_token):
             raise PermissionError("concessão de revisão revogada ou expirada")
         yield
+
+
+@contextmanager
+def native_session_confirmed(session_token: str):
+    """Hold session close stable while a native local operation commits."""
+    with _grant_lock:
+        session = _sessions.get(session_token)
+        if session is None:
+            raise PermissionError("sessão encerrada ou expirada")
+        _confirm_session_locked(session.principal, session_token)
+        yield session
+
+
+@contextmanager
+def native_review_grant_confirmed(session_token: str, grant_id: str | None = None):
+    """Hold the exact active native review grant stable through a local commit."""
+    with _grant_lock:
+        session = _sessions.get(session_token)
+        if session is None:
+            raise PermissionError("sessão encerrada ou expirada")
+        _confirm_session_locked(session.principal, session_token)
+        now = _now()
+        matches = [
+            grant for grant in _grants.values()
+            if grant.principal == session.principal
+            and grant.session_token == session_token
+            and grant.connector == "mission_sim"
+            and grant.resource_ids == frozenset({MISSION_REVIEW_RESOURCE})
+            and NATIVE_DOMAIN_ID in grant.domain_ids
+            and not grant.revoked
+            and grant.expires_at > now
+            and (grant_id is None or grant.id == grant_id)
+        ]
+        if not matches:
+            raise PermissionError("concessão de revisão revogada ou expirada")
+        selected = max(matches, key=lambda item: (item.expires_at, item.id))
+        yield session, selected
+
+
+def revoke_native_review_grants(session_token: str) -> int:
+    """Revoke the exact native review scope while serializing active operations."""
+    with _grant_lock:
+        session = _sessions.get(session_token)
+        if session is None:
+            raise PermissionError("sessão encerrada ou expirada")
+        _confirm_session_locked(session.principal, session_token)
+        instant = _now()
+        revoked = 0
+        for grant in _grants.values():
+            if (
+                grant.principal == session.principal
+                and grant.session_token == session_token
+                and grant.connector == "mission_sim"
+                and grant.resource_ids == frozenset({MISSION_REVIEW_RESOURCE})
+                and grant.domain_ids == frozenset({NATIVE_DOMAIN_ID})
+                and not grant.revoked
+                and grant.expires_at > instant
+            ):
+                grant.revoked = True
+                revoked += 1
+        return revoked
 
 
 def mission_domains(principal: str, resource_id: str, session_token: str | None = None) -> frozenset[str]:

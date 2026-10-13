@@ -133,9 +133,10 @@ test("G5 IPC exposes only the fixed typed operations", async () => {
     return JSON.stringify({ ok: true, session_active: true });
   });
   await ipc.sessionStatus();
-  const opened = await ipc.openSession("senha sintética de teste");
+  const opened = await ipc.openSession();
   await ipc.createMissionReadGrant();
   await ipc.revokeMissionReadGrant();
+  await ipc.revokeReviewGrant();
   await ipc.listMissions();
   const review = { id: "review_12345678", revision: 1, sha256: "a".repeat(64), title: "Rascunho local" };
   await ipc.pendingReviews();
@@ -145,13 +146,13 @@ test("G5 IPC exposes only the fixed typed operations", async () => {
   await ipc.closeSession();
   assert.deepEqual(calls.map(({ command }) => command), [
     "g5_session_status", "g5_session_open", "g5_mission_read_grant_create",
-    "g5_mission_read_grant_revoke", "g5_missions_list", "g5_reviews_pending",
+    "g5_mission_read_grant_revoke", "g5_review_grant_revoke", "g5_missions_list", "g5_reviews_pending",
     "g5_review_draft", "g5_review_detail", "g5_review_approve", "g5_session_close",
   ]);
-  assert.deepEqual(calls[1].args, { passphrase: "senha sintética de teste" });
+  assert.equal(calls[1].args, undefined);
   assert.equal(draft.queued, true);
-  assert.deepEqual(calls[7].args, { reviewId: review.id, revision: 1, sha256: review.sha256 });
   assert.deepEqual(calls[8].args, { reviewId: review.id, revision: 1, sha256: review.sha256 });
+  assert.deepEqual(calls[9].args, { reviewId: review.id, revision: 1, sha256: review.sha256 });
   assert.equal(opened.session_active, true);
 });
 
@@ -192,4 +193,50 @@ test("parser G5 aceita detalhe tipado e recusa controles antes da UI", () => {
     ok: true,
     review_detail: { ...detail, content: "texto\u0000injetado" },
   })));
+});
+
+test("workflow IPC permanece fechado e exige objeto de tarefa validado", async () => {
+  const calls = [];
+  const task = {
+    task_id: "a".repeat(32), tool_id: "simulate_action", state: "awaiting_approval",
+    arguments_sha: "b".repeat(64), created_at: "2026-10-12T12:00:00+00:00",
+    updated_at: "2026-10-12T12:00:00+00:00", risk: "medium", expected_effect: "simulação local sem envio",
+    idempotency_key: "workflow-idempotency-1", permission: "mission:review", timeout_ms: 500,
+    limit: 1, retry: { max_attempts: 2, retryable: ["transient_local"] }, enabled: true,
+    preview: {
+      service: "E-mail sintético (simulação local)", account: "operator@example.test",
+      target: "synthetic-outbox", payload: { subject: "Assunto", body: "Corpo sintético" },
+      consequence: "Nenhuma mensagem será enviada.", data_sent: [], risk: "medium",
+    },
+  };
+  const ipc = createG5Ipc(async (command, args) => {
+    calls.push({ command, args });
+    if (command === "g5_workflow_list") return JSON.stringify({ ok: true, tasks: [{
+      task_id: task.task_id, tool_id: task.tool_id, state: task.state,
+      arguments_sha: task.arguments_sha, created_at: task.created_at, updated_at: task.updated_at,
+      risk: task.risk, expected_effect: task.expected_effect,
+    }] });
+    return JSON.stringify({ ok: true, task });
+  });
+  await ipc.workflowSubmitSimulation("Assunto", "Corpo sintético");
+  await ipc.workflowList();
+  const detail = await ipc.workflowDetail(task.task_id);
+  await ipc.workflowExecuteSimulation(task.task_id);
+  await ipc.workflowPause(task.task_id);
+  await ipc.workflowResume(task.task_id);
+  await ipc.workflowCancel(task.task_id);
+  assert.deepEqual(calls.map(({ command }) => command), [
+    "g5_workflow_submit_simulation", "g5_workflow_list", "g5_workflow_detail",
+    "g5_workflow_execute_simulation", "g5_workflow_pause", "g5_workflow_resume", "g5_workflow_cancel",
+  ]);
+  assert.equal(detail.task.preview.data_sent.length, 0);
+  assert.equal("url" in calls[0].args, false);
+  assert.equal("method" in calls[0].args, false);
+  const summary = {
+    task_id: task.task_id, tool_id: task.tool_id, state: task.state,
+    arguments_sha: task.arguments_sha, created_at: task.created_at, updated_at: task.updated_at,
+    risk: task.risk, expected_effect: task.expected_effect,
+  };
+  assert.throws(() => parseG5CommandResult(JSON.stringify({ ok: true, tasks: Array(5).fill(summary) })));
+  assert.throws(() => parseG5CommandResult(JSON.stringify({ ok: true, task: { ...task, tool_id: "arbitrary_url" } })));
 });

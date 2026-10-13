@@ -49,10 +49,19 @@ APP_PATHS = frozenset(
         ("POST", "/v1/app/captures/clear"),
         ("POST", "/v1/app/connectors/status"),
         ("POST", "/v1/app/grants/mission-review"),
+        ("POST", "/v1/app/grants/mission-review/revoke"),
         ("POST", "/v1/app/reviews/pending"),
         ("POST", "/v1/app/reviews/draft"),
         ("POST", "/v1/app/reviews/detail"),
         ("POST", "/v1/app/reviews/approve"),
+        ("POST", "/v1/app/workflows/submit"),
+        ("POST", "/v1/app/workflows/list"),
+        ("POST", "/v1/app/workflows/detail"),
+        ("POST", "/v1/app/workflows/approve"),
+        ("POST", "/v1/app/workflows/execute"),
+        ("POST", "/v1/app/workflows/pause"),
+        ("POST", "/v1/app/workflows/resume"),
+        ("POST", "/v1/app/workflows/cancel"),
     }
 )
 CONTROL_PATHS = frozenset(

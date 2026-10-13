@@ -41,11 +41,20 @@ const APP_CAPTURE_LIST_ROUTE: &str = "/v1/app/captures/list";
 const APP_CAPTURE_CLEAR_ROUTE: &str = "/v1/app/captures/clear";
 const APP_CONNECTORS_STATUS_ROUTE: &str = "/v1/app/connectors/status";
 const APP_REVIEW_GRANT_ROUTE: &str = "/v1/app/grants/mission-review";
+const APP_REVIEW_GRANT_REVOKE_ROUTE: &str = "/v1/app/grants/mission-review/revoke";
 const APP_REVIEWS_PENDING_ROUTE: &str = "/v1/app/reviews/pending";
 const APP_REVIEW_DRAFT_ROUTE: &str = "/v1/app/reviews/draft";
 const APP_REVIEW_DETAIL_ROUTE: &str = "/v1/app/reviews/detail";
 const APP_REVIEW_APPROVE_ROUTE: &str = "/v1/app/reviews/approve";
-const APP_ROUTES: [&str; 16] = [
+const APP_WORKFLOW_SUBMIT_ROUTE: &str = "/v1/app/workflows/submit";
+const APP_WORKFLOW_LIST_ROUTE: &str = "/v1/app/workflows/list";
+const APP_WORKFLOW_DETAIL_ROUTE: &str = "/v1/app/workflows/detail";
+const APP_WORKFLOW_APPROVE_ROUTE: &str = "/v1/app/workflows/approve";
+const APP_WORKFLOW_EXECUTE_ROUTE: &str = "/v1/app/workflows/execute";
+const APP_WORKFLOW_PAUSE_ROUTE: &str = "/v1/app/workflows/pause";
+const APP_WORKFLOW_RESUME_ROUTE: &str = "/v1/app/workflows/resume";
+const APP_WORKFLOW_CANCEL_ROUTE: &str = "/v1/app/workflows/cancel";
+const APP_ROUTES: [&str; 25] = [
     APP_SESSION_OPEN_ROUTE,
     APP_SESSION_CLOSE_ROUTE,
     APP_GRANT_CREATE_ROUTE,
@@ -58,10 +67,19 @@ const APP_ROUTES: [&str; 16] = [
     APP_CAPTURE_CLEAR_ROUTE,
     APP_CONNECTORS_STATUS_ROUTE,
     APP_REVIEW_GRANT_ROUTE,
+    APP_REVIEW_GRANT_REVOKE_ROUTE,
     APP_REVIEWS_PENDING_ROUTE,
     APP_REVIEW_DRAFT_ROUTE,
     APP_REVIEW_DETAIL_ROUTE,
     APP_REVIEW_APPROVE_ROUTE,
+    APP_WORKFLOW_SUBMIT_ROUTE,
+    APP_WORKFLOW_LIST_ROUTE,
+    APP_WORKFLOW_DETAIL_ROUTE,
+    APP_WORKFLOW_APPROVE_ROUTE,
+    APP_WORKFLOW_EXECUTE_ROUTE,
+    APP_WORKFLOW_PAUSE_ROUTE,
+    APP_WORKFLOW_RESUME_ROUTE,
+    APP_WORKFLOW_CANCEL_ROUTE,
 ];
 const CONNECT_TIMEOUT: Duration = Duration::from_millis(350);
 const REQUEST_TIMEOUT: Duration = Duration::from_millis(900);
