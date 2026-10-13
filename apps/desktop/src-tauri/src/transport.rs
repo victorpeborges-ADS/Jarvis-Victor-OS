@@ -54,7 +54,14 @@ const APP_WORKFLOW_EXECUTE_ROUTE: &str = "/v1/app/workflows/execute";
 const APP_WORKFLOW_PAUSE_ROUTE: &str = "/v1/app/workflows/pause";
 const APP_WORKFLOW_RESUME_ROUTE: &str = "/v1/app/workflows/resume";
 const APP_WORKFLOW_CANCEL_ROUTE: &str = "/v1/app/workflows/cancel";
-const APP_ROUTES: [&str; 25] = [
+const APP_AUTOMATION_LIST_ROUTE: &str = "/v1/app/automations/list";
+const APP_AUTOMATION_DETAIL_ROUTE: &str = "/v1/app/automations/detail";
+const APP_AUTOMATION_HISTORY_ROUTE: &str = "/v1/app/automations/history";
+const APP_AUTOMATION_RUN_ROUTE: &str = "/v1/app/automations/run";
+const APP_AUTOMATION_CREATE_ROUTE: &str = "/v1/app/automations/create";
+const APP_AUTOMATION_TIMEZONE_ROUTE: &str = "/v1/app/automations/timezone";
+const APP_AUTOMATION_CONTROL_ROUTE: &str = "/v1/app/automations/control";
+const APP_ROUTES: [&str; 32] = [
     APP_SESSION_OPEN_ROUTE,
     APP_SESSION_CLOSE_ROUTE,
     APP_GRANT_CREATE_ROUTE,
@@ -80,6 +87,13 @@ const APP_ROUTES: [&str; 25] = [
     APP_WORKFLOW_PAUSE_ROUTE,
     APP_WORKFLOW_RESUME_ROUTE,
     APP_WORKFLOW_CANCEL_ROUTE,
+    APP_AUTOMATION_LIST_ROUTE,
+    APP_AUTOMATION_DETAIL_ROUTE,
+    APP_AUTOMATION_HISTORY_ROUTE,
+    APP_AUTOMATION_RUN_ROUTE,
+    APP_AUTOMATION_CREATE_ROUTE,
+    APP_AUTOMATION_TIMEZONE_ROUTE,
+    APP_AUTOMATION_CONTROL_ROUTE,
 ];
 const CONNECT_TIMEOUT: Duration = Duration::from_millis(350);
 const REQUEST_TIMEOUT: Duration = Duration::from_millis(900);

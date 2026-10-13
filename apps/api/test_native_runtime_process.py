@@ -51,6 +51,13 @@ APP_PATHS = {
     "/v1/app/workflows/pause",
     "/v1/app/workflows/resume",
     "/v1/app/workflows/cancel",
+    "/v1/app/automations/list",
+    "/v1/app/automations/detail",
+    "/v1/app/automations/history",
+    "/v1/app/automations/run",
+    "/v1/app/automations/create",
+    "/v1/app/automations/timezone",
+    "/v1/app/automations/control",
 }
 
 
@@ -316,6 +323,34 @@ def test_supervised_fastapi_g5_vertical_flow_and_stop(tmp_path):
         session = _fields(opened)
         assert session["ok"] == "true" and session["principal"] == "owner"
         assert PASSPHRASE not in opened.decode("ascii")
+
+        status, empty_automations = client.request(
+            "POST", "/v1/app/automations/list",
+            _body(session_token=session["session_token"]),
+        )
+        assert status == 200
+        assert _fields(empty_automations) == {"ok": "true", "items": "", "count": "0"}
+
+        status, created = client.request(
+            "POST", "/v1/app/automations/create",
+            _body(
+                session_token=session["session_token"], csrf_token=session["csrf_token"],
+                kind="reminder", title="Lembrete de processo", recurrence="once",
+                local_schedule="2099-01-01T09:00", timezone="UTC",
+                quiet_start="", quiet_end="", message="Rascunho local sintético",
+                sources_confirmed="none",
+            ),
+        )
+        created_fields = _fields(created)
+        assert status == 200 and created_fields["ok"] == "true"
+        assert created_fields["workflow_version"] == "reminder.v1"
+        status, listed_automations = client.request(
+            "POST", "/v1/app/automations/list",
+            _body(session_token=session["session_token"]),
+        )
+        listed_fields = _fields(listed_automations)
+        assert status == 200 and listed_fields["count"] == "1"
+        assert created_fields["id"] in listed_fields["items"]
 
         status, denied = client.request(
             "POST",

@@ -240,3 +240,68 @@ test("workflow IPC permanece fechado e exige objeto de tarefa validado", async (
   assert.throws(() => parseG5CommandResult(JSON.stringify({ ok: true, tasks: Array(5).fill(summary) })));
   assert.throws(() => parseG5CommandResult(JSON.stringify({ ok: true, task: { ...task, tool_id: "arbitrary_url" } })));
 });
+
+
+test("automações locais usam somente IPC tipado e descartam campos inesperados", async () => {
+  const calls = [];
+  const automation = {
+    id: "0123456789abcdef0123456789abcdef",
+    kind: "reminder",
+    title: "Lembrete",
+    recurrence: "daily",
+    local_schedule: "09:00",
+    timezone: "America/Sao_Paulo",
+    state: "active",
+    next_run_at: "2026-10-13T12:00:00.000000+00:00",
+    workflow_version: "reminder.v1",
+    sources: ["user-authored-reminder"],
+    quiet_start: "",
+    quiet_end: "",
+    message: "Revisar",
+  };
+  const run = {
+    id: "fedcba9876543210fedcba9876543210",
+    scheduled_for: "2026-10-13T12:00:00.000000+00:00",
+    status: "succeeded",
+    attempts: 1,
+    error_code: "",
+    completed_at: "2026-10-13T12:00:01.000000+00:00",
+    workflow_version: "reminder.v1",
+    sources: [{ source: "user-authored-reminder", id: "0123456789abcdef0123456789abcdef", observed_at: "2026-10-12T12:00:00.000000+00:00" }],
+    output: "Revisar",
+  };
+  const ipc = createG5Ipc(async (command, args) => {
+    calls.push({ command, args });
+    if (command === "g5_automations_list") return JSON.stringify({ ok: true, automations: [{ ...automation, message: undefined }], csrf_token: "descartar" });
+    if (command === "g5_automation_history") return JSON.stringify({ ok: true, runs: [{ ...run, output: undefined, sources: "user-authored-reminder" }] });
+    if (command === "g5_automation_run") return JSON.stringify({ ok: true, run, session_token: "descartar" });
+    if (command === "g5_automation_create") return JSON.stringify({ ok: true, id: automation.id, state: "active", next_run_at: automation.next_run_at, workflow_version: "reminder.v1" });
+    if (command === "g5_automation_timezone") return JSON.stringify({ ok: true, id: automation.id, timezone: "UTC", next_run_at: automation.next_run_at });
+    if (command === "g5_automation_control") return JSON.stringify({ ok: true, id: automation.id, state: "paused", next_run_at: "" });
+    return JSON.stringify({ ok: true, automation, secret: "descartar" });
+  });
+  const listed = await ipc.automationsList();
+  const detail = await ipc.automationDetail(automation.id);
+  const history = await ipc.automationHistory(automation.id);
+  const opened = await ipc.automationRun(automation.id, run.id);
+  const created = await ipc.automationCreate({
+    kind: "reminder", title: "Lembrete", recurrence: "daily", localSchedule: "09:00",
+    timezone: "UTC", quietStart: "", quietEnd: "", message: "Revisar", confirmLocalSources: false,
+  });
+  await ipc.automationTimezone(automation.id, "UTC");
+  await ipc.automationControl(automation.id, "pause");
+  assert.equal(listed.automations?.[0]?.sources[0], "user-authored-reminder");
+  assert.equal(detail.automation?.workflow_version, "reminder.v1");
+  assert.equal(history.runs?.[0]?.status, "succeeded");
+  assert.equal(opened.run?.output, "Revisar");
+  assert.equal(created.id, automation.id);
+  assert.equal("csrf_token" in listed, false);
+  assert.deepEqual(calls.map(({ command }) => command), [
+    "g5_automations_list", "g5_automation_detail", "g5_automation_history", "g5_automation_run",
+    "g5_automation_create", "g5_automation_timezone", "g5_automation_control",
+  ]);
+  assert.deepEqual(calls[4].args, {
+    kind: "reminder", title: "Lembrete", recurrence: "daily", localSchedule: "09:00",
+    timezone: "UTC", quietStart: "", quietEnd: "", message: "Revisar", confirmLocalSources: false,
+  });
+});

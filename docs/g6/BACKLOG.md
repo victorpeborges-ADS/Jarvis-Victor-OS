@@ -168,6 +168,16 @@ Prioridades indicam precedência, não estimativa de duração. “Arquivos prov
 
 ## P2 — polish
 
+### G6-LOCAL-001 — Automações locais persistentes
+
+- **Subgate:** macOS local, primeiro marco
+- **Estado:** implementação candidata descrita em [LOCAL_AUTOMATIONS.md](LOCAL_AUTOMATIONS.md); sem aceite até revisão e smoke manual da janela.
+- **Objetivo:** lembretes, briefing e revisão local agendados apenas enquanto o runtime do app está ativo.
+- **Dependências:** SQLite local, supervisor MAC-003, sessão G5 e grant mission:read revalidado para leitura.
+- **Limites:** sem daemon, notificação de sistema, rede/modelo ou ação externa; execuções perdidas exigem recuperação explícita.
+- **Testes:** relógio injetável, DST/fuso, quiet hours, atraso/reboot, idempotência concorrente, retries limitados, migração, API supervisionada, IPC e build.
+- **Aceite pendente:** testes focados verdes e smoke Tauri real confirmando cadastro, aviso/rascunho, pausa/retomada, missed-run e recuperação consentida.
+
 ### G6-UX-001 — Paridade visual/editorial
 
 - **Subgate:** G6.5

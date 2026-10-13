@@ -105,3 +105,7 @@ A revisão do estado anterior encontrou que uma chamada direta ao comando IPC po
 O diálogo nativo usa `tauri-plugin-dialog`, dependência adicionada porque o checkbox do WebView não é uma fronteira de confiança. O corpo não contém tokens, passphrase ou segredos; os testes não iniciam uma janela. O smoke visual com a janela real e cancelamento/confirmação do diálogo continua pendente do proprietário.
 
 O aceite histórico em `G6_MAC_002_2_MAC_003_ACEITE.md` não foi reescrito. Gmail e Calendar continuam desconectados. O smoke visual da jornada nova de Aprovações ainda precisa ser executado pelo proprietário.
+
+## Candidata composta Phase 5 — 2026-10-13
+
+Na candidata isolada `codex/jarvis-integration-candidate`, a abertura do G5 mantém a passphrase somente na entrada nativa oculta; React e o comando IPC de abertura não recebem o valor. A criação do grant `mission:review` agora também exige diálogo nativo antes da chamada fixa ao backend. A aprovação por item já exige confirmação nativa vinculada ao detalhe atual do servidor. Esses fluxos foram cobertos por regressões Rust/API/IPC, mas nenhum diálogo nem janela real foi observado. O roteiro e os limites estão em [`INTEGRATION_CANDIDATE_2026-10-13.md`](INTEGRATION_CANDIDATE_2026-10-13.md); o smoke manual do proprietário permanece pendente.

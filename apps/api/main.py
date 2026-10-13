@@ -1,5 +1,6 @@
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
+import asyncio
 import hashlib
 import hmac
 import os
@@ -27,6 +28,7 @@ from contract import (
     read_raw_fixture,
 )
 from local_security import router as real_router
+from local_automations import LocalAutomationScheduler, run_app_worker
 from mission_api import router as mission_router
 from review_api import router as review_router
 from knowledge_api import router as knowledge_router
@@ -202,6 +204,7 @@ def create_native_app(
 ) -> FastAPI:
     """Build the closed UDS-only app; web/demo routers are deliberately absent."""
     store = SQLiteMemoryStore(database_path)
+    automation_scheduler = LocalAutomationScheduler(store)
     calendar_provider = CalendarProvider()
     calendar_sync_service = CalendarSyncService(store, calendar_provider)
 
@@ -211,7 +214,15 @@ def create_native_app(
         from source_admission import reconcile_legacy_selected_sources
         reconcile_legacy_selected_sources(store)
         recover_interrupted(store)
-        yield
+        worker = asyncio.create_task(run_app_worker(automation_scheduler))
+        try:
+            yield
+        finally:
+            worker.cancel()
+            try:
+                await worker
+            except asyncio.CancelledError:
+                pass
 
     app = FastAPI(
         title="JARVIS MAC-003 local runtime",
@@ -221,6 +232,7 @@ def create_native_app(
         lifespan=lifespan,
     )
     app.state.memory_store = store
+    app.state.local_automation_scheduler = automation_scheduler
     app.state.calendar_sim_provider = calendar_provider
     app.state.calendar_sync_service = calendar_sync_service
     app.include_router(create_native_runtime_router(identity))

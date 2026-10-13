@@ -81,4 +81,25 @@ h1 { margin: 8px 0 28px; font-family: Georgia, serif; font-size: clamp(30px, 5vw
 .workflow-list li span { color: #596579; font-size: 14px; }
 @media (max-width: 720px) { .shell { grid-template-columns: 1fr; } .rail { padding: 14px; border-right: 0; border-bottom: 1px solid #e4e8ef; gap: 12px; } .rail nav { display: flex; overflow-x: auto; } .nav-item { flex: none; text-align: center; } .rail-note { display: none; } .content { padding: 28px 18px; } .card { padding: 20px; } }
 @media (prefers-color-scheme: dark) { :root { color: #edf1f7; background: #141b28; } .rail, .card { background: #1c2636; border-color: #37465a; } .nav-item { color: #c9d2df; } .nav-item:hover { background: #28364a; } .nav-item.active, .action { background: #bca5ff; border-color: #bca5ff; color: #181427; } .card p, .rail-note, .card li span:last-child, .capture-list small, .field-hint, .workflow-list li span { color: #c3cfdd; } .card li, .card textarea, .g5-card input[type="password"], .workflow-panel input:not([type="checkbox"]) { background: #1c2636; border-color: #58677b; color: #edf1f7; } .badge { background: #413919; border-color: #817333; color: #ffe69b; } .action.secondary { color: #edf1f7; border-color: #aebbd0; } .notice { background: #392c52; color: #f2eaff; } .g5-state, .g5-results, .workflow-panel { border-color: #37465a; } .mission-summary, .review-detail, .workflow-panel .g5-form { border-color: #58677b; } .review-detail pre { background: #121923; color: #edf1f7; } }
+.automation-page { display: grid; gap: 12px; }
+.automation-form { display: grid; gap: 10px; border-top: 1px solid #e5e9f0; padding-top: 12px; }
+.automation-form input:not([type="checkbox"]), .automation-form select, .automation-form textarea,
+.automation-page > select, .automation-card input {
+  width: 100%; min-height: 44px; padding: 10px 12px; border: 1px solid #8994a5;
+  border-radius: 10px; color: inherit; background: #fff;
+}
+.automation-form textarea { min-height: 76px; resize: vertical; }
+.automation-quiet { display: grid; grid-template-columns: auto minmax(120px, 1fr); gap: 8px 12px; border: 1px solid #e5e9f0; border-radius: 10px; padding: 12px; }
+.automation-quiet legend { padding: 0 6px; }
+.automation-quiet small { grid-column: 1 / -1; color: #596579; }
+.automation-card { display: grid; gap: 4px; border-top: 1px solid #e5e9f0; padding-top: 14px; }
+.automation-card h3 { margin: 0; }
+.automation-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.automation-actions input { max-width: 250px; }
+.automation-history { display: grid; gap: 10px; padding: 0; list-style: none; }
+.automation-history li { display: flex; justify-content: space-between; align-items: center; gap: 12px; flex-wrap: wrap; border: 1px solid #e5e9f0; border-radius: 12px; padding: 14px; }
+.automation-history li > div:first-child { display: grid; gap: 4px; }
+.automation-history small { color: #596579; }
+@media (max-width: 720px) { .shell { grid-template-columns: 1fr; } .rail { padding: 14px; border-right: 0; border-bottom: 1px solid #e4e8ef; gap: 12px; } .rail nav { display: flex; overflow-x: auto; } .nav-item { flex: none; text-align: center; } .rail-note { display: none; } .content { padding: 28px 18px; } .card { padding: 20px; } }
+@media (prefers-color-scheme: dark) { :root { color: #edf1f7; background: #141b28; } .rail, .card { background: #1c2636; border-color: #37465a; } .nav-item { color: #c9d2df; } .nav-item:hover { background: #28364a; } .nav-item.active, .action { background: #bca5ff; border-color: #bca5ff; color: #181427; } .card p, .rail-note, .card li span:last-child, .capture-list small, .field-hint, .automation-history small, .automation-quiet small { color: #c3cfdd; } .card li, .card textarea, .g5-card input[type="password"], .automation-form input, .automation-form select, .automation-form textarea, .automation-page > select, .automation-card input { background: #1c2636; border-color: #58677b; color: #edf1f7; } .badge { background: #413919; border-color: #817333; color: #ffe69b; } .action.secondary { color: #edf1f7; border-color: #aebbd0; } .notice { background: #392c52; color: #f2eaff; } .g5-state, .g5-results { border-color: #37465a; } .mission-summary, .review-detail, .automation-quiet, .automation-card, .automation-form { border-color: #58677b; } .review-detail pre { background: #121923; color: #edf1f7; } }
 @media (prefers-reduced-motion: reduce) { *, *::before, *::after { scroll-behavior: auto !important; transition-duration: 0.01ms !important; animation-duration: 0.01ms !important; } }

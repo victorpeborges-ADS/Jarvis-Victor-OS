@@ -62,6 +62,13 @@ APP_PATHS = frozenset(
         ("POST", "/v1/app/workflows/pause"),
         ("POST", "/v1/app/workflows/resume"),
         ("POST", "/v1/app/workflows/cancel"),
+        ("POST", "/v1/app/automations/list"),
+        ("POST", "/v1/app/automations/detail"),
+        ("POST", "/v1/app/automations/history"),
+        ("POST", "/v1/app/automations/run"),
+        ("POST", "/v1/app/automations/create"),
+        ("POST", "/v1/app/automations/timezone"),
+        ("POST", "/v1/app/automations/control"),
     }
 )
 CONTROL_PATHS = frozenset(

@@ -941,3 +941,164 @@ def test_native_workflow_list_stays_within_mac003_response_limit(native_client):
     assert listed["ok"] == "true"
     assert len(json.loads(listed["tasks_json"])) == 4
     assert len(listed_response.content) <= 2048
+
+
+def test_native_automation_routes_require_session_and_local_read_grant(native_client):
+    unauthenticated = fields(native_client.post(
+        "/v1/app/automations/list", content=body(session_token=""), headers=HEADERS
+    ))
+    assert unauthenticated == {"ok": "false", "code": "session_required"}
+
+    token, csrf = login(native_client)
+    reminder = fields(native_client.post(
+        "/v1/app/automations/create",
+        content=body(
+            session_token=token, csrf_token=csrf, kind="reminder", title="Lembrete sintético",
+            recurrence="once", local_schedule="2099-01-01T09:00", timezone="UTC",
+            quiet_start="", quiet_end="", message="Revisar teste local", sources_confirmed="none",
+        ),
+        headers=HEADERS,
+    ))
+    assert reminder["ok"] == "true"
+    assert reminder["state"] == "active"
+    assert reminder["workflow_version"] == "reminder.v1"
+
+    denied_briefing = fields(native_client.post(
+        "/v1/app/automations/create",
+        content=body(
+            session_token=token, csrf_token=csrf, kind="morning_briefing", title="Briefing local",
+            recurrence="once", local_schedule="2099-01-02T09:00", timezone="UTC",
+            quiet_start="", quiet_end="", message="", sources_confirmed="local-only",
+        ),
+        headers=HEADERS,
+    ))
+    assert denied_briefing == {"ok": "false", "code": "authorization_required"}
+
+    grant = fields(native_client.post(
+        "/v1/app/grants/mission-read",
+        content=body(session_token=token, csrf_token=csrf, domain_id="dom_synthetic_a"),
+        headers=HEADERS,
+    ))
+    assert grant["ok"] == "true"
+    briefing = fields(native_client.post(
+        "/v1/app/automations/create",
+        content=body(
+            session_token=token, csrf_token=csrf, kind="morning_briefing", title="Briefing local",
+            recurrence="once", local_schedule="2099-01-02T09:00", timezone="UTC",
+            quiet_start="", quiet_end="", message="", sources_confirmed="local-only",
+        ),
+        headers=HEADERS,
+    ))
+    assert briefing["ok"] == "true"
+    assert briefing["workflow_version"] == "morning-briefing.v1"
+
+    listed = fields(native_client.post(
+        "/v1/app/automations/list", content=body(session_token=token), headers=HEADERS
+    ))
+    assert listed["ok"] == "true" and listed["count"] == "2"
+    assert "Lembrete sintético" in listed["items"]
+    assert "Briefing local" in listed["items"]
+    briefing_detail = fields(native_client.post(
+        "/v1/app/automations/detail",
+        content=body(session_token=token, automation_id=briefing["id"]),
+        headers=HEADERS,
+    ))
+    assert briefing_detail["ok"] == "true"
+    assert briefing_detail["sources"] == "local_captures,missions:dom_synthetic_a"
+    assert briefing_detail["workflow_version"] == "morning-briefing.v1"
+
+    paused = fields(native_client.post(
+        "/v1/app/automations/control",
+        content=body(session_token=token, csrf_token=csrf, automation_id=reminder["id"], action="pause", run_id=""),
+        headers=HEADERS,
+    ))
+    assert paused["ok"] == "true" and paused["state"] == "paused"
+    changed_zone = fields(native_client.post(
+        "/v1/app/automations/timezone",
+        content=body(session_token=token, csrf_token=csrf, automation_id=reminder["id"], timezone="America/Sao_Paulo"),
+        headers=HEADERS,
+    ))
+    assert changed_zone["ok"] == "true" and changed_zone["timezone"] == "America/Sao_Paulo"
+    assert changed_zone["next_run_at"] == ""
+    history = fields(native_client.post(
+        "/v1/app/automations/history",
+        content=body(session_token=token, automation_id=reminder["id"]), headers=HEADERS,
+    ))
+    assert history == {"ok": "true", "items": "", "count": "0"}
+
+    capture = fields(native_client.post(
+        "/v1/app/captures/create",
+        content=body(session_token=token, csrf_token=csrf, text="Ideia local de teste"),
+        headers=HEADERS,
+    ))
+    assert capture["ok"] == "true"
+    from datetime import timezone
+    from local_automations import list_runs
+
+    due = datetime.now(timezone.utc) + timedelta(seconds=1)
+    due_text = due.isoformat(timespec="microseconds")
+    scheduler = native_client.app.state.local_automation_scheduler
+    scheduler.clock = lambda: due
+    with native_client.app.state.memory_store.transaction() as connection:
+        connection.execute(
+            "UPDATE local_automations SET next_run_at_utc=? WHERE id=?",
+            (due_text, briefing["id"]),
+        )
+    assert scheduler.run_due(due) == 1
+    run = list_runs(native_client.app.state.memory_store, "owner", briefing["id"])[0]
+    assert run["status"] == "succeeded"
+    result = fields(native_client.post(
+        "/v1/app/automations/run",
+        content=body(session_token=token, automation_id=briefing["id"], run_id=run["id"]),
+        headers=HEADERS,
+    ))
+    assert result["ok"] == "true"
+    assert "Ideia local de teste" in result["output"]
+    assert "local_captures" in result["sources"]
+
+    revoked = fields(native_client.post(
+        "/v1/app/grants/mission-read/revoke",
+        content=body(session_token=token, csrf_token=csrf, grant_id=grant["grant_id"]),
+        headers=HEADERS,
+    ))
+    assert revoked == {"ok": "true", "revoked": "true"}
+    denied_history = fields(native_client.post(
+        "/v1/app/automations/history",
+        content=body(session_token=token, automation_id=briefing["id"]),
+        headers=HEADERS,
+    ))
+    denied_result = fields(native_client.post(
+        "/v1/app/automations/run",
+        content=body(session_token=token, automation_id=briefing["id"], run_id=run["id"]),
+        headers=HEADERS,
+    ))
+    assert denied_history == denied_result == {
+        "ok": "false", "code": "authorization_required"
+    }
+    reminder_history = fields(native_client.post(
+        "/v1/app/automations/history",
+        content=body(session_token=token, automation_id=reminder["id"]),
+        headers=HEADERS,
+    ))
+    assert reminder_history == {"ok": "true", "items": "", "count": "0"}
+
+def test_maximum_unicode_automation_values_fit_the_closed_api_responses(native_client):
+    token, csrf = login(native_client)
+    for day in (1, 2, 3):
+        created = fields(native_client.post(
+            "/v1/app/automations/create",
+            content=body(
+                session_token=token, csrf_token=csrf, kind="reminder", title="🧠" * 24,
+                recurrence="once", local_schedule=f"2099-03-{day:02d}T09:00", timezone="UTC",
+                quiet_start="", quiet_end="", message="🧠" * 32, sources_confirmed="none",
+            ),
+            headers=HEADERS,
+        ))
+        assert created["ok"] == "true"
+    response = native_client.post(
+        "/v1/app/automations/list", content=body(session_token=token), headers=HEADERS
+    )
+    assert response.status_code == 200
+    assert len(response.content) <= 2048
+    listed = fields(response)
+    assert listed["ok"] == "true" and listed["count"] == "3"

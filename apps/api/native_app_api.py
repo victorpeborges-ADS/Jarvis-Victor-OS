@@ -22,6 +22,7 @@ from local_security import (
     _open_session_for_passphrase,
     _revoke_grant_for_session,
     _close_session_for,
+    mission_read_confirmed,
     mission_read_scope_confirmed,
     mission_review_confirmed,
     native_session_confirmed,
@@ -36,6 +37,16 @@ from local_captures import (
     encode_capture_items,
     list_captures,
     update_capture,
+)
+from local_automations import (
+    AutomationError,
+    control_automation,
+    create_automation,
+    get_automation,
+    get_run,
+    list_automations,
+    list_runs,
+    update_timezone,
 )
 from mission_repository import MissionConflict, MissionCorrupt, MissionDenied, MissionRejected, MissionRepository
 from memory_store import MemoryStoreError
@@ -89,6 +100,21 @@ EXPECTED_FIELDS = {
     "/v1/app/workflows/pause": ("session_token", "csrf_token", "task_id"),
     "/v1/app/workflows/resume": ("session_token", "csrf_token", "task_id"),
     "/v1/app/workflows/cancel": ("session_token", "csrf_token", "task_id"),
+
+        "/v1/app/automations/list": ("session_token",),
+        "/v1/app/automations/detail": ("session_token", "automation_id"),
+        "/v1/app/automations/history": ("session_token", "automation_id"),
+        "/v1/app/automations/run": ("session_token", "automation_id", "run_id"),
+        "/v1/app/automations/create": (
+        "session_token", "csrf_token", "kind", "title", "recurrence", "local_schedule",
+        "timezone", "quiet_start", "quiet_end", "message", "sources_confirmed",
+    ),
+        "/v1/app/automations/timezone": (
+        "session_token", "csrf_token", "automation_id", "timezone",
+    ),
+        "/v1/app/automations/control": (
+        "session_token", "csrf_token", "automation_id", "action", "run_id",
+    ),
 }
 
 
@@ -155,6 +181,8 @@ def _error(code: str) -> PlainTextResponse:
         "grant_expired",
         "operation_failed",
         "capture_rejected",
+        "automation_invalid", "automation_not_found", "automation_limit",
+        "automation_conflict", "authorization_required",
         "workflow_rejected",
         "recommendation_rejected", "tool_blocked", "schema_rejected", "limit_exceeded",
         "idempotency_key_rejected", "idempotency_conflict", "owner_rejected", "clock_rejected",
@@ -197,6 +225,9 @@ async def open_native_session(request: Request) -> PlainTextResponse:
             return _error("credential_rejected")
         credentials = LoginIn(passphrase=fields["passphrase"])
         session = _open_session_for_passphrase(credentials.passphrase, "native-uds")
+        scheduler = getattr(request.app.state, "local_automation_scheduler", None)
+        if scheduler is not None:
+            scheduler.set_session(session.token)
     except (ValueError, UnicodeError, ValidationError):
         return _error("credential_rejected")
     except HTTPException as exc:
@@ -216,6 +247,9 @@ async def close_native_session(request: Request) -> PlainTextResponse:
         fields = await _read_fields(request, EXPECTED_FIELDS[request.url.path])
         session = _native_session(fields["session_token"], fields["csrf_token"], mutation=True)
         _close_session_for(session)
+        scheduler = getattr(request.app.state, "local_automation_scheduler", None)
+        if scheduler is not None:
+            scheduler.clear_session(session.token)
     except (ValueError, UnicodeError):
         return _error("session_required")
     except HTTPException as exc:
@@ -823,3 +857,223 @@ async def resume_native_workflow(request: Request) -> PlainTextResponse:
 @router.post("/v1/app/workflows/cancel")
 async def cancel_native_workflow(request: Request) -> PlainTextResponse:
     return await _change_native_workflow(request, "cancel")
+
+
+def _encode_automation_rows(items: list[dict]) -> str:
+    fields = (
+        "id", "kind", "recurrence", "local_schedule", "timezone", "state",
+        "next_run_at_utc", "workflow_version", "quiet_start", "quiet_end", "title",
+    )
+    lines = []
+    for item in items:
+        values = ["" if item.get(name) is None else str(item.get(name, "")) for name in fields]
+        if any(any(character in value for character in "\t\n\r") for value in values):
+            raise ValueError("automação inválida")
+        lines.append("\t".join(values))
+    return "\n".join(lines)
+
+def _encode_automation_history(items: list[dict]) -> str:
+    lines = []
+    for item in items:
+        sources = ",".join(str(source.get("source", "")) for source in item.get("sources", []))
+        values = (
+            item["id"], item["scheduled_for_utc"], item["status"], str(item["attempts"]),
+            item.get("error_code") or "", item.get("completed_at") or "",
+            item["workflow_version"], sources,
+        )
+        if any(any(character in value for character in "\t\n\r") for value in values):
+            raise ValueError("histórico inválido")
+        lines.append("\t".join(values))
+    return "\n".join(lines)
+
+def _encode_automation_sources(items: list[dict]) -> str:
+    lines = []
+    for item in items:
+        values = (str(item.get("source", "")), str(item.get("id", "")), str(item.get("observed_at", "")))
+        if any(any(character in value for character in ",;\t\n\r") for value in values):
+            raise ValueError("proveniência inválida")
+        lines.append(",".join(values))
+    return ";".join(lines)
+
+def _automation_error(exc: AutomationError) -> PlainTextResponse:
+    if exc.code in {"automation_invalid", "automation_not_found", "automation_limit", "automation_conflict", "authorization_required"}:
+        return _error(exc.code)
+    return _error("scope_invalid" if exc.code == "scope_invalid" else "operation_failed")
+
+def _confirm_automation_source_access(session, automation: dict) -> None:
+    if automation["kind"] != "reminder":
+        with mission_read_confirmed(session.principal, NATIVE_DOMAIN, session.token):
+            pass
+
+@router.post("/v1/app/automations/list")
+async def list_native_automations(request: Request) -> PlainTextResponse:
+    try:
+        fields = await _read_fields(request, EXPECTED_FIELDS[request.url.path])
+        session = _native_session(fields["session_token"])
+        items = list_automations(request.app.state.memory_store, session.principal)
+        return _success(items=_encode_automation_rows(items), count=len(items))
+    except (ValueError, UnicodeError):
+        return _error("scope_invalid")
+    except HTTPException as exc:
+        return _error_for(exc)
+    except AutomationError as exc:
+        return _automation_error(exc)
+
+@router.post("/v1/app/automations/detail")
+async def detail_native_automation(request: Request) -> PlainTextResponse:
+    try:
+        fields = await _read_fields(request, EXPECTED_FIELDS[request.url.path])
+        session = _native_session(fields["session_token"])
+        item = get_automation(request.app.state.memory_store, session.principal, fields["automation_id"])
+        return _success(
+            id=item["id"], kind=item["kind"], title=item["title"], recurrence=item["recurrence"],
+            local_schedule=item["local_schedule"], timezone=item["timezone"], state=item["state"],
+            next_run_at=item["next_run_at_utc"] or "", workflow_version=item["workflow_version"],
+            sources=",".join(item["sources"]), quiet_start=item["quiet_start"] or "",
+            quiet_end=item["quiet_end"] or "", message=item["message"],
+        )
+    except (ValueError, UnicodeError):
+        return _error("scope_invalid")
+    except HTTPException as exc:
+        return _error_for(exc)
+    except AutomationError as exc:
+        return _automation_error(exc)
+
+@router.post("/v1/app/automations/history")
+async def history_native_automation(request: Request) -> PlainTextResponse:
+    try:
+        fields = await _read_fields(request, EXPECTED_FIELDS[request.url.path])
+        session = _native_session(fields["session_token"])
+        automation = get_automation(
+            request.app.state.memory_store, session.principal, fields["automation_id"]
+        )
+        _confirm_automation_source_access(session, automation)
+        rows = list_runs(request.app.state.memory_store, session.principal, fields["automation_id"], 5)
+        return _success(items=_encode_automation_history(rows), count=len(rows))
+    except (ValueError, UnicodeError):
+        return _error("scope_invalid")
+    except HTTPException as exc:
+        return _error_for(exc)
+    except PermissionError:
+        return _error("authorization_required")
+    except AutomationError as exc:
+        return _automation_error(exc)
+
+@router.post("/v1/app/automations/run")
+async def detail_native_automation_run(request: Request) -> PlainTextResponse:
+    try:
+        fields = await _read_fields(request, EXPECTED_FIELDS[request.url.path])
+        session = _native_session(fields["session_token"])
+        automation = get_automation(
+            request.app.state.memory_store, session.principal, fields["automation_id"]
+        )
+        _confirm_automation_source_access(session, automation)
+        item = get_run(
+            request.app.state.memory_store, session.principal,
+            fields["automation_id"], fields["run_id"],
+        )
+        output = item["result_text"][:80]
+        sources = _encode_automation_sources(item["sources"])
+        return _success(
+            id=item["id"], status=item["status"], output=output,
+            sources=sources, error_code=item["error_code"] or "",
+            scheduled_for=item["scheduled_for_utc"], workflow_version=item["workflow_version"],
+        )
+    except (ValueError, UnicodeError):
+        return _error("scope_invalid")
+    except HTTPException as exc:
+        return _error_for(exc)
+    except PermissionError:
+        return _error("authorization_required")
+    except AutomationError as exc:
+        return _automation_error(exc)
+
+@router.post("/v1/app/automations/create")
+async def create_native_automation(request: Request) -> PlainTextResponse:
+    try:
+        fields = await _read_fields(request, EXPECTED_FIELDS[request.url.path])
+        session = _native_session(fields["session_token"], fields["csrf_token"], mutation=True)
+        if fields["kind"] == "reminder":
+            if fields["sources_confirmed"] != "none":
+                return _error("scope_invalid")
+        else:
+            if fields["sources_confirmed"] != "local-only":
+                return _error("scope_invalid")
+            with mission_read_confirmed(session.principal, NATIVE_DOMAIN, session.token):
+                pass
+        item = create_automation(
+            request.app.state.memory_store,
+            owner=session.principal,
+            kind=fields["kind"],
+            title=fields["title"],
+            recurrence=fields["recurrence"],
+            local_schedule=fields["local_schedule"],
+            timezone_name=fields["timezone"],
+            quiet_start=fields["quiet_start"] or None,
+            quiet_end=fields["quiet_end"] or None,
+            message=fields["message"],
+            now=_now(),
+        )
+        return _success(id=item["id"], state=item["state"], next_run_at=item["next_run_at_utc"], workflow_version=item["workflow_version"])
+    except (ValueError, UnicodeError, ValidationError):
+        return _error("scope_invalid")
+    except HTTPException as exc:
+        return _error_for(exc)
+    except PermissionError:
+        return _error("authorization_required")
+    except AutomationError as exc:
+        return _automation_error(exc)
+    except (MemoryStoreError, OSError, sqlite3.Error):
+        return _error("operation_failed")
+
+@router.post("/v1/app/automations/timezone")
+async def change_native_automation_timezone(request: Request) -> PlainTextResponse:
+    try:
+        fields = await _read_fields(request, EXPECTED_FIELDS[request.url.path])
+        session = _native_session(fields["session_token"], fields["csrf_token"], mutation=True)
+        item = update_timezone(
+            request.app.state.memory_store, session.principal, fields["automation_id"],
+            fields["timezone"], _now(),
+        )
+        return _success(id=item["id"], timezone=item["timezone"], next_run_at=item["next_run_at_utc"] or "")
+    except (ValueError, UnicodeError, ValidationError):
+        return _error("scope_invalid")
+    except HTTPException as exc:
+        return _error_for(exc)
+    except AutomationError as exc:
+        return _automation_error(exc)
+    except (MemoryStoreError, OSError, sqlite3.Error):
+        return _error("operation_failed")
+
+@router.post("/v1/app/automations/control")
+async def control_native_automation(request: Request) -> PlainTextResponse:
+    try:
+        fields = await _read_fields(request, EXPECTED_FIELDS[request.url.path])
+        session = _native_session(fields["session_token"], fields["csrf_token"], mutation=True)
+        item = get_automation(request.app.state.memory_store, session.principal, fields["automation_id"])
+        if fields["action"] in {"recover", "retry"} and item["kind"] != "reminder":
+            with mission_read_confirmed(session.principal, NATIVE_DOMAIN, session.token):
+                pass
+        updated = control_automation(
+            request.app.state.memory_store,
+            owner=session.principal,
+            automation_id=fields["automation_id"],
+            action=fields["action"],
+            run_id=fields["run_id"] or None,
+            now=_now(),
+        )
+        if fields["action"] in {"recover", "retry"}:
+            scheduler = getattr(request.app.state, "local_automation_scheduler", None)
+            if scheduler is not None:
+                scheduler.run_due()
+        return _success(id=updated["id"], state=updated["state"], next_run_at=updated["next_run_at_utc"] or "")
+    except (ValueError, UnicodeError, ValidationError):
+        return _error("scope_invalid")
+    except HTTPException as exc:
+        return _error_for(exc)
+    except PermissionError:
+        return _error("authorization_required")
+    except AutomationError as exc:
+        return _automation_error(exc)
+    except (MemoryStoreError, OSError, sqlite3.Error):
+        return _error("operation_failed")

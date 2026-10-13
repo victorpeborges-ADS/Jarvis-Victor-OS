@@ -28,6 +28,7 @@ const STARTUP_TIMEOUT: Duration = Duration::from_secs(5);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(700);
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
 const POLL_INTERVAL: Duration = Duration::from_millis(10);
+const MAX_G5_APP_REQUEST_BODY_BYTES: usize = 1024;
 const APP_WORKFLOW_SUBMIT_ROUTE: &str = "/v1/app/workflows/submit";
 const APP_WORKFLOW_LIST_ROUTE: &str = "/v1/app/workflows/list";
 const APP_WORKFLOW_DETAIL_ROUTE: &str = "/v1/app/workflows/detail";
@@ -276,6 +277,7 @@ struct G5ReviewDetail {
 }
 
 struct NativeReviewApprovalConfirmed;
+struct NativeReviewGrantConfirmed;
 struct NativeWorkflowApprovalConfirmed;
 
 struct SecretText(String);
@@ -1351,7 +1353,10 @@ impl RuntimeManager {
         result
     }
 
-    fn g5_review_grant_create(&self) -> String {
+    fn g5_review_grant_create_confirmed(
+        &self,
+        _confirmation: NativeReviewGrantConfirmed,
+    ) -> String {
         let _operation = self
             .g5_operation
             .lock()
@@ -1770,6 +1775,370 @@ impl RuntimeManager {
             return g5_error_json("stale_generation");
         }
         format!("{{\"ok\":true,\"approved\":true,\"replayed\":{replayed}}}")
+    }
+
+    fn g5_automation_request(
+        &self,
+        route: &'static str,
+        mutation: bool,
+        extra: &[(&str, &str)],
+        expected: &[&str],
+    ) -> Result<Vec<(String, SecretText)>, &'static str> {
+        let _operation = self
+            .g5_operation
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let (instance_id, transport, token, csrf) = self.g5_credentials_for_active()?;
+        let mut body_fields = vec![("session_token", token.as_str())];
+        if mutation {
+            body_fields.push(("csrf_token", csrf.as_str()));
+        }
+        body_fields.extend_from_slice(extra);
+        let body = SecretBytes::new(encode_application_fields(&body_fields));
+        if body.as_slice().len() > MAX_G5_APP_REQUEST_BODY_BYTES {
+            return Err("scope_invalid");
+        }
+        let response = transport
+            .call_g5_application(route, body.as_slice())
+            .map_err(|_| "transport_failure")?;
+        let response = SecretBytes::new(response);
+        let fields =
+            parse_application_response(response.as_slice()).map_err(|_| "protocol_failure")?;
+        if let Some(error) = app_response_error(&fields) {
+            clear_cached_authorization_after_rejection(
+                &self.shared,
+                &instance_id,
+                &transport,
+                token.as_str(),
+                error,
+            );
+            return Err(error);
+        }
+        let mut expected_with_ok = Vec::with_capacity(expected.len() + 1);
+        expected_with_ok.push("ok");
+        expected_with_ok.extend_from_slice(expected);
+        if app_field(&fields, "ok") != Some("true") || !app_fields_match(&fields, &expected_with_ok)
+        {
+            return Err("protocol_failure");
+        }
+        let inner = lock_inner(&self.shared);
+        if !g5_generation_matches(&inner, &instance_id, &transport)
+            || inner
+                .g5_session
+                .as_ref()
+                .is_none_or(|session| session.token.as_str() != token.as_str())
+        {
+            return Err("stale_generation");
+        }
+        Ok(fields)
+    }
+
+    fn g5_automations_list(&self) -> String {
+        let fields = match self.g5_automation_request(
+            "/v1/app/automations/list",
+            false,
+            &[],
+            &["items", "count"],
+        ) {
+            Ok(fields) => fields,
+            Err(error) => return g5_error_json(error),
+        };
+        let Some(count) = app_field(&fields, "count").and_then(|value| value.parse::<usize>().ok())
+        else {
+            return g5_error_json("protocol_failure");
+        };
+        let Some(items) =
+            app_field(&fields, "items").and_then(|raw| parse_automation_items(raw, count))
+        else {
+            return g5_error_json("protocol_failure");
+        };
+        format!("{{\"ok\":true,\"automations\":[{}]}}", items.join(","))
+    }
+
+    fn g5_automation_detail(&self, automation_id: String) -> String {
+        if !is_hex_identifier(&automation_id) {
+            return g5_error_json("scope_invalid");
+        }
+        let fields = match self.g5_automation_request(
+            "/v1/app/automations/detail",
+            false,
+            &[("automation_id", automation_id.as_str())],
+            &[
+                "id",
+                "kind",
+                "title",
+                "recurrence",
+                "local_schedule",
+                "timezone",
+                "state",
+                "next_run_at",
+                "workflow_version",
+                "sources",
+                "quiet_start",
+                "quiet_end",
+                "message",
+            ],
+        ) {
+            Ok(fields) => fields,
+            Err(error) => return g5_error_json(error),
+        };
+        if app_field(&fields, "id") != Some(automation_id.as_str()) {
+            return g5_error_json("protocol_failure");
+        }
+        let value = |name: &str| app_field(&fields, name).unwrap_or_default();
+        let kind = value("kind");
+        let recurrence = value("recurrence");
+        let state = value("state");
+        if !matches!(
+            kind,
+            "reminder" | "morning_briefing" | "idea_mission_review"
+        ) || !matches!(recurrence, "once" | "daily")
+            || !matches!(state, "active" | "paused" | "completed" | "deleted")
+            || !matches!(
+                value("workflow_version"),
+                "reminder.v1" | "morning-briefing.v1" | "idea-mission-review.v1"
+            )
+        {
+            return g5_error_json("protocol_failure");
+        }
+        let (expected_sources, sources_json) = if kind == "reminder" {
+            ("user-authored-reminder", "[\"user-authored-reminder\"]")
+        } else {
+            (
+                "local_captures,missions:dom_synthetic_a",
+                "[\"local_captures\",\"missions:dom_synthetic_a\"]",
+            )
+        };
+        if value("sources") != expected_sources {
+            return g5_error_json("protocol_failure");
+        }
+        format!(
+            "{{\"ok\":true,\"automation\":{{\"id\":{},\"kind\":{},\"title\":{},\"recurrence\":{},\"local_schedule\":{},\"timezone\":{},\"state\":{},\"next_run_at\":{},\"workflow_version\":{},\"sources\":{},\"quiet_start\":{},\"quiet_end\":{},\"message\":{}}}}}",
+            json_string(value("id")), json_string(kind), json_string(value("title")),
+            json_string(recurrence), json_string(value("local_schedule")),
+            json_string(value("timezone")), json_string(state), json_string(value("next_run_at")),
+            json_string(value("workflow_version")), sources_json,
+            json_string(value("quiet_start")), json_string(value("quiet_end")),
+            json_string(value("message")),
+        )
+    }
+
+    fn g5_automation_history(&self, automation_id: String) -> String {
+        if !is_hex_identifier(&automation_id) {
+            return g5_error_json("scope_invalid");
+        }
+        let fields = match self.g5_automation_request(
+            "/v1/app/automations/history",
+            false,
+            &[("automation_id", automation_id.as_str())],
+            &["items", "count"],
+        ) {
+            Ok(fields) => fields,
+            Err(error) => return g5_error_json(error),
+        };
+        let Some(count) = app_field(&fields, "count").and_then(|value| value.parse::<usize>().ok())
+        else {
+            return g5_error_json("protocol_failure");
+        };
+        let Some(runs) =
+            app_field(&fields, "items").and_then(|raw| parse_automation_runs(raw, count))
+        else {
+            return g5_error_json("protocol_failure");
+        };
+        format!("{{\"ok\":true,\"runs\":[{}]}}", runs.join(","))
+    }
+
+    fn g5_automation_run(&self, automation_id: String, run_id: String) -> String {
+        if !is_hex_identifier(&automation_id) || !is_hex_identifier(&run_id) {
+            return g5_error_json("scope_invalid");
+        }
+        let fields = match self.g5_automation_request(
+            "/v1/app/automations/run",
+            false,
+            &[
+                ("automation_id", automation_id.as_str()),
+                ("run_id", run_id.as_str()),
+            ],
+            &[
+                "id",
+                "status",
+                "output",
+                "sources",
+                "error_code",
+                "scheduled_for",
+                "workflow_version",
+            ],
+        ) {
+            Ok(fields) => fields,
+            Err(error) => return g5_error_json(error),
+        };
+        if app_field(&fields, "id") != Some(run_id.as_str()) {
+            return g5_error_json("protocol_failure");
+        }
+        let status = app_field(&fields, "status").unwrap_or_default();
+        if !matches!(
+            status,
+            "running"
+                | "deferred"
+                | "retry_wait"
+                | "succeeded"
+                | "failed"
+                | "missed"
+                | "pending"
+                | "superseded"
+        ) {
+            return g5_error_json("protocol_failure");
+        }
+        let Some(sources) = app_field(&fields, "sources").and_then(parse_automation_sources) else {
+            return g5_error_json("protocol_failure");
+        };
+        format!(
+            "{{\"ok\":true,\"run\":{{\"id\":{},\"status\":{},\"output\":{},\"sources\":[{}],\"error_code\":{},\"scheduled_for\":{},\"workflow_version\":{}}}}}",
+            json_string(run_id.as_str()), json_string(status),
+            json_string(app_field(&fields, "output").unwrap_or_default()),
+            sources.join(","), json_string(app_field(&fields, "error_code").unwrap_or_default()),
+            json_string(app_field(&fields, "scheduled_for").unwrap_or_default()),
+            json_string(app_field(&fields, "workflow_version").unwrap_or_default()),
+        )
+    }
+
+    fn g5_automation_create(
+        &self,
+        kind: String,
+        title: String,
+        recurrence: String,
+        local_schedule: String,
+        timezone: String,
+        quiet_start: String,
+        quiet_end: String,
+        message: String,
+        confirm_local_sources: bool,
+    ) -> String {
+        if !matches!(
+            kind.as_str(),
+            "reminder" | "morning_briefing" | "idea_mission_review"
+        ) || !matches!(recurrence.as_str(), "once" | "daily")
+            || title.len() > 96
+            || local_schedule.len() > 16
+            || message.len() > 128
+            || timezone.len() > 64
+            || quiet_start.len() > 5
+            || quiet_end.len() > 5
+            || [
+                title.as_str(),
+                local_schedule.as_str(),
+                timezone.as_str(),
+                message.as_str(),
+            ]
+            .iter()
+            .any(|value| {
+                value
+                    .bytes()
+                    .any(|byte| byte == b'\r' || byte == b'\n' || byte == 0)
+            })
+        {
+            return g5_error_json("scope_invalid");
+        }
+        if kind != "reminder" && !confirm_local_sources {
+            return g5_error_json("scope_invalid");
+        }
+        let source_consent = if confirm_local_sources {
+            "local-only"
+        } else {
+            "none"
+        };
+        let fields = match self.g5_automation_request(
+            "/v1/app/automations/create",
+            true,
+            &[
+                ("kind", kind.as_str()),
+                ("title", title.as_str()),
+                ("recurrence", recurrence.as_str()),
+                ("local_schedule", local_schedule.as_str()),
+                ("timezone", timezone.as_str()),
+                ("quiet_start", quiet_start.as_str()),
+                ("quiet_end", quiet_end.as_str()),
+                ("message", message.as_str()),
+                ("sources_confirmed", source_consent),
+            ],
+            &["id", "state", "next_run_at", "workflow_version"],
+        ) {
+            Ok(fields) => fields,
+            Err(error) => return g5_error_json(error),
+        };
+        format!(
+            "{{\"ok\":true,\"id\":{},\"state\":{},\"next_run_at\":{},\"workflow_version\":{}}}",
+            json_string(app_field(&fields, "id").unwrap_or_default()),
+            json_string(app_field(&fields, "state").unwrap_or_default()),
+            json_string(app_field(&fields, "next_run_at").unwrap_or_default()),
+            json_string(app_field(&fields, "workflow_version").unwrap_or_default()),
+        )
+    }
+
+    fn g5_automation_timezone(&self, automation_id: String, timezone: String) -> String {
+        if !is_hex_identifier(&automation_id)
+            || timezone.len() > 64
+            || timezone
+                .bytes()
+                .any(|byte| matches!(byte, b'\r' | b'\n' | 0))
+        {
+            return g5_error_json("scope_invalid");
+        }
+        let fields = match self.g5_automation_request(
+            "/v1/app/automations/timezone",
+            true,
+            &[
+                ("automation_id", automation_id.as_str()),
+                ("timezone", timezone.as_str()),
+            ],
+            &["id", "timezone", "next_run_at"],
+        ) {
+            Ok(fields) => fields,
+            Err(error) => return g5_error_json(error),
+        };
+        format!(
+            "{{\"ok\":true,\"id\":{},\"timezone\":{},\"next_run_at\":{}}}",
+            json_string(app_field(&fields, "id").unwrap_or_default()),
+            json_string(app_field(&fields, "timezone").unwrap_or_default()),
+            json_string(app_field(&fields, "next_run_at").unwrap_or_default()),
+        )
+    }
+
+    fn g5_automation_control(
+        &self,
+        automation_id: String,
+        action: String,
+        run_id: String,
+    ) -> String {
+        if !is_hex_identifier(&automation_id)
+            || !matches!(
+                action.as_str(),
+                "pause" | "resume" | "delete" | "recover" | "retry"
+            )
+            || (!run_id.is_empty() && !is_hex_identifier(&run_id))
+            || (matches!(action.as_str(), "recover" | "retry") && run_id.is_empty())
+        {
+            return g5_error_json("scope_invalid");
+        }
+        let fields = match self.g5_automation_request(
+            "/v1/app/automations/control",
+            true,
+            &[
+                ("automation_id", automation_id.as_str()),
+                ("action", action.as_str()),
+                ("run_id", run_id.as_str()),
+            ],
+            &["id", "state", "next_run_at"],
+        ) {
+            Ok(fields) => fields,
+            Err(error) => return g5_error_json(error),
+        };
+        format!(
+            "{{\"ok\":true,\"id\":{},\"state\":{},\"next_run_at\":{}}}",
+            json_string(app_field(&fields, "id").unwrap_or_default()),
+            json_string(app_field(&fields, "state").unwrap_or_default()),
+            json_string(app_field(&fields, "next_run_at").unwrap_or_default()),
+        )
     }
 
     fn g5_workflow_call_locked(
@@ -2831,7 +3200,7 @@ with TestClient(app, base_url='http://127.0.0.1', client=('127.0.0.1', 50999)) a
         eprintln!("production_supervisor stage=ready_g5_grant_read_revoke PASS");
 
         if !manager
-            .g5_review_grant_create()
+            .g5_review_grant_create_confirmed(NativeReviewGrantConfirmed)
             .contains("\"review_grant\":true")
         {
             return Err("explicit mission:review grant creation failed");
@@ -4015,6 +4384,212 @@ fn parse_rfc3339_micros(value: &str) -> Option<u64> {
         .checked_add(u64::from(micros))
 }
 
+fn parse_automation_items(raw: &str, count: usize) -> Option<Vec<String>> {
+    if count > 3 {
+        return None;
+    }
+    if count == 0 {
+        return if raw.is_empty() {
+            Some(Vec::new())
+        } else {
+            None
+        };
+    }
+    let lines: Vec<&str> = raw.split('\n').collect();
+    if lines.len() != count {
+        return None;
+    }
+    let mut parsed = Vec::with_capacity(count);
+    for line in lines {
+        let fields: Vec<&str> = line.split('\t').collect();
+        if fields.len() != 11 {
+            return None;
+        }
+        let [id, kind, recurrence, local_schedule, timezone, state, next_run, version, quiet_start, quiet_end, title] =
+            <[&str; 11]>::try_from(fields).ok()?;
+        let expected_version = match kind {
+            "reminder" => "reminder.v1",
+            "morning_briefing" => "morning-briefing.v1",
+            "idea_mission_review" => "idea-mission-review.v1",
+            _ => return None,
+        };
+        if !is_hex_identifier(id)
+            || !matches!(recurrence, "once" | "daily")
+            || !matches!(state, "active" | "paused" | "completed" | "deleted")
+            || version != expected_version
+            || timezone.is_empty()
+            || timezone.len() > 64
+            || timezone.chars().any(char::is_control)
+            || title.is_empty()
+            || title.chars().count() > 24
+            || title.chars().any(char::is_control)
+            || (recurrence == "daily" && !valid_hhmm(local_schedule))
+            || (recurrence == "once" && !valid_local_datetime(local_schedule))
+            || (!next_run.is_empty() && parse_rfc3339_micros(next_run).is_none())
+            || ((!quiet_start.is_empty() || !quiet_end.is_empty())
+                && (!valid_hhmm(quiet_start) || !valid_hhmm(quiet_end)))
+        {
+            return None;
+        }
+        let sources = match kind {
+            "reminder" => "[\"user-authored-reminder\"]",
+            _ => "[\"local_captures\",\"missions:dom_synthetic_a\"]",
+        };
+        parsed.push(format!(
+            "{{\"id\":{},\"kind\":{},\"recurrence\":{},\"local_schedule\":{},\"timezone\":{},\"state\":{},\"next_run_at\":{},\"workflow_version\":{},\"quiet_start\":{},\"quiet_end\":{},\"title\":{},\"sources\":{}}}",
+            json_string(id), json_string(kind), json_string(recurrence),
+            json_string(local_schedule), json_string(timezone), json_string(state),
+            json_string(next_run), json_string(version), json_string(quiet_start),
+            json_string(quiet_end), json_string(title), sources,
+        ));
+    }
+    Some(parsed)
+}
+
+fn parse_automation_runs(raw: &str, count: usize) -> Option<Vec<String>> {
+    if count > 5 {
+        return None;
+    }
+    if count == 0 {
+        return if raw.is_empty() {
+            Some(Vec::new())
+        } else {
+            None
+        };
+    }
+    let lines: Vec<&str> = raw.split('\n').collect();
+    if lines.len() != count {
+        return None;
+    }
+    let mut parsed = Vec::with_capacity(count);
+    for line in lines {
+        let fields: Vec<&str> = line.split('\t').collect();
+        if fields.len() != 8 {
+            return None;
+        }
+        let [id, scheduled, status, attempts, error, completed, version, sources] =
+            <[&str; 8]>::try_from(fields).ok()?;
+        let attempts = attempts.parse::<u8>().ok()?;
+        if !is_hex_identifier(id)
+            || parse_rfc3339_micros(scheduled).is_none()
+            || !matches!(
+                status,
+                "running"
+                    | "deferred"
+                    | "retry_wait"
+                    | "succeeded"
+                    | "failed"
+                    | "missed"
+                    | "pending"
+                    | "superseded"
+            )
+            || attempts > 3
+            || (!completed.is_empty() && parse_rfc3339_micros(completed).is_none())
+            || error.len() > 64
+            || error.chars().any(char::is_control)
+            || !matches!(
+                version,
+                "reminder.v1" | "morning-briefing.v1" | "idea-mission-review.v1"
+            )
+            || sources.len() > 128
+            || sources.chars().any(char::is_control)
+            || sources.split(',').any(|source| {
+                !source.is_empty()
+                    && !matches!(
+                        source,
+                        "user-authored-reminder"
+                            | "local_captures"
+                            | "missions:dom_synthetic_a"
+                            | "local-empty-state"
+                    )
+            })
+        {
+            return None;
+        }
+        parsed.push(format!(
+            "{{\"id\":{},\"scheduled_for\":{},\"status\":{},\"attempts\":{},\"error_code\":{},\"completed_at\":{},\"workflow_version\":{},\"sources\":{}}}",
+            json_string(id), json_string(scheduled), json_string(status), attempts,
+            json_string(error), json_string(completed), json_string(version), json_string(sources),
+        ));
+    }
+    Some(parsed)
+}
+
+fn parse_automation_sources(raw: &str) -> Option<Vec<String>> {
+    if raw.is_empty() {
+        return Some(Vec::new());
+    }
+    let lines: Vec<&str> = raw.split(';').collect();
+    if lines.len() > 4 {
+        return None;
+    }
+    let mut parsed = Vec::with_capacity(lines.len());
+    for line in lines {
+        let fields: Vec<&str> = line.split(',').collect();
+        if fields.len() != 3 {
+            return None;
+        }
+        let [source, id, observed_at] = <[&str; 3]>::try_from(fields).ok()?;
+        if !matches!(
+            source,
+            "user-authored-reminder"
+                | "local_captures"
+                | "missions:dom_synthetic_a"
+                | "local-empty-state"
+        ) || !(is_hex_identifier(id) || id == "dom_synthetic_a")
+            || parse_rfc3339_micros(observed_at).is_none()
+        {
+            return None;
+        }
+        parsed.push(format!(
+            "{{\"source\":{},\"id\":{},\"observed_at\":{}}}",
+            json_string(source),
+            json_string(id),
+            json_string(observed_at),
+        ));
+    }
+    Some(parsed)
+}
+
+fn valid_hhmm(value: &str) -> bool {
+    let Some((hour, minute)) = value.split_once(':') else {
+        return false;
+    };
+    hour.len() == 2
+        && minute.len() == 2
+        && hour.parse::<u8>().is_ok_and(|number| number <= 23)
+        && minute.parse::<u8>().is_ok_and(|number| number <= 59)
+}
+
+fn valid_local_datetime(value: &str) -> bool {
+    if !value.is_ascii()
+        || value.len() != 16
+        || value.as_bytes().get(10) != Some(&b'T')
+        || !valid_hhmm(&value[11..])
+    {
+        return false;
+    }
+    let mut parts = value[..10].split('-');
+    let Some(year) = parts.next().and_then(|part| part.parse::<u16>().ok()) else {
+        return false;
+    };
+    let Some(month) = parts.next().and_then(|part| part.parse::<u8>().ok()) else {
+        return false;
+    };
+    let Some(day) = parts.next().and_then(|part| part.parse::<u8>().ok()) else {
+        return false;
+    };
+    let leap_year = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+    let last_day = match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if leap_year => 29,
+        2 => 28,
+        _ => return false,
+    };
+    parts.next().is_none() && (1..=9999).contains(&year) && (1..=last_day).contains(&day)
+}
+
 fn parse_capture_items(raw: &str, count: usize) -> Option<Vec<(String, String, String)>> {
     if count == 0 {
         return if raw.is_empty() {
@@ -4393,10 +4968,11 @@ fn native_workflow_approval_message(task: &JsonValue) -> String {
     )
 }
 
-fn approve_only_after_native_confirmation(
-    confirmed: bool,
-    approve: impl FnOnce() -> String,
-) -> String {
+fn native_review_grant_message() -> &'static str {
+    "Conceder mission:review para revisões sintéticas em dom_synthetic_a por até 60 minutos? O conteúdo completo só aparece em confirmação nativa por item. O conteúdo é não confiável e não autoriza ações. Nenhum e-mail, evento ou efeito externo será executado."
+}
+
+fn run_only_after_native_confirmation(confirmed: bool, approve: impl FnOnce() -> String) -> String {
     if confirmed {
         approve()
     } else {
@@ -4907,8 +5483,29 @@ pub fn g5_connectors_status(manager: tauri::State<'_, RuntimeManager>) -> String
 }
 
 #[tauri::command]
-pub fn g5_review_grant_create(manager: tauri::State<'_, RuntimeManager>) -> String {
-    manager.g5_review_grant_create()
+pub async fn g5_review_grant_create(app: tauri::AppHandle) -> String {
+    {
+        let manager = app.state::<RuntimeManager>();
+        if let Err(error) = manager.g5_credentials_for_active() {
+            return g5_error_json(error);
+        }
+    }
+    let dialog = app
+        .dialog()
+        .message(native_review_grant_message())
+        .title("Conceder acesso local às revisões")
+        .kind(MessageDialogKind::Warning)
+        .buttons(MessageDialogButtons::OkCancelCustom(
+            "Conceder acesso".to_owned(),
+            "Cancelar".to_owned(),
+        ));
+    let confirmed = tauri::async_runtime::spawn_blocking(move || dialog.blocking_show())
+        .await
+        .unwrap_or(false);
+    let manager = app.state::<RuntimeManager>();
+    run_only_after_native_confirmation(confirmed, || {
+        manager.g5_review_grant_create_confirmed(NativeReviewGrantConfirmed)
+    })
 }
 
 #[tauri::command]
@@ -5088,7 +5685,7 @@ pub async fn g5_review_approve(
         .await
         .unwrap_or(false);
     let manager = app.state::<RuntimeManager>();
-    approve_only_after_native_confirmation(confirmed, || {
+    run_only_after_native_confirmation(confirmed, || {
         manager.g5_review_approve_confirmed(
             review_id,
             revision,
@@ -5096,6 +5693,81 @@ pub async fn g5_review_approve(
             NativeReviewApprovalConfirmed,
         )
     })
+}
+
+#[tauri::command]
+pub fn g5_automations_list(manager: tauri::State<'_, RuntimeManager>) -> String {
+    manager.g5_automations_list()
+}
+
+#[tauri::command]
+pub fn g5_automation_detail(
+    manager: tauri::State<'_, RuntimeManager>,
+    automation_id: String,
+) -> String {
+    manager.g5_automation_detail(automation_id)
+}
+
+#[tauri::command]
+pub fn g5_automation_history(
+    manager: tauri::State<'_, RuntimeManager>,
+    automation_id: String,
+) -> String {
+    manager.g5_automation_history(automation_id)
+}
+
+#[tauri::command]
+pub fn g5_automation_run(
+    manager: tauri::State<'_, RuntimeManager>,
+    automation_id: String,
+    run_id: String,
+) -> String {
+    manager.g5_automation_run(automation_id, run_id)
+}
+
+#[tauri::command]
+pub fn g5_automation_create(
+    manager: tauri::State<'_, RuntimeManager>,
+    kind: String,
+    title: String,
+    recurrence: String,
+    local_schedule: String,
+    timezone: String,
+    quiet_start: String,
+    quiet_end: String,
+    message: String,
+    confirm_local_sources: bool,
+) -> String {
+    manager.g5_automation_create(
+        kind,
+        title,
+        recurrence,
+        local_schedule,
+        timezone,
+        quiet_start,
+        quiet_end,
+        message,
+        confirm_local_sources,
+    )
+}
+
+#[tauri::command]
+pub fn g5_automation_timezone(
+    manager: tauri::State<'_, RuntimeManager>,
+    automation_id: String,
+    timezone: String,
+) -> String {
+    manager.g5_automation_timezone(automation_id, timezone)
+}
+
+#[tauri::command]
+pub fn g5_automation_control(
+    manager: tauri::State<'_, RuntimeManager>,
+    automation_id: String,
+    action: String,
+    run_id: String,
+) -> String {
+    manager.g5_automation_control(automation_id, action, run_id)
 }
 
 #[tauri::command]
@@ -5174,6 +5846,25 @@ mod tests {
     }
 
     #[test]
+    fn native_review_grant_confirmation_is_explicit_and_cancellable() {
+        let message = native_review_grant_message();
+        assert!(message.contains("mission:review"));
+        assert!(message.contains("dom_synthetic_a"));
+        assert!(message.contains("60 minutos"));
+        assert!(message.contains("não confiável"));
+        assert!(message.contains("Nenhum e-mail, evento ou efeito externo"));
+
+        let mut grant_called = false;
+        let result = run_only_after_native_confirmation(false, || {
+            grant_called = true;
+            "approved".to_owned()
+        });
+        assert!(result.contains("\"ok\":false"));
+        assert!(result.contains("confirmação nativa foi cancelada"));
+        assert!(!grant_called);
+    }
+
+    #[test]
     fn native_review_confirmation_is_bound_to_exact_untrusted_snapshot() {
         let detail = G5ReviewDetail {
             id: "review_synthetic_01".to_owned(),
@@ -5211,7 +5902,7 @@ mod tests {
     #[test]
     fn cancelled_native_review_confirmation_never_runs_approval() {
         let mut approval_called = false;
-        let result = approve_only_after_native_confirmation(false, || {
+        let result = run_only_after_native_confirmation(false, || {
             approval_called = true;
             "approved".to_owned()
         });
@@ -5530,7 +6221,7 @@ mod tests {
             .g5_missions_list()
             .contains("Missão sintética Rust → FastAPI"));
         assert!(manager
-            .g5_review_grant_create()
+            .g5_review_grant_create_confirmed(NativeReviewGrantConfirmed)
             .contains("\"review_grant\":true"));
         let proposed = manager.g5_workflow_submit_fixed(
             "simulate_action",
@@ -6489,7 +7180,11 @@ mod tests {
 
 #[cfg(test)]
 mod local_use_tests {
-    use super::{expiry_matches, parse_capture_items, parse_rfc3339_micros, resolve_api_root};
+    use super::{
+        encode_application_fields, expiry_matches, parse_automation_items, parse_automation_runs,
+        parse_automation_sources, parse_capture_items, parse_rfc3339_micros, resolve_api_root,
+        valid_local_datetime, MAX_G5_APP_REQUEST_BODY_BYTES,
+    };
     use std::fs;
 
     #[test]
@@ -6515,5 +7210,65 @@ mod local_use_tests {
         fs::write(root.join("serve.py"), b"# synthetic\n").unwrap();
         assert!(resolve_api_root(&root).unwrap().join("serve.py").is_file());
         let _ = fs::remove_dir_all(&root);
+    }
+    #[test]
+    fn local_automation_ipc_parsers_enforce_closed_workflows_and_provenance() {
+        let id = "0123456789abcdef0123456789abcdef";
+        let item = format!(
+            "{id}\treminder\tdaily\t09:00\tAmerica/Sao_Paulo\tactive\t2026-10-13T12:00:00.000000+00:00\treminder.v1\t\t\tLembrete"
+        );
+        let parsed = parse_automation_items(&item, 1).expect("fixed reminder fields parse");
+        assert_eq!(parsed.len(), 1);
+        assert!(parsed[0].contains("user-authored-reminder"));
+        assert!(parse_automation_items(&item.replace("reminder.v1", "unknown.v9"), 1).is_none());
+        assert!(parse_automation_items(&item, 4).is_none());
+
+        let run = format!(
+            "{id}\t2026-10-13T12:00:00.000000+00:00\tmissed\t0\tapp_inactive\t2026-10-13T12:01:00.000000+00:00\treminder.v1\tuser-authored-reminder"
+        );
+        let parsed_run = parse_automation_runs(&run, 1).expect("history fields parse");
+        assert!(parsed_run[0].contains("\"status\":\"missed\""));
+        assert!(parse_automation_runs(&run.replace("missed", "superseded"), 1).is_some());
+        assert!(parse_automation_runs(
+            &run.replace("user-authored-reminder", "arbitrary-source"),
+            1
+        )
+        .is_none());
+        assert!(parse_automation_sources(&format!(
+            "user-authored-reminder,{id},2026-10-13T12:00:00.000000+00:00"
+        ))
+        .is_some());
+        assert!(parse_automation_sources("arbitrary-source,id,2026-10-13T12:00:00Z").is_none());
+        assert!(valid_local_datetime("2026-10-13T12:00"));
+        assert!(!valid_local_datetime("2026-99-13T12:00"));
+        assert!(!valid_local_datetime("2026-02-30T12:00"));
+        assert!(!valid_local_datetime("2026-10-1éT12:00"));
+    }
+
+    #[test]
+    fn local_automation_creation_limits_fit_the_existing_g5_request_frame() {
+        let title = "🧠".repeat(24);
+        let message = "🧠".repeat(32);
+        let fields = [
+            ("session_token", "s".repeat(43)),
+            ("csrf_token", "c".repeat(43)),
+            ("kind", "reminder".to_owned()),
+            ("title", title),
+            ("recurrence", "once".to_owned()),
+            ("local_schedule", "2099-01-01T09:00".to_owned()),
+            ("timezone", "America/Argentina/ComodRivadavia".to_owned()),
+            ("quiet_start", String::new()),
+            ("quiet_end", String::new()),
+            ("message", message),
+            ("sources_confirmed", "none".to_owned()),
+        ];
+        let borrowed: Vec<(&str, &str)> = fields
+            .iter()
+            .map(|(name, value)| (*name, value.as_str()))
+            .collect();
+        assert!(
+            encode_application_fields(&borrowed).len() <= MAX_G5_APP_REQUEST_BODY_BYTES,
+            "documented reminder limits must fit the v3 request body limit"
+        );
     }
 }

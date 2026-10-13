@@ -97,6 +97,34 @@ export type G5Mission = {
   revision: number;
 };
 
+export type LocalAutomation = {
+  id: string;
+  kind: "reminder" | "morning_briefing" | "idea_mission_review";
+  title: string;
+  recurrence: "once" | "daily";
+  local_schedule: string;
+  timezone: string;
+  state: "active" | "paused" | "completed" | "deleted";
+  next_run_at: string;
+  workflow_version: string;
+  sources: string[];
+  quiet_start: string;
+  quiet_end: string;
+  message?: string;
+};
+
+export type LocalAutomationRun = {
+  id: string;
+  scheduled_for: string;
+  status: "running" | "deferred" | "retry_wait" | "succeeded" | "failed" | "missed" | "pending" | "superseded";
+  attempts: number;
+  error_code: string;
+  completed_at: string;
+  workflow_version: string;
+  sources: string[];
+  output?: string;
+};
+
 export type G5CommandResult = {
   ok: boolean;
   error?: string;
@@ -120,6 +148,14 @@ export type G5CommandResult = {
   created_at?: string;
   cleared?: boolean;
   deleted?: boolean;
+  automations?: LocalAutomation[];
+  automation?: LocalAutomation;
+  runs?: LocalAutomationRun[];
+  run?: LocalAutomationRun;
+  timezone?: string;
+  next_run_at?: string;
+  state?: "active" | "paused" | "completed" | "deleted";
+  workflow_version?: string;
 };
 
 type G5Invoke = (command: string, args?: Record<string, unknown>) => Promise<string>;
@@ -188,6 +224,23 @@ export function createG5Ipc(invokeG5: G5Invoke) {
       parseG5CommandResult(await invokeG5("g5_workflow_resume", { taskId })),
     workflowCancel: async (taskId: string): Promise<G5CommandResult> =>
       parseG5CommandResult(await invokeG5("g5_workflow_cancel", { taskId })),
+    automationsList: async (): Promise<G5CommandResult> =>
+      parseG5CommandResult(await invokeG5("g5_automations_list")),
+    automationDetail: async (automationId: string): Promise<G5CommandResult> =>
+      parseG5CommandResult(await invokeG5("g5_automation_detail", { automationId })),
+    automationHistory: async (automationId: string): Promise<G5CommandResult> =>
+      parseG5CommandResult(await invokeG5("g5_automation_history", { automationId })),
+    automationRun: async (automationId: string, runId: string): Promise<G5CommandResult> =>
+      parseG5CommandResult(await invokeG5("g5_automation_run", { automationId, runId })),
+    automationCreate: async (input: {
+      kind: LocalAutomation["kind"]; title: string; recurrence: LocalAutomation["recurrence"];
+      localSchedule: string; timezone: string; quietStart: string; quietEnd: string;
+      message: string; confirmLocalSources: boolean;
+    }): Promise<G5CommandResult> => parseG5CommandResult(await invokeG5("g5_automation_create", input)),
+    automationTimezone: async (automationId: string, timezone: string): Promise<G5CommandResult> =>
+      parseG5CommandResult(await invokeG5("g5_automation_timezone", { automationId, timezone })),
+    automationControl: async (automationId: string, action: "pause" | "resume" | "delete" | "recover" | "retry", runId = ""): Promise<G5CommandResult> =>
+      parseG5CommandResult(await invokeG5("g5_automation_control", { automationId, action, runId })),
   };
 }
 
@@ -330,6 +383,36 @@ export function parseG5CommandResult(value: string): G5CommandResult {
     if (record.deleted !== true) throw new Error("Apagar captura inválido.");
     result.deleted = true;
   }
+  if (record.automations !== undefined) {
+    if (!Array.isArray(record.automations) || record.automations.length > 3) throw new Error("Lista de automações inválida.");
+    result.automations = record.automations.map(parseLocalAutomation);
+  }
+  if (record.automation !== undefined) result.automation = parseLocalAutomation(record.automation);
+  if (record.runs !== undefined) {
+    if (!Array.isArray(record.runs) || record.runs.length > 5) throw new Error("Histórico inválido.");
+    result.runs = record.runs.map((run) => parseLocalAutomationRun(run, false));
+  }
+  if (record.run !== undefined) result.run = parseLocalAutomationRun(record.run, true);
+  if (record.id !== undefined) {
+    if (typeof record.id !== "string" || !/^[0-9a-f]{32}$/.test(record.id)) throw new Error("Identificador de automação inválido.");
+    result.id = record.id;
+  }
+  if (record.timezone !== undefined) {
+    if (typeof record.timezone !== "string" || record.timezone.length < 1 || record.timezone.length > 64 || /[\u0000-\u001f\u007f]/.test(record.timezone)) throw new Error("Fuso horário inválido.");
+    result.timezone = record.timezone;
+  }
+  if (record.next_run_at !== undefined) {
+    if (typeof record.next_run_at !== "string" || (record.next_run_at !== "" && !validAutomationTimestamp(record.next_run_at))) throw new Error("Próxima execução inválida.");
+    result.next_run_at = record.next_run_at;
+  }
+  if (record.state !== undefined) {
+    if (typeof record.state !== "string" || !["active", "paused", "completed", "deleted"].includes(record.state)) throw new Error("Estado da automação inválido.");
+    result.state = record.state as G5CommandResult["state"];
+  }
+  if (record.workflow_version !== undefined) {
+    if (typeof record.workflow_version !== "string" || !["reminder.v1", "morning-briefing.v1", "idea-mission-review.v1"].includes(record.workflow_version)) throw new Error("Versão do workflow inválida.");
+    result.workflow_version = record.workflow_version;
+  }
   if (record.review_grant !== undefined) {
     if (record.review_grant !== true) throw new Error("Concessão de revisão inválida.");
     result.review_grant = true;
@@ -400,7 +483,7 @@ export function parseG5CommandResult(value: string): G5CommandResult {
       return { id: capture.id, text: capture.text, created_at: capture.created_at };
     });
   }
-  if (record.id !== undefined || record.created_at !== undefined) {
+  if (record.created_at !== undefined) {
     if (typeof record.id !== "string" || typeof record.created_at !== "string") throw new Error("Captura inválida.");
     result.id = record.id;
     result.created_at = record.created_at;
@@ -460,6 +543,100 @@ function parseWorkflowTask(value: unknown): WorkflowTask {
     ...(typeof item.result_sha === "string" && /^[0-9a-f]{64}$/.test(item.result_sha) ? { result_sha: item.result_sha } : {}),
     ...(typeof item.effect === "string" ? { effect: item.effect } : {}),
     ...(typeof item.attempts === "number" && Number.isSafeInteger(item.attempts) ? { attempts: item.attempts } : {}),
+  };
+}
+
+function validAutomationTimestamp(value: unknown): value is string {
+  return typeof value === "string" && value.length <= 40 && Number.isFinite(Date.parse(value));
+}
+
+function parseLocalAutomation(value: unknown): LocalAutomation {
+  if (typeof value !== "object" || value === null) throw new Error("Automação inválida.");
+  const item = value as Record<string, unknown>;
+  const kinds = ["reminder", "morning_briefing", "idea_mission_review"] as const;
+  const recurrence = ["once", "daily"] as const;
+  const states = ["active", "paused", "completed", "deleted"] as const;
+  if (typeof item.id !== "string" || !/^[0-9a-f]{32}$/.test(item.id) ||
+      typeof item.kind !== "string" || !kinds.includes(item.kind as typeof kinds[number]) ||
+      typeof item.recurrence !== "string" || !recurrence.includes(item.recurrence as typeof recurrence[number]) ||
+      typeof item.state !== "string" || !states.includes(item.state as typeof states[number]) ||
+      typeof item.title !== "string" || item.title.length < 1 || [...item.title].length > 24 || /[\u0000-\u001f\u007f]/.test(item.title) ||
+      typeof item.local_schedule !== "string" || item.local_schedule.length > 16 || /[\u0000-\u001f\u007f]/.test(item.local_schedule) ||
+      typeof item.timezone !== "string" || item.timezone.length < 1 || item.timezone.length > 64 || /[\u0000-\u001f\u007f]/.test(item.timezone) ||
+      typeof item.next_run_at !== "string" || (item.next_run_at !== "" && !validAutomationTimestamp(item.next_run_at)) ||
+      typeof item.workflow_version !== "string" || !["reminder.v1", "morning-briefing.v1", "idea-mission-review.v1"].includes(item.workflow_version) ||
+      typeof item.quiet_start !== "string" || typeof item.quiet_end !== "string" ||
+      !Array.isArray(item.sources) || item.sources.some((source) => typeof source !== "string" || source.length > 64)) {
+    throw new Error("Automação inválida.");
+  }
+  const expectedWorkflow = item.kind === "reminder" ? "reminder.v1"
+    : item.kind === "morning_briefing" ? "morning-briefing.v1" : "idea-mission-review.v1";
+  const expectedSources = item.kind === "reminder" ? ["user-authored-reminder"] : ["local_captures", "missions:dom_synthetic_a"];
+  if (item.workflow_version !== expectedWorkflow || JSON.stringify(item.sources) !== JSON.stringify(expectedSources)) {
+    throw new Error("Proveniência da automação inválida.");
+  }
+  if ((item.quiet_start !== "" && !/^(?:[01]\d|2[0-3]):[0-5]\d$/.test(item.quiet_start)) ||
+      (item.quiet_end !== "" && !/^(?:[01]\d|2[0-3]):[0-5]\d$/.test(item.quiet_end)) ||
+      ((item.quiet_start === "") !== (item.quiet_end === ""))) throw new Error("Janela silenciosa inválida.");
+  if ((item.recurrence === "daily" && !/^(?:[01]\d|2[0-3]):[0-5]\d$/.test(item.local_schedule)) ||
+      (item.recurrence === "once" && !/^\d{4}-\d{2}-\d{2}T(?:[01]\d|2[0-3]):[0-5]\d$/.test(item.local_schedule))) {
+    throw new Error("Horário da automação inválido.");
+  }
+  if (item.kind === "reminder" && item.message !== undefined) {
+    if (typeof item.message !== "string" || [...item.message].length < 1 || [...item.message].length > 32 || /[\u0000-\u001f\u007f]/.test(item.message)) {
+      throw new Error("Lembrete inválido.");
+    }
+  }
+  return {
+    id: item.id, kind: item.kind as LocalAutomation["kind"], title: item.title,
+    recurrence: item.recurrence as LocalAutomation["recurrence"], local_schedule: item.local_schedule,
+    timezone: item.timezone, state: item.state as LocalAutomation["state"], next_run_at: item.next_run_at,
+    workflow_version: item.workflow_version, sources: item.sources as string[],
+    quiet_start: item.quiet_start, quiet_end: item.quiet_end,
+    ...(typeof item.message === "string" ? { message: item.message } : {}),
+  };
+}
+
+function parseLocalAutomationRun(value: unknown, withOutput: boolean): LocalAutomationRun {
+  if (typeof value !== "object" || value === null) throw new Error("Execução inválida.");
+  const item = value as Record<string, unknown>;
+  const states = ["running", "deferred", "retry_wait", "succeeded", "failed", "missed", "pending", "superseded"];
+  if (typeof item.id !== "string" || !/^[0-9a-f]{32}$/.test(item.id) ||
+      !validAutomationTimestamp(item.scheduled_for) || typeof item.status !== "string" || !states.includes(item.status) ||
+      (item.attempts !== undefined && (typeof item.attempts !== "number" || !Number.isSafeInteger(item.attempts) || item.attempts < 0 || item.attempts > 3)) ||
+      (!withOutput && item.attempts === undefined) ||
+      typeof item.error_code !== "string" || item.error_code.length > 64 || /[\u0000-\u001f\u007f]/.test(item.error_code) ||
+      (item.completed_at !== undefined && (typeof item.completed_at !== "string" || (item.completed_at !== "" && !validAutomationTimestamp(item.completed_at)))) ||
+      (!withOutput && item.completed_at === undefined) ||
+      typeof item.workflow_version !== "string" || !["reminder.v1", "morning-briefing.v1", "idea-mission-review.v1"].includes(item.workflow_version) ||
+      (withOutput && (typeof item.output !== "string" || [...item.output].length > 80 || /[\u0000-\u001f\u007f]/.test(item.output)))) {
+    throw new Error("Execução inválida.");
+  }
+  const allowedSources = ["user-authored-reminder", "local_captures", "missions:dom_synthetic_a", "local-empty-state"];
+  let sources: string[];
+  if (withOutput) {
+    if (!Array.isArray(item.sources) || item.sources.length > 4) throw new Error("Proveniência da execução inválida.");
+    sources = item.sources.map((source) => {
+      if (typeof source !== "object" || source === null) throw new Error("Proveniência da execução inválida.");
+      const ref = source as Record<string, unknown>;
+      if (typeof ref.source !== "string" || !allowedSources.includes(ref.source) ||
+          typeof ref.id !== "string" || (!/^[0-9a-f]{32}$/.test(ref.id) && ref.id !== "dom_synthetic_a") ||
+          !validAutomationTimestamp(ref.observed_at)) throw new Error("Proveniência da execução inválida.");
+      return ref.source + " · " + ref.id + " · " + ref.observed_at;
+    });
+  } else {
+    if (typeof item.sources !== "string" || item.sources.length > 128 || /[\u0000-\u001f\u007f]/.test(item.sources)) {
+      throw new Error("Proveniência da execução inválida.");
+    }
+    sources = item.sources ? item.sources.split(",") : [];
+    if (sources.some((source) => !allowedSources.includes(source))) throw new Error("Proveniência da execução inválida.");
+  }
+  return {
+    id: item.id, scheduled_for: item.scheduled_for, status: item.status as LocalAutomationRun["status"],
+    attempts: typeof item.attempts === "number" ? item.attempts : 0, error_code: item.error_code,
+    completed_at: typeof item.completed_at === "string" ? item.completed_at : "",
+    workflow_version: item.workflow_version, sources,
+    ...(typeof item.output === "string" ? { output: item.output } : {}),
   };
 }
 

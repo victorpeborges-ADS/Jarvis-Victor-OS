@@ -1,12 +1,12 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import type { FormEvent } from "react";
 import { invoke, isTauri } from "@tauri-apps/api/core";
 import "./App.css";
 import { createG5Ipc, executeRuntimeCommand, grantIsDisplayedActive, parseLocalRuntimeConfig, parseRuntimeEnvelope, parseTransportSnapshot } from "./runtimeCommand";
-import type { ConnectorStatus, G5CommandResult, G5Mission, G5PendingReview, G5ReviewDetail, G5SessionSnapshot, LocalCapture, LocalRuntimeConfig, RuntimeEnvelope, RuntimeState, RuntimeCommand, TransportSnapshot, TransportState, WorkflowState, WorkflowTask, WorkflowTaskSummary } from "./runtimeCommand";
+import type { ConnectorStatus, G5CommandResult, G5Mission, G5PendingReview, G5ReviewDetail, G5SessionSnapshot, LocalAutomation, LocalAutomationRun, LocalCapture, LocalRuntimeConfig, RuntimeEnvelope, RuntimeState, RuntimeCommand, TransportSnapshot, TransportState, WorkflowState, WorkflowTask, WorkflowTaskSummary } from "./runtimeCommand";
 
 const g5Ipc = createG5Ipc((command, args) => invoke<string>(command, args));
-const sections = ["Agora", "Inbox", "Missões", "Aprovações", "Runtime local", "Configurações"] as const;
+const sections = ["Agora", "Inbox", "Missões", "Aprovações", "Automações", "Runtime local", "Configurações"] as const;
 type Section = (typeof sections)[number];
 
 const connectorBlockLabels = {
@@ -44,6 +44,31 @@ const workflowStateLabels: Record<WorkflowState, string> = {
   failed: "Falhou", cancelled: "Cancelada",
 };
 
+const automationKindLabels: Record<LocalAutomation["kind"], string> = {
+  reminder: "Lembrete",
+  morning_briefing: "Briefing da manhã",
+  idea_mission_review: "Revisão de ideias e missões",
+};
+
+const runStatusLabels: Record<LocalAutomationRun["status"], string> = {
+  running: "Em execução", deferred: "Aguardando horário permitido", retry_wait: "Nova tentativa agendada",
+  succeeded: "Concluída", failed: "Falhou", missed: "Perdida", pending: "Aguardando",
+  superseded: "Substituída por mudança no agendamento",
+};
+
+function localDateTimeInput(date: Date): string {
+  const pad = (value: number) => String(value).padStart(2, "0");
+  return date.getFullYear() + "-" + pad(date.getMonth() + 1) + "-" + pad(date.getDate()) + "T" + pad(date.getHours()) + ":" + pad(date.getMinutes());
+}
+
+function formatAutomationTime(value: string, timezone: string): string {
+  try {
+    return new Date(value).toLocaleString("pt-BR", { timeZone: timezone });
+  } catch {
+    return "fuso horário inválido";
+  }
+}
+
 function App() {
   const [section, setSection] = useState<Section>("Agora");
   const [captures, setCaptures] = useState<LocalCapture[]>([]);
@@ -64,6 +89,24 @@ function App() {
   const [reviewConfirmed, setReviewConfirmed] = useState(false);
   const [draftConfirmed, setDraftConfirmed] = useState(false);
   const [approvalConfirmed, setApprovalConfirmed] = useState(false);
+  const [automations, setAutomations] = useState<LocalAutomation[]>([]);
+  const [automationRuns, setAutomationRuns] = useState<LocalAutomationRun[]>([]);
+  const [automationSelected, setAutomationSelected] = useState("");
+  const [automationDetailData, setAutomationDetailData] = useState<LocalAutomation | null>(null);
+  const [automationRunDetail, setAutomationRunDetail] = useState<LocalAutomationRun | null>(null);
+  const [automationBusy, setAutomationBusy] = useState(false);
+  const [automationError, setAutomationError] = useState("");
+  const [automationKind, setAutomationKind] = useState<LocalAutomation["kind"]>("reminder");
+  const [automationTitle, setAutomationTitle] = useState("");
+  const [automationRecurrence, setAutomationRecurrence] = useState<LocalAutomation["recurrence"]>("daily");
+  const [automationSchedule, setAutomationSchedule] = useState("09:00");
+  const [automationTimezone, setAutomationTimezone] = useState(() => Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC");
+  const [automationMessage, setAutomationMessage] = useState("");
+  const [quietStart, setQuietStart] = useState("");
+  const [quietEnd, setQuietEnd] = useState("");
+  const [localSourcesConfirmed, setLocalSourcesConfirmed] = useState(false);
+  const seenAutomationRuns = useRef(new Set<string>());
+  const initializedAutomationNotice = useRef(false);
   const [reviewGrant, setReviewGrant] = useState(false);
   const [pendingReviews, setPendingReviews] = useState<G5PendingReview[]>([]);
   const [editingId, setEditingId] = useState<string | null>(null);
@@ -152,6 +195,95 @@ function App() {
     })();
     return () => { cancelled = true; };
   }, [runtimeAvailable, g5Status?.session_active, section]);
+
+  useEffect(() => {
+    if (!runtimeAvailable || !g5Status?.session_active || section !== "Automações") {
+      setAutomations([]);
+      setAutomationRuns([]);
+      setAutomationDetailData(null);
+      setAutomationRunDetail(null);
+      return;
+    }
+    let cancelled = false;
+    const refreshAutomations = async () => {
+      try {
+        const result = await g5Ipc.automationsList();
+        if (!cancelled && result.ok) {
+          const items = result.automations ?? [];
+          setAutomations(items);
+          setAutomationSelected((current) => items.some((item) => item.id === current) ? current : items[0]?.id ?? "");
+          setAutomationError("");
+        } else if (!cancelled) {
+          setAutomationError(result.error ?? "Não foi possível consultar as automações locais.");
+        }
+      } catch {
+        if (!cancelled) setAutomationError("O canal local não respondeu ao consultar as automações.");
+      }
+    };
+    void refreshAutomations();
+    const timer = window.setInterval(() => void refreshAutomations(), 15000);
+    return () => { cancelled = true; window.clearInterval(timer); };
+  }, [runtimeAvailable, g5Status?.session_active, section]);
+
+  useEffect(() => {
+    if (!runtimeAvailable || !g5Status?.session_active || !automationSelected || section !== "Automações") return;
+    let cancelled = false;
+    void Promise.all([
+      g5Ipc.automationHistory(automationSelected),
+      g5Ipc.automationDetail(automationSelected),
+    ]).then(([history, detail]) => {
+      if (cancelled) return;
+      if (history.ok) setAutomationRuns(history.runs ?? []);
+      else setAutomationError(history.error ?? "O histórico não pôde ser lido.");
+      if (detail.ok && detail.automation) setAutomationDetailData(detail.automation);
+      else setAutomationError(detail.error ?? "Os detalhes do agendamento não puderam ser lidos.");
+    }).catch(() => { if (!cancelled) setAutomationError("Não foi possível ler os detalhes locais."); });
+    return () => { cancelled = true; };
+  }, [runtimeAvailable, g5Status?.session_active, automationSelected, section, automations]);
+
+  useEffect(() => {
+    if (!runtimeAvailable || !g5Status?.session_active ||
+        runtime?.snapshot.state !== "READY" || transport?.state !== "READY") return;
+    let cancelled = false;
+    const pollFinishedRuns = async () => {
+      try {
+        const listed = await g5Ipc.automationsList();
+        if (!listed.ok || cancelled) return;
+        const recent = await Promise.all((listed.automations ?? []).filter((automation) => automation.state !== "deleted").map(async (automation) => ({
+          automation,
+          history: await g5Ipc.automationHistory(automation.id),
+        })));
+        if (cancelled) return;
+        if (!initializedAutomationNotice.current) {
+          for (const item of recent) for (const run of item.history.runs ?? []) seenAutomationRuns.current.add(run.id);
+          initializedAutomationNotice.current = true;
+          const missed = recent.find((item) => (item.history.runs ?? []).some((run) => run.status === "missed"));
+          if (missed && !cancelled) setNotice(missed.automation.title + ": há uma execução perdida. Abra Automações para revisar e decidir se deseja recuperar.");
+          return;
+        }
+        for (const item of recent) {
+          if (!item.history.ok) continue;
+          const fresh = (item.history.runs ?? []).filter((run) => !seenAutomationRuns.current.has(run.id));
+          for (const run of fresh) seenAutomationRuns.current.add(run.id);
+          const finished = fresh.find((run) => ["succeeded", "failed", "missed"].includes(run.status));
+          if (!finished || cancelled) continue;
+          if (finished.status === "succeeded") {
+            const detail = await g5Ipc.automationRun(item.automation.id, finished.id);
+            if (!cancelled) setNotice(detail.ok && detail.run?.output
+              ? item.automation.title + ": " + detail.run.output
+              : item.automation.title + ": rascunho local pronto; confira o histórico de Automações.");
+          } else if (!cancelled) {
+            setNotice(item.automation.title + ": " + runStatusLabels[finished.status] + ". Confira Automações.");
+          }
+        }
+      } catch {
+        // The automation screen presents channel failures; never log schedule content.
+      }
+    };
+    void pollFinishedRuns();
+    const timer = window.setInterval(() => void pollFinishedRuns(), 15000);
+    return () => { cancelled = true; window.clearInterval(timer); };
+  }, [runtimeAvailable, g5Status?.session_active, runtime?.snapshot.state, transport?.state]);
 
   async function runRuntimeCommand(command: RuntimeCommand) {
     setRuntimeBusy(true);
@@ -515,6 +647,113 @@ function App() {
     }
   }
 
+  async function refreshAutomationData(automationId = automationSelected) {
+    const listed = await g5Ipc.automationsList();
+    if (!listed.ok) throw new Error(listed.error ?? "Não foi possível atualizar as automações.");
+    const items = listed.automations ?? [];
+    setAutomations(items);
+    const selected = items.some((item) => item.id === automationId) ? automationId : items[0]?.id ?? "";
+    setAutomationSelected(selected);
+    if (selected) {
+      const history = await g5Ipc.automationHistory(selected);
+      if (!history.ok) throw new Error(history.error ?? "Não foi possível atualizar o histórico.");
+      setAutomationRuns(history.runs ?? []);
+    } else {
+      setAutomationRuns([]);
+      setAutomationDetailData(null);
+      setAutomationRunDetail(null);
+    }
+  }
+
+  async function createAutomation(event: React.FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    setAutomationBusy(true);
+    setAutomationError("");
+    try {
+      const created = await g5Ipc.automationCreate({
+        kind: automationKind,
+        title: automationTitle.trim(),
+        recurrence: automationRecurrence,
+        localSchedule: automationSchedule,
+        timezone: automationTimezone,
+        quietStart,
+        quietEnd,
+        message: automationKind === "reminder" ? automationMessage.trim() : "",
+        confirmLocalSources: automationKind !== "reminder" && localSourcesConfirmed,
+      });
+      if (!created.ok || !created.id) {
+        setAutomationError(created.error ?? "A automação não foi salva.");
+        return;
+      }
+      setAutomationTitle("");
+      setAutomationMessage("");
+      setLocalSourcesConfirmed(false);
+      await refreshAutomationData(created.id);
+      setNotice("Agendamento salvo localmente. Ele só será avaliado enquanto o app estiver ativo.");
+    } catch (error) {
+      setAutomationError(error instanceof Error ? error.message : "Não foi possível salvar o agendamento.");
+    } finally {
+      setAutomationBusy(false);
+    }
+  }
+
+  async function controlAutomation(automationId: string, action: "pause" | "resume" | "delete" | "recover" | "retry", runId = "") {
+    setAutomationBusy(true);
+    setAutomationError("");
+    setAutomationRunDetail(null);
+    try {
+      const result = await g5Ipc.automationControl(automationId, action, runId);
+      if (!result.ok) {
+        setAutomationError(result.error ?? "A operação não foi concluída.");
+        return;
+      }
+      await refreshAutomationData(automationId);
+      setNotice(action === "recover" ? "Recuperação autorizada; resultado registrado no histórico local."
+        : action === "retry" ? "Nova tentativa autorizada; resultado registrado no histórico local."
+          : action === "delete" ? "Agendamento removido da fila; o histórico foi preservado."
+            : action === "pause" ? "Agendamento pausado." : "Agendamento retomado.");
+    } catch (error) {
+      setAutomationError(error instanceof Error ? error.message : "O canal local não respondeu.");
+    } finally {
+      setAutomationBusy(false);
+    }
+  }
+
+  async function changeAutomationTimezone(automationId: string) {
+    setAutomationBusy(true);
+    setAutomationError("");
+    try {
+      const result = await g5Ipc.automationTimezone(automationId, automationTimezone);
+      if (!result.ok) {
+        setAutomationError(result.error ?? "O fuso não foi atualizado.");
+        return;
+      }
+      await refreshAutomationData(automationId);
+      setNotice("Fuso horário atualizado; a próxima execução foi recalculada.");
+    } catch (error) {
+      setAutomationError(error instanceof Error ? error.message : "Não foi possível atualizar o fuso.");
+    } finally {
+      setAutomationBusy(false);
+    }
+  }
+
+  async function showAutomationRun(automationId: string, runId: string) {
+    setAutomationBusy(true);
+    setAutomationError("");
+    try {
+      const result = await g5Ipc.automationRun(automationId, runId);
+      if (!result.ok || !result.run) {
+        setAutomationError(result.error ?? "O resultado não pôde ser lido.");
+        return;
+      }
+      setAutomationRunDetail(result.run);
+    } catch {
+      setAutomationError("Não foi possível abrir o resultado local.");
+    } finally {
+      setAutomationBusy(false);
+    }
+  }
+
   return <div className="shell">
     <aside className="rail">
       <div className="brand" aria-label="JARVIS"><span className="mark">JV</span><span>JARVIS</span></div>
@@ -595,7 +834,7 @@ function App() {
       </article>}
       {section === "Aprovações" && <article className="card"><p className="badge">SEM EFEITO EXTERNO</p>
         <h2>Revisão local, com confirmação</h2>
-        <p>A concessão <code>mission:review</code> só é pedida se você confirmar. Ela não é automática e não envia e-mail nem altera calendário.</p>
+        <p>A concessão <code>mission:review</code> exige confirmação nativa do macOS. Aprovar cada item também exige confirmação nativa com o snapshot atual do servidor; o conteúdo é dado não confiável. Nenhuma etapa envia e-mail nem altera calendário.</p>
         {!g5Status?.session_active && <p>Abra a sessão em Missões antes de solicitar a revisão.</p>}
         {g5Status?.session_active && <>
           <label className="confirm"><input type="checkbox" checked={reviewConfirmed} onChange={(event) => setReviewConfirmed(event.currentTarget.checked)} /> Confirmo a concessão de revisão só para decisões locais em <code>dom_synthetic_a</code>.</label>
@@ -664,6 +903,127 @@ function App() {
               </>}
             </section>}
           </section>
+        </>}
+      </article>}
+      {section === "Automações" && <article className="card automation-page">
+        <p className="badge">LOCAL · SEM SERVIÇO EM SEGUNDO PLANO</p>
+        <h2>Agendamentos locais</h2>
+        <p>Lembretes, briefing e revisão viram uma notificação/rascunho dentro do histórico do app. O worker existe apenas enquanto o runtime supervisionado está ativo. Não envia e-mail, cria evento nem altera dados externos.</p>
+        <p>Se o Mac/app estiver desligado na hora, o histórico registra “perdida”; nada é recuperado automaticamente. A recuperação pede confirmação explícita. Horários usam o fuso IANA informado; em horário repetido pelo DST usamos a primeira ocorrência, e em horário inexistente avançamos até o primeiro minuto válido.</p>
+        {!runtimeAvailable && <p className="runtime-hint">Esta função só está disponível na janela Tauri, com o runtime local ativo.</p>}
+        {runtimeAvailable && !g5Status?.session_active && <p>Abra uma sessão local em Missões para administrar os agendamentos. A sessão não concede leitura por si só.</p>}
+        {runtimeAvailable && g5Status?.session_active && <>
+          <form className="automation-form" onSubmit={(event) => void createAutomation(event)}>
+            <h3>Novo agendamento</h3>
+            <label htmlFor="automation-kind">Workflow</label>
+            <select id="automation-kind" value={automationKind} onChange={(event) => setAutomationKind(event.currentTarget.value as LocalAutomation["kind"])}>
+              <option value="reminder">Lembrete</option>
+              <option value="morning_briefing">Briefing da manhã</option>
+              <option value="idea_mission_review">Revisão de ideias e missões</option>
+            </select>
+            <label htmlFor="automation-title">Nome</label>
+            <input id="automation-title" maxLength={48} value={automationTitle} onChange={(event) => setAutomationTitle(event.currentTarget.value)} />
+            <p className="field-hint">Até 24 caracteres no nome e 32 no texto; o limite mantém a chamada G5 dentro do frame local atual.</p>
+            <label htmlFor="automation-recurrence">Frequência</label>
+            <select id="automation-recurrence" value={automationRecurrence} onChange={(event) => {
+              const recurrence = event.currentTarget.value as LocalAutomation["recurrence"];
+              setAutomationRecurrence(recurrence);
+              setAutomationSchedule(recurrence === "daily" ? "09:00" : localDateTimeInput(new Date(Date.now() + 60 * 60 * 1000)));
+            }}>
+              <option value="daily">Diária</option>
+              <option value="once">Uma vez</option>
+            </select>
+            <label htmlFor="automation-schedule">{automationRecurrence === "daily" ? "Horário local" : "Data e hora local"}</label>
+            <input id="automation-schedule" type={automationRecurrence === "daily" ? "time" : "datetime-local"} value={automationSchedule} onChange={(event) => setAutomationSchedule(event.currentTarget.value)} required />
+            <label htmlFor="automation-timezone">Fuso horário IANA</label>
+            <input id="automation-timezone" maxLength={64} value={automationTimezone} onChange={(event) => setAutomationTimezone(event.currentTarget.value)} required />
+            <p className="field-hint">Fuso detectado: {Intl.DateTimeFormat().resolvedOptions().timeZone || "não identificado"}. A próxima execução é recalculada quando o fuso é alterado.</p>
+            {automationKind === "reminder" && <>
+              <label htmlFor="automation-message">Lembrete</label>
+              <textarea id="automation-message" maxLength={64} value={automationMessage} onChange={(event) => setAutomationMessage(event.currentTarget.value)} required />
+            </>}
+            {automationKind !== "reminder" && <>
+              <p className="field-hint">Usa apenas capturas locais e missões em dom_synthetic_a. Não acessa rede nem modelo.</p>
+              <label className="confirm"><input type="checkbox" checked={localSourcesConfirmed} onChange={(event) => setLocalSourcesConfirmed(event.currentTarget.checked)} disabled={!grantActive} />Confirmo um briefing usando somente ideias e missões locais; requer grant mission:read ativo.</label>
+            </>}
+            <fieldset className="automation-quiet">
+              <legend>Quiet hours (opcional)</legend>
+              <label htmlFor="quiet-start">Início</label><input id="quiet-start" type="time" value={quietStart} onChange={(event) => setQuietStart(event.currentTarget.value)} />
+              <label htmlFor="quiet-end">Fim</label><input id="quiet-end" type="time" value={quietEnd} onChange={(event) => setQuietEnd(event.currentTarget.value)} />
+              <small>Preencha os dois horários ou deixe ambos vazios.</small>
+            </fieldset>
+            <button className="action" type="submit" disabled={automationBusy || automations.filter((item) => item.state !== "deleted").length >= 3 ||
+              !automationTitle.trim() || [...automationTitle].length > 24 || !automationSchedule ||
+              (automationKind === "reminder" && (!automationMessage.trim() || [...automationMessage].length > 32)) ||
+              (automationKind !== "reminder" && (!localSourcesConfirmed || !grantActive)) || (!!quietStart !== !!quietEnd)}>
+              Salvar agendamento
+            </button>
+          </form>
+          {automationError && <p className="notice" role="alert">{automationError}</p>}
+          <h3>Agendamentos ativos e recentes ({automations.filter((item) => item.state !== "deleted").length}/3)</h3>
+          {automations.length === 0
+            ? <p>Nenhum agendamento local ainda.</p>
+            : <label htmlFor="automation-selected">Escolha um agendamento</label>}
+          {automations.length > 0 && <select id="automation-selected" value={automationSelected} onChange={(event) => {
+            const id = event.currentTarget.value;
+            setAutomationSelected(id);
+            setAutomationDetailData(null);
+            const selected = automations.find((item) => item.id === id);
+            if (selected) setAutomationTimezone(selected.timezone);
+            setAutomationRunDetail(null);
+          }}>
+            {automations.map((item) => <option value={item.id} key={item.id}>{item.title} · {automationKindLabels[item.kind]}{item.state === "deleted" ? " · removido" : ""}</option>)}
+          </select>}
+          {automations.filter((item) => item.id === automationSelected).map((item) => <section className="automation-card" key={item.id}>
+            <h3>{item.title}</h3>
+            <p>{automationKindLabels[item.kind]} · {item.recurrence === "daily" ? "diária às " + item.local_schedule : "uma vez em " + item.local_schedule} · {item.timezone}</p>
+            <p><strong>Estado:</strong> {item.state} · <strong>Workflow:</strong> {item.workflow_version}</p>
+            <p><strong>Próxima execução:</strong> {item.next_run_at ? formatAutomationTime(item.next_run_at, item.timezone) : "nenhuma"} ({item.timezone})</p>
+            <p><strong>Origem:</strong> {item.sources.join(", ")}{item.quiet_start && " · quiet hours " + item.quiet_start + "–" + item.quiet_end}</p>
+            {(automationDetailData?.id === item.id ? automationDetailData.message : item.message) &&
+              <p><strong>Rascunho:</strong> {automationDetailData?.id === item.id ? automationDetailData.message : item.message}</p>}
+            {item.state !== "deleted" && item.state !== "completed" && <>
+              <label htmlFor={"automation-timezone-" + item.id}>Alterar fuso</label>
+              <div className="automation-actions">
+                <input id={"automation-timezone-" + item.id} maxLength={64} value={automationTimezone} onChange={(event) => setAutomationTimezone(event.currentTarget.value)} />
+                <button className="action secondary" type="button" disabled={automationBusy || !automationTimezone.trim()} onClick={() => void changeAutomationTimezone(item.id)}>Atualizar fuso</button>
+              {item.state === "active" && <button className="action secondary" type="button" disabled={automationBusy} onClick={() => void controlAutomation(item.id, "pause")}>Pausar</button>}
+              {item.state === "paused" && <button className="action secondary" type="button" disabled={automationBusy} onClick={() => void controlAutomation(item.id, "resume")}>Retomar</button>}
+              <button className="action secondary" type="button" disabled={automationBusy} onClick={() => {
+                if (window.confirm("Remover este agendamento? O histórico será preservado.")) void controlAutomation(item.id, "delete");
+              }}>Apagar</button>
+              </div>
+            </>}
+          </section>)}
+          <h3>Histórico recente</h3>
+          {automationRuns.length === 0 ? <p>Nenhuma execução registrada.</p> : <ul className="automation-history">{automationRuns.map((run) => {
+            const selected = automations.find((item) => item.id === automationSelected);
+            const needsGrant = selected?.kind !== "reminder" && !grantActive;
+            return <li key={run.id}>
+              <div>
+                <strong>{runStatusLabels[run.status]}</strong>
+                <span>{formatAutomationTime(run.scheduled_for, selected?.timezone || automationTimezone)}</span>
+                <small>{run.workflow_version} · tentativas {run.attempts}/3 · origem: {run.sources.join(", ") || "nenhuma"}</small>
+                {run.error_code && <small>Falha: {run.error_code}</small>}
+              </div>
+              <div className="automation-actions">
+                <button className="action secondary" type="button" disabled={automationBusy} onClick={() => void showAutomationRun(automationSelected, run.id)}>Abrir resultado</button>
+                {run.status === "missed" && <button className="action" type="button" disabled={automationBusy || needsGrant || run.attempts >= 3} onClick={() => {
+                  if (window.confirm("Esta execução foi perdida. Deseja recuperar agora? Ela só usará os dados locais aprovados.")) void controlAutomation(automationSelected, "recover", run.id);
+                }}>Recuperar…</button>}
+                {run.status === "failed" && run.attempts < 3 && <button className="action secondary" type="button" disabled={automationBusy || needsGrant} onClick={() => {
+                  if (window.confirm("Deseja fazer uma tentativa manual adicional?")) void controlAutomation(automationSelected, "retry", run.id);
+                }}>Tentar novamente…</button>}
+                {run.status === "failed" && run.attempts >= 3 && <small>Limite de três tentativas atingido.</small>}
+              </div>
+            </li>;
+          })}</ul>}
+          {automationRunDetail && <section className="review-detail" aria-live="polite">
+            <h3>Resultado da execução</h3>
+            <p>{runStatusLabels[automationRunDetail.status]} · {automationRunDetail.workflow_version} · fontes: {automationRunDetail.sources.join(", ") || "nenhuma"}</p>
+            {automationRunDetail.error_code && <p role="alert">Falha: {automationRunDetail.error_code}</p>}
+            {automationRunDetail.output && <pre>{automationRunDetail.output}</pre>}
+          </section>}
         </>}
       </article>}
       {section === "Runtime local" && <article className="card runtime-card">
