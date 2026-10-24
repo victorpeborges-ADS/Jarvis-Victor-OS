@@ -1,22 +1,9 @@
 import type { Metadata } from "next";
-import { Inter, Newsreader } from "next/font/google";
 import "./globals.css";
 import { Header } from "@/components/ui/Header";
 import { BottomNav } from "@/components/ui/BottomNav";
 import { Sidebar } from "@/components/ui/Sidebar";
 import { LocalIntegrationProvider } from "@/components/integration/LocalIntegrationProvider";
-
-const inter = Inter({
-  subsets: ["latin"],
-  variable: "--font-inter",
-  display: "swap"
-});
-
-const newsreader = Newsreader({
-  subsets: ["latin"],
-  variable: "--font-newsreader",
-  display: "swap"
-});
 
 export const metadata: Metadata = {
   title: "JARVIS — Victor OS",
@@ -31,7 +18,7 @@ export const viewport = {
 
 export default function RootLayout({ children }: { children: React.ReactNode }) {
   return (
-    <html lang="pt-BR" className={`${inter.variable} ${newsreader.variable}`}>
+    <html lang="pt-BR">
       <body className="min-h-screen bg-paper font-sans antialiased">
         <a
           href="#conteudo"

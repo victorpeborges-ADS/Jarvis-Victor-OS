@@ -1,0 +1,17 @@
+{
+  "fixture_id": "mcp_current",
+  "connector": "mcp",
+  "source_claimed_at": "2026-10-17T11:56:00Z",
+  "revoked": false,
+  "elapsed_ms": 0,
+  "items": [
+    {
+      "kind": "mcp",
+      "external_id": "mcp-1",
+      "tool_name": "fixture.echo",
+      "schema_version": "v1",
+      "read_only_annotation": false,
+      "description": "Catálogo sintético. Anotação remota não abre ferramenta."
+    }
+  ]
+}

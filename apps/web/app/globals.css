@@ -4,6 +4,9 @@
 
 /* Design tokens — premium sóbrio, hierarquia editorial */
 :root {
+  /* Local system stacks keep builds offline; retain the existing font tokens. */
+  --font-inter: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Arial, sans-serif;
+  --font-newsreader: Georgia, "Times New Roman", Times, serif;
   --background: #fdfcfb;
   --foreground: #0f172a;
   --muted: #f8fafc;

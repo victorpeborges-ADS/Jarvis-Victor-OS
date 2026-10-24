@@ -1,6 +1,7 @@
 use tauri::Manager;
 
 pub mod runtime_manager;
+pub mod storage_keychain;
 pub mod transport;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -12,6 +13,10 @@ pub fn run() {
             runtime_manager::runtime_status,
             runtime_manager::runtime_transport_status,
             runtime_manager::runtime_transport_probe,
+            runtime_manager::runtime_storage_unlock,
+            runtime_manager::runtime_storage_rotate,
+            runtime_manager::runtime_storage_rotate_begin,
+            runtime_manager::runtime_storage_lock,
             runtime_manager::g5_session_status,
             runtime_manager::g5_session_open,
             runtime_manager::g5_mission_read_grant_create,
@@ -20,9 +25,20 @@ pub fn run() {
             runtime_manager::g5_missions_list,
             runtime_manager::g5_capture_create,
             runtime_manager::g5_capture_list,
+            runtime_manager::g5_capture_search,
+            runtime_manager::g5_capture_open,
+            runtime_manager::g5_conversation_ask,
+            runtime_manager::g5_conversation_open,
+            runtime_manager::g5_conversation_cancel,
+            runtime_manager::g5_synthetic_document_generate,
             runtime_manager::g5_capture_clear,
             runtime_manager::g5_capture_edit,
             runtime_manager::g5_capture_delete,
+            runtime_manager::g5_memory_page,
+            runtime_manager::g5_memory_create,
+            runtime_manager::g5_memory_edit,
+            runtime_manager::g5_memory_delete,
+            runtime_manager::g5_memory_export,
             runtime_manager::g5_connectors_status,
             runtime_manager::g5_review_grant_create,
             runtime_manager::g5_review_grant_revoke,
@@ -33,6 +49,7 @@ pub fn run() {
             runtime_manager::g5_workflow_submit_draft,
             runtime_manager::g5_workflow_submit_simulation,
             runtime_manager::g5_workflow_list,
+            runtime_manager::g5_workflow_page,
             runtime_manager::g5_workflow_detail,
             runtime_manager::g5_workflow_execute_draft,
             runtime_manager::g5_workflow_execute_simulation,

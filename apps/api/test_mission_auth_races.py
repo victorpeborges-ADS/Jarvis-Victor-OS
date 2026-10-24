@@ -6,6 +6,7 @@ import time
 
 import pytest
 
+from api_test_support import sqlite_rows
 import local_security
 import mission_api
 from test_review_api import ORIGIN, client, login, mission_all_grants
@@ -56,7 +57,7 @@ def test_run_does_not_commit_after_session_or_write_grant_revoked(client, monkey
         worker.join(timeout=10)
         assert not worker.is_alive()
         assert result[0].status_code == 403, result[0].text
-        with sqlite3.connect(client.database_path) as connection:
+        with sqlite_rows(client.app.state.memory_store) as connection:
             record = connection.execute("SELECT document_json, status FROM missions WHERE id=?", (mission_id,)).fetchone()
             assert record[1] == "interrupted"
             assert connection.execute("SELECT COUNT(*) FROM mission_artifact_reviews WHERE mission_id=?", (mission_id,)).fetchone()[0] == 0
@@ -83,7 +84,7 @@ def test_create_rechecks_write_grant_after_route_precheck(client, monkeypatch):
         "idempotency_key": "create-revoked-after-precheck",
     })
     assert response.status_code == 403, response.text
-    with sqlite3.connect(client.database_path) as connection:
+    with sqlite_rows(client.app.state.memory_store) as connection:
         assert connection.execute("SELECT COUNT(*) FROM missions").fetchone()[0] == 0
 
 
@@ -103,7 +104,7 @@ def test_direct_transition_rechecks_write_grant_after_route_precheck(client, mon
         "action": "cancel", "expected_revision": 1, "idempotency_key": "cancel-revoked-after-precheck",
     })
     assert response.status_code == 403, response.text
-    with sqlite3.connect(client.database_path) as connection:
+    with sqlite_rows(client.app.state.memory_store) as connection:
         assert connection.execute("SELECT status FROM missions WHERE id=?", (mission_id,)).fetchone()[0] == "planned"
 
 
@@ -125,6 +126,6 @@ def test_import_rechecks_write_grant_after_filter(client, monkeypatch):
         "missions": [document], "idempotency_key": "import-revoked-after-filter", "confirm": True,
     })
     assert response.status_code == 403, response.text
-    with sqlite3.connect(client.database_path) as connection:
+    with sqlite_rows(client.app.state.memory_store) as connection:
         assert connection.execute("SELECT COUNT(*) FROM mission_idempotency WHERE idempotency_key=?",
                                   ("import-revoked-after-filter",)).fetchone()[0] == 0

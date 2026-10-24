@@ -1,0 +1,15 @@
+{
+  "fixture_id": "drive_current",
+  "connector": "drive",
+  "source_claimed_at": "2026-10-17T11:50:00Z",
+  "revoked": false,
+  "elapsed_ms": 0,
+  "items": [
+    {
+      "kind": "drive",
+      "external_id": "file-1",
+      "name": "Notas sintéticas.txt",
+      "mime_type": "text/plain"
+    }
+  ]
+}

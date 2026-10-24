@@ -1,0 +1,19 @@
+{
+  "fixture_id": "redirect",
+  "connector": "drive",
+  "source_claimed_at": "2026-10-17T11:50:00Z",
+  "revoked": false,
+  "elapsed_ms": 0,
+  "redirect": {
+    "status": 302,
+    "location": "http://127.0.0.1/marcador-redirect-alvo"
+  },
+  "items": [
+    {
+      "kind": "drive",
+      "external_id": "file-redirect",
+      "name": "marcador-redirect",
+      "mime_type": "text/plain"
+    }
+  ]
+}

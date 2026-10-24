@@ -33,6 +33,64 @@ export type G5SessionSnapshot = {
 };
 
 export type LocalCapture = { id: string; text: string; created_at: string };
+export type CaptureOrigin = LocalCapture & { domain_id: "dom_synthetic_a"; category: "explicit_capture" };
+export type MemoryCategory = "explicit_capture" | "confirmed_fact" | "external_evidence" | "inferred_proposal";
+export type MemoryDomain = "dom_synthetic_a" | "dom_synthetic_b" | "dom_synthetic_c" | "dom_synthetic_d" | "dom_synthetic_e" | "dom_synthetic_f" | "dom_synthetic_g" | "dom_synthetic_h";
+export type LocalMemoryRecord = {
+  id: string; category: MemoryCategory; domain_id: MemoryDomain; body: string;
+  source_kind: "user_authored_capture" | "owner_confirmation" | "synthetic_source" | "assistant_inference";
+  source_ref: string; version: number; recorded_at: string; revised_at: string;
+};
+export type GroundedReadSource = { id: string; kind: "capture" | "confirmed_fact" | "document"; domain_id: "dom_synthetic_a"; snippet: string };
+export type GroundedReadResult = {
+  status: "evidence" | "insufficient_basis" | "budget_exhausted" | "context_limit" | "provider_timeout" | "provider_failed" | "cancelled" | "stale_session" | "response_too_large";
+  reason: string;
+  provider_id: "fake-deterministic";
+  cost: "unmeasured";
+  text: string;
+  omitted: number;
+  sources: GroundedReadSource[];
+};
+export type SyntheticDocumentArtifact = {
+  id: string;
+  schema_version: 1;
+  kind: "synthetic_document";
+  title: "Resumo sintético de exemplo";
+  sections: [{ index: 1; heading: "Conteúdo de teste"; paragraphs: ["Este documento contém somente texto sintético local."]; source_id: "src_exemplo_sintetico" }];
+  origin: { skill_id: "generate-synthetic-document"; skill_version: "1.0.0"; manifest_sha256: string; license_name: "nao-declarada-no-arquivo-local" };
+  permission: { capability: "generate_synthetic_document"; scope: "synthetic"; principal: "owner" };
+};
+// The WebView invokes only the operation name; Rust injects these credentials in this wire order.
+export const STORAGE_ROTATE_WIRE_FIELDS = ["database_key", "generation", "operation_id", "intent"] as const;
+export const STORAGE_ROTATE_RETIRE_WIRE_FIELDS = ["from_account"] as const;
+export const STORAGE_ROTATE_FINALIZE_WIRE_FIELDS = ["database_key", "operation_id"] as const;
+export const SYNTHETIC_DOCUMENT_WIRE_FIELDS = ["session_token", "csrf_token"] as const;
+export const CONVERSATION_ASK_WIRE_FIELDS = ["session_token", "conversation_id", "question", "domain_id"] as const;
+export const CONVERSATION_OPEN_WIRE_FIELDS = ["session_token", "domain_id", "mode"] as const;
+export const CONVERSATION_CANCEL_WIRE_FIELDS = ["session_token", "conversation_id", "domain_id"] as const;
+export type ConversationRequestTicket = { conversationId: string; generation: number };
+
+export class ConversationRequestGate {
+  private generation = 0;
+  private activeConversation = "";
+
+  begin(conversationId: string): ConversationRequestTicket {
+    this.activeConversation = conversationId;
+    this.generation += 1;
+    return { conversationId, generation: this.generation };
+  }
+
+  isCurrent(ticket: ConversationRequestTicket, visibleConversationId: string): boolean {
+    return ticket.generation === this.generation &&
+      ticket.conversationId === this.activeConversation &&
+      ticket.conversationId === visibleConversationId;
+  }
+
+  invalidate(): void {
+    this.generation += 1;
+    this.activeConversation = "";
+  }
+}
 export type G5PendingReview = { id: string; revision: number; sha256: string; title: string };
 export type G5ReviewDetail = G5PendingReview & { content: string };
 export type WorkflowState = "proposed" | "awaiting_approval" | "paused" | "running" | "interrupted" | "succeeded" | "failed" | "cancelled";
@@ -135,6 +193,15 @@ export type G5CommandResult = {
   dataset?: "api_synthetic";
   items?: G5Mission[];
   captures?: LocalCapture[];
+  has_item?: boolean;
+  memory_record?: LocalMemoryRecord;
+  exported?: boolean;
+  origin?: CaptureOrigin;
+  omitted?: number;
+  grounded_read?: GroundedReadResult;
+  artifact?: SyntheticDocumentArtifact;
+  artifact_sha256?: string;
+  cancelled?: boolean;
   reviews?: G5PendingReview[];
   review_detail?: G5ReviewDetail;
   approved?: boolean;
@@ -178,12 +245,64 @@ export function createG5Ipc(invokeG5: G5Invoke) {
       parseG5CommandResult(await invokeG5("g5_capture_create", { text })),
     listCaptures: async (): Promise<G5CommandResult> =>
       parseG5CommandResult(await invokeG5("g5_capture_list")),
+    searchCaptures: async (query: string): Promise<G5CommandResult> =>
+      parseG5CommandResult(await invokeG5("g5_capture_search", { query })),
+    openCapture: async (captureId: string): Promise<G5CommandResult> =>
+      parseG5CommandResult(await invokeG5("g5_capture_open", { capture_id: captureId })),
+    groundedRead: async (conversationId: string, question: string): Promise<G5CommandResult> => {
+      if (!/^[0-9a-f]{32}$/.test(conversationId) || typeof question !== "string" ||
+          [...question].length < 1 || [...question].length > 400 || /[\u0000-\u001f\u007f]/.test(question)) {
+        throw new Error("Pergunta local inválida.");
+      }
+      return parseG5CommandResult(await invokeG5("g5_conversation_ask", {
+        conversation_id: conversationId,
+        question,
+      }));
+    },
+    openConversation: async (mode: "new" | "resume"): Promise<G5CommandResult> => {
+      if (mode !== "new" && mode !== "resume") throw new Error("Modo de conversa inválido.");
+      return parseG5CommandResult(await invokeG5("g5_conversation_open", { mode }));
+    },
+    cancelConversation: async (conversationId: string): Promise<G5CommandResult> => {
+      if (!/^[0-9a-f]{32}$/.test(conversationId)) throw new Error("Conversa inválida.");
+      return parseG5CommandResult(await invokeG5("g5_conversation_cancel", { conversation_id: conversationId }));
+    },
+    generateSyntheticDocument: async (): Promise<G5CommandResult> =>
+      parseG5CommandResult(await invokeG5("g5_synthetic_document_generate")),
     clearCaptures: async (): Promise<G5CommandResult> =>
       parseG5CommandResult(await invokeG5("g5_capture_clear")),
     editCapture: async (captureId: string, text: string): Promise<G5CommandResult> =>
       parseG5CommandResult(await invokeG5("g5_capture_edit", { capture_id: captureId, text })),
     deleteCapture: async (captureId: string): Promise<G5CommandResult> =>
       parseG5CommandResult(await invokeG5("g5_capture_delete", { capture_id: captureId })),
+    memoryPage: async (category: MemoryCategory, domainId: MemoryDomain, offset: number): Promise<G5CommandResult> => {
+      if (!validMemoryCategory(category) || !validMemoryDomain(domainId) || !Number.isSafeInteger(offset) || offset < 0 || offset > 5000) {
+        throw new Error("Consulta de memória inválida.");
+      }
+      return parseG5CommandResult(await invokeG5("g5_memory_page", { category, domainId, offset }));
+    },
+    memoryCreate: async (category: MemoryCategory, domainId: MemoryDomain, body: string, sourceRef: string): Promise<G5CommandResult> => {
+      if (!validMemoryCategory(category) || !validMemoryDomain(domainId) || !validMemoryBody(body) || !validMemorySourceRef(sourceRef)) {
+        throw new Error("Item de memória inválido.");
+      }
+      return parseG5CommandResult(await invokeG5("g5_memory_create", { category, domainId, body, sourceRef }));
+    },
+    memoryEdit: async (category: MemoryCategory, domainId: MemoryDomain, recordId: string, body: string, expectedRevision: number): Promise<G5CommandResult> => {
+      if (!validMemoryCategory(category) || !validMemoryDomain(domainId) || !/^[0-9a-f]{32}$/.test(recordId) ||
+          !validMemoryBody(body) || !Number.isSafeInteger(expectedRevision) || expectedRevision < 1 || expectedRevision >= 0x7fffffff) {
+        throw new Error("Correção de memória inválida.");
+      }
+      return parseG5CommandResult(await invokeG5("g5_memory_edit", { category, domainId, recordId, body, expectedRevision }));
+    },
+    memoryDelete: async (category: MemoryCategory, domainId: MemoryDomain, recordId: string, expectedRevision: number): Promise<G5CommandResult> => {
+      if (!validMemoryCategory(category) || !validMemoryDomain(domainId) || !/^[0-9a-f]{32}$/.test(recordId) ||
+          !Number.isSafeInteger(expectedRevision) || expectedRevision < 1 || expectedRevision > 0x7fffffff) {
+        throw new Error("Exclusão de memória inválida.");
+      }
+      return parseG5CommandResult(await invokeG5("g5_memory_delete", { category, domainId, recordId, expectedRevision }));
+    },
+    memoryExport: async (): Promise<G5CommandResult> =>
+      parseG5CommandResult(await invokeG5("g5_memory_export")),
     connectorStatus: async (): Promise<ConnectorStatus> =>
       parseConnectorStatus(await invokeG5("g5_connectors_status")),
     createReviewGrant: async (): Promise<G5CommandResult> =>
@@ -206,6 +325,10 @@ export function createG5Ipc(invokeG5: G5Invoke) {
         revision: review.revision,
         sha256: review.sha256,
       })),
+    workflowPage: async (cursor = ""): Promise<WorkflowPageResult> => {
+      if (!validWorkflowCursor(cursor)) throw new Error("Cursor de histórico inválido.");
+      return parseWorkflowPageResult(await invokeG5("g5_workflow_page", { cursor }), cursor);
+    },
     workflowList: async (): Promise<G5CommandResult> =>
       parseG5CommandResult(await invokeG5("g5_workflow_list")),
     workflowDetail: async (taskId: string): Promise<G5CommandResult> =>
@@ -246,6 +369,50 @@ export function createG5Ipc(invokeG5: G5Invoke) {
 
 const states: RuntimeState[] = ["STOPPED", "STARTING", "READY", "STOPPING", "FAILED", "CRASHED"];
 const transportStates: TransportState[] = ["DISCONNECTED", "DISCOVERING", "PROVING_INSTANCE", "READY", "INCOMPATIBLE", "FAILED"];
+const memoryCategories: MemoryCategory[] = ["explicit_capture", "confirmed_fact", "external_evidence", "inferred_proposal"];
+const memoryDomains: MemoryDomain[] = ["dom_synthetic_a", "dom_synthetic_b", "dom_synthetic_c", "dom_synthetic_d", "dom_synthetic_e", "dom_synthetic_f", "dom_synthetic_g", "dom_synthetic_h"];
+
+function validMemoryCategory(value: string): value is MemoryCategory {
+  return memoryCategories.includes(value as MemoryCategory);
+}
+
+function validMemoryDomain(value: string): value is MemoryDomain {
+  return memoryDomains.includes(value as MemoryDomain);
+}
+
+function validMemoryBody(value: string): boolean {
+  return typeof value === "string" && [...value].length >= 1 && [...value].length <= 80 && !/[\u0000-\u001f\u007f]/.test(value);
+}
+
+function validMemorySourceRef(value: string): boolean {
+  return typeof value === "string" && /^[A-Za-z0-9_-]{1,64}$/.test(value);
+}
+
+function parseMemoryRecord(value: unknown): LocalMemoryRecord {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) throw new Error("Registro de memória inválido.");
+  const record = value as Record<string, unknown>;
+  const keys = ["id", "category", "domain_id", "body", "source_kind", "source_ref", "version", "recorded_at", "revised_at"];
+  if (Object.keys(record).length !== keys.length || keys.some((key) => !(key in record)) ||
+      typeof record.id !== "string" || !/^[0-9a-f]{32}$/.test(record.id) ||
+      typeof record.category !== "string" || !validMemoryCategory(record.category) ||
+      typeof record.domain_id !== "string" || !validMemoryDomain(record.domain_id) ||
+      typeof record.body !== "string" || !validMemoryBody(record.body) ||
+      typeof record.source_ref !== "string" || !validMemorySourceRef(record.source_ref) ||
+      typeof record.version !== "number" || !Number.isSafeInteger(record.version) || record.version < 1 || record.version > 0x7fffffff ||
+      typeof record.recorded_at !== "string" || !validAutomationTimestamp(record.recorded_at) ||
+      typeof record.revised_at !== "string" || !validAutomationTimestamp(record.revised_at)) {
+    throw new Error("Registro de memória inválido.");
+  }
+  const sourceKinds: Record<MemoryCategory, LocalMemoryRecord["source_kind"]> = {
+    explicit_capture: "user_authored_capture", confirmed_fact: "owner_confirmation",
+    external_evidence: "synthetic_source", inferred_proposal: "assistant_inference",
+  };
+  if (record.source_kind !== sourceKinds[record.category] ||
+      (record.category === "explicit_capture" && (record.domain_id !== "dom_synthetic_a" || record.source_ref !== "explicit_capture"))) {
+    throw new Error("Origem de memória inválida.");
+  }
+  return record as LocalMemoryRecord;
+}
 
 export function parseRuntimeEnvelope(value: string): RuntimeEnvelope {
   const parsed: unknown = JSON.parse(value);
@@ -329,6 +496,113 @@ export function parseG5CommandResult(value: string): G5CommandResult {
   }
   const record = parsed as Record<string, unknown>;
   const result: G5CommandResult = { ok: record.ok as boolean };
+  if (record.id !== undefined && record.expires_at !== undefined) {
+    if (record.ok !== true || Object.keys(record).length !== 3 ||
+        Object.keys(record).some((key) => !["ok", "id", "expires_at"].includes(key)) ||
+        typeof record.id !== "string" || !/^[0-9a-f]{32}$/.test(record.id) ||
+        typeof record.expires_at !== "string" || !Number.isFinite(Date.parse(record.expires_at)) ||
+        Date.parse(record.expires_at) <= Date.now()) {
+      throw new Error("Identidade de conversa inválida.");
+    }
+    return { ok: true, id: record.id, expires_at: record.expires_at };
+  }
+  if (record.has_item !== undefined || record.record !== undefined) {
+    if (record.ok !== true) throw new Error("Resposta da lista de memória inválida.");
+    if (record.has_item === false && Object.keys(record).length === 2 && !("record" in record)) {
+      result.has_item = false;
+    } else if (record.has_item === true && Object.keys(record).length === 3 && record.record !== undefined) {
+      result.has_item = true;
+      result.memory_record = parseMemoryRecord(record.record);
+    } else if (record.has_item === undefined && Object.keys(record).length === 2 && record.record !== undefined) {
+      result.memory_record = parseMemoryRecord(record.record);
+    } else {
+      throw new Error("Resposta da lista de memória inválida.");
+    }
+    if (result.memory_record && ((record.has_item === true) !== (result.has_item === true))) {
+      throw new Error("Resposta da lista de memória inválida.");
+    }
+    return result;
+  }
+  if (record.artifact !== undefined) {
+    if (record.ok !== true || Object.keys(record).length !== 3 ||
+        Object.keys(record).some((key) => !["ok", "artifact", "artifact_sha256"].includes(key)) ||
+        typeof record.artifact_sha256 !== "string" || !/^[0-9a-f]{64}$/.test(record.artifact_sha256)) {
+      throw new Error("Resposta do documento sintético inválida.");
+    }
+    const artifact = record.artifact as Record<string, unknown>;
+    const artifactKeys = ["id", "schema_version", "kind", "title", "sections", "origin", "permission"];
+    if (typeof artifact !== "object" || artifact === null || Array.isArray(artifact) ||
+        Object.keys(artifact).length !== artifactKeys.length || artifactKeys.some((key) => !(key in artifact))) {
+      throw new Error("Documento sintético inválido.");
+    }
+    const section = Array.isArray(artifact.sections) && artifact.sections.length === 1 ? artifact.sections[0] as Record<string, unknown> : null;
+    const origin = typeof artifact.origin === "object" && artifact.origin !== null && !Array.isArray(artifact.origin)
+      ? artifact.origin as Record<string, unknown> : null;
+    const permission = typeof artifact.permission === "object" && artifact.permission !== null && !Array.isArray(artifact.permission)
+      ? artifact.permission as Record<string, unknown> : null;
+    if (typeof artifact.id !== "string" || !/^doc_[0-9a-f]{16}$/.test(artifact.id) ||
+        artifact.schema_version !== 1 || artifact.kind !== "synthetic_document" ||
+        artifact.title !== "Resumo sintético de exemplo" || !section ||
+        Object.keys(section).length !== 4 || !["index", "heading", "paragraphs", "source_id"].every((key) => key in section) ||
+        section.index !== 1 || section.heading !== "Conteúdo de teste" ||
+        JSON.stringify(section.paragraphs) !== JSON.stringify(["Este documento contém somente texto sintético local."]) ||
+        section.source_id !== "src_exemplo_sintetico" || !origin ||
+        Object.keys(origin).length !== 4 || !["skill_id", "skill_version", "manifest_sha256", "license_name"].every((key) => key in origin) ||
+        origin.skill_id !== "generate-synthetic-document" || origin.skill_version !== "1.0.0" ||
+        typeof origin.manifest_sha256 !== "string" || !/^[0-9a-f]{64}$/.test(origin.manifest_sha256) ||
+        origin.license_name !== "nao-declarada-no-arquivo-local" || !permission ||
+        Object.keys(permission).length !== 3 || !["capability", "scope", "principal"].every((key) => key in permission) ||
+        permission.capability !== "generate_synthetic_document" || permission.scope !== "synthetic" || permission.principal !== "owner") {
+      throw new Error("Documento sintético inválido.");
+    }
+    result.artifact = artifact as SyntheticDocumentArtifact;
+    result.artifact_sha256 = record.artifact_sha256;
+  }
+  if (record.grounded_read !== undefined) {
+    if (record.ok !== true || Object.keys(record).length !== 2 ||
+        Object.keys(record).some((key) => !["ok", "grounded_read"].includes(key)) ||
+        typeof record.grounded_read !== "object" || record.grounded_read === null || Array.isArray(record.grounded_read)) {
+      throw new Error("Resposta de conversa local inválida.");
+    }
+    const read = record.grounded_read as Record<string, unknown>;
+    const expected = ["status", "reason", "provider_id", "cost", "text", "omitted", "sources"];
+    if (Object.keys(read).length !== expected.length || expected.some((key) => !(key in read)) ||
+        Object.keys(read).some((key) => !expected.includes(key))) {
+      throw new Error("Resposta de conversa local inválida.");
+    }
+    const statuses = ["evidence", "insufficient_basis", "budget_exhausted", "context_limit", "provider_timeout", "provider_failed", "cancelled", "stale_session", "response_too_large"];
+    if (typeof read.status !== "string" || !statuses.includes(read.status) ||
+        typeof read.reason !== "string" || !/^[a-z_]{0,32}$/.test(read.reason) ||
+        read.provider_id !== "fake-deterministic" || read.cost !== "unmeasured" ||
+        typeof read.text !== "string" || read.text.length > 1800 ||
+        typeof read.omitted !== "number" || !Number.isSafeInteger(read.omitted) || read.omitted < 0 ||
+        !Array.isArray(read.sources) || read.sources.length > 3) {
+      throw new Error("Resposta de conversa local inválida.");
+    }
+    const sources = read.sources.map((item): GroundedReadSource => {
+      if (typeof item !== "object" || item === null || Array.isArray(item)) throw new Error("Fonte local inválida.");
+      const source = item as Record<string, unknown>;
+      const keys = ["id", "kind", "domain_id", "snippet"];
+      if (Object.keys(source).length !== keys.length || keys.some((key) => !(key in source)) ||
+          typeof source.id !== "string" || !/^[a-z0-9_-]{1,32}$/.test(source.id) ||
+          (source.kind !== "capture" && source.kind !== "confirmed_fact" && source.kind !== "document") || source.domain_id !== "dom_synthetic_a" ||
+          typeof source.snippet !== "string" || source.snippet.length < 1 || [...source.snippet].length > 4096 ||
+          /[\u0000-\u001f\u007f]/.test(source.snippet)) {
+        throw new Error("Fonte local inválida.");
+      }
+      return { id: source.id, kind: source.kind, domain_id: "dom_synthetic_a", snippet: source.snippet };
+    });
+    if ((read.status === "evidence") !== (sources.length > 0 && read.text.length > 0) ||
+        (read.status !== "evidence" && (sources.length !== 0 || read.text.length !== 0)) ||
+        sources.map((source) => source.snippet).join(" | ") !== read.text) {
+      throw new Error("Evidência local inconsistente.");
+    }
+    result.grounded_read = {
+      status: read.status as GroundedReadResult["status"], reason: read.reason,
+      provider_id: "fake-deterministic", cost: "unmeasured", text: read.text,
+      omitted: read.omitted, sources,
+    };
+  }
   if (record.task !== undefined) result.task = parseWorkflowTask(record.task);
   if (record.tasks !== undefined) {
     if (!Array.isArray(record.tasks) || record.tasks.length > 4) throw new Error("Lista de workflows inválida.");
@@ -382,6 +656,14 @@ export function parseG5CommandResult(value: string): G5CommandResult {
   if (record.deleted !== undefined) {
     if (record.deleted !== true) throw new Error("Apagar captura inválido.");
     result.deleted = true;
+  }
+  if (record.cancelled !== undefined) {
+    if (record.ok !== true || Object.keys(record).length !== 2 || record.cancelled !== true) throw new Error("Cancelamento de conversa inválido.");
+    result.cancelled = true;
+  }
+  if (record.exported !== undefined) {
+    if (record.ok !== true || Object.keys(record).length !== 2 || record.exported !== true) throw new Error("Exportação de memória inválida.");
+    result.exported = true;
   }
   if (record.automations !== undefined) {
     if (!Array.isArray(record.automations) || record.automations.length > 3) throw new Error("Lista de automações inválida.");
@@ -470,11 +752,44 @@ export function parseG5CommandResult(value: string): G5CommandResult {
       return { id: review.id, revision: review.revision, sha256: review.sha256, title: review.title };
     });
   }
+  if (record.captures !== undefined || record.origin !== undefined) {
+    const allowed = new Set(["ok", "captures", "origin", "omitted"]);
+    if (Object.keys(record).some((key) => !allowed.has(key))) {
+      throw new Error("Campo de captura desconhecido.");
+    }
+  }
+  if (record.origin !== undefined) {
+    if (typeof record.origin !== "object" || record.origin === null || Array.isArray(record.origin)) {
+      throw new Error("Origem da captura inválida.");
+    }
+    const origin = record.origin as Record<string, unknown>;
+    const originKeys = ["id", "text", "created_at", "domain_id", "category"];
+    if (Object.keys(origin).length !== originKeys.length || originKeys.some((key) => !(key in origin))) {
+      throw new Error("Origem da captura inválida.");
+    }
+    if (typeof origin.id !== "string" || !/^[0-9a-f]{32}$/.test(origin.id) ||
+        typeof origin.text !== "string" || origin.text.length === 0 || [...origin.text].length > 80 ||
+        /[\u0000-\u001f\u007f]/.test(origin.text) || typeof origin.created_at !== "string" ||
+        origin.domain_id !== "dom_synthetic_a" || origin.category !== "explicit_capture") {
+      throw new Error("Origem da captura inválida.");
+    }
+    result.origin = {
+      id: origin.id,
+      text: origin.text,
+      created_at: origin.created_at,
+      domain_id: "dom_synthetic_a",
+      category: "explicit_capture",
+    };
+  }
   if (record.captures !== undefined) {
-    if (!Array.isArray(record.captures)) throw new Error("Lista de capturas inválida.");
+    if (!Array.isArray(record.captures) || record.captures.length > 3) throw new Error("Lista de capturas inválida.");
     result.captures = record.captures.map((item): LocalCapture => {
-      if (typeof item !== "object" || item === null) throw new Error("Captura inválida.");
+      if (typeof item !== "object" || item === null || Array.isArray(item)) throw new Error("Captura inválida.");
       const capture = item as Record<string, unknown>;
+      const captureKeys = ["id", "text", "created_at"];
+      if (Object.keys(capture).length !== captureKeys.length || captureKeys.some((key) => !(key in capture))) {
+        throw new Error("Captura inválida.");
+      }
       if (typeof capture.id !== "string" || !/^[0-9a-f]{32}$/.test(capture.id) ||
           typeof capture.text !== "string" || capture.text.length === 0 || [...capture.text].length > 80 ||
           /[\u0000-\u001f\u007f]/.test(capture.text) || typeof capture.created_at !== "string") {
@@ -482,6 +797,13 @@ export function parseG5CommandResult(value: string): G5CommandResult {
       }
       return { id: capture.id, text: capture.text, created_at: capture.created_at };
     });
+    if (record.omitted !== undefined) {
+      if (typeof record.omitted !== "number" || !Number.isSafeInteger(record.omitted) || record.omitted < 0) {
+        throw new Error("Contagem de capturas omitidas inválida.");
+      }
+      if (result.captures.length < 3 && record.omitted !== 0) throw new Error("Contagem de capturas omitidas inválida.");
+      result.omitted = record.omitted;
+    }
   }
   if (record.created_at !== undefined) {
     if (typeof record.id !== "string" || typeof record.created_at !== "string") throw new Error("Captura inválida.");
@@ -492,6 +814,43 @@ export function parseG5CommandResult(value: string): G5CommandResult {
     throw new Error("Resposta de missões inválida.");
   }
   return result;
+}
+
+export type WorkflowPageResult = { ok: true; tasks: WorkflowTaskSummary[]; next_cursor: string } | { ok: false; error: string };
+
+function validWorkflowCursor(cursor: string): boolean {
+  if (typeof cursor !== "string") return false;
+  if (cursor === "") return true;
+  if (cursor.length > 80 || !/^wf1\|[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]{6})?\+00:00\|[0-9a-f]{32}$/.test(cursor) || cursor.includes(".000000+")) return false;
+  const stamp = cursor.split("|")[1];
+  const year = Number(stamp.slice(0, 4)), month = Number(stamp.slice(5, 7)), day = Number(stamp.slice(8, 10));
+  const leap = year % 4 === 0 && (year % 100 !== 0 || year % 400 === 0);
+  const days = [31, leap ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+  return year > 0 && month >= 1 && month <= 12 && day >= 1 && day <= days[month - 1] &&
+    Number(stamp.slice(11, 13)) < 24 && Number(stamp.slice(14, 16)) < 60 && Number(stamp.slice(17, 19)) < 60;
+}
+
+export function parseWorkflowPageResult(raw: unknown, requested = ""): WorkflowPageResult {
+  if (!validWorkflowCursor(requested) || typeof raw !== "string" || new TextEncoder().encode(raw).length >= 2048) throw new Error("Página local inválida.");
+  const value = JSON.parse(raw) as Record<string, unknown>;
+  if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("Página local inválida.");
+  if (value.ok === false && Object.keys(value).length === 2 && typeof value.error === "string") return { ok: false, error: value.error };
+  if (value.ok !== true || Object.keys(value).length !== 3 || !Array.isArray(value.tasks) || value.tasks.length > 4 ||
+      typeof value.next_cursor !== "string" || !validWorkflowCursor(value.next_cursor)) throw new Error("Página local inválida.");
+  const keys = ["task_id", "tool_id", "state", "arguments_sha", "created_at", "updated_at", "risk", "expected_effect"];
+  let previous = requested ? requested.split("|").slice(1).join("|") : "";
+  let lastCursor = "";
+  const tasks = value.tasks.map((entry: unknown) => {
+    const item = parseWorkflowTaskSummary(entry);
+    if (Object.keys(item).length !== keys.length || keys.some((key) => !(key in item))) throw new Error("Página local inválida.");
+    lastCursor = `wf1|${item.created_at}|${item.task_id}`;
+    const key = `${item.created_at}|${item.task_id}`;
+    if (!validWorkflowCursor(lastCursor) || (previous && key >= previous)) throw new Error("Ordem de histórico inválida.");
+    previous = key;
+    return item;
+  });
+  if (value.next_cursor && (tasks.length === 0 || value.next_cursor !== lastCursor)) throw new Error("Cursor de histórico inválido.");
+  return { ok: true, tasks, next_cursor: value.next_cursor };
 }
 
 function parseWorkflowTaskSummary(value: unknown): WorkflowTaskSummary {

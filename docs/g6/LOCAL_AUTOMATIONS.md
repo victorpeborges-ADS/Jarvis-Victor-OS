@@ -82,3 +82,7 @@ O proprietário ainda precisa observar a janela real e registrar separadamente: 
 ## Composição na candidata Phase 5 — 2026-10-13
 
 Este handoff preserva a evidência reportada pela worktree de origem `feat/jarvis-automacoes-locais-persistentes`. A integração com workflow e Aprovações nativas está documentada em [`INTEGRATION_CANDIDATE_2026-10-13.md`](INTEGRATION_CANDIDATE_2026-10-13.md), que contém os comandos reexecutados na worktree composta, a prova `0019 → 0020` em banco temporário, os limites do SQLite sem cifra e os smokes manuais pendentes. Nenhuma janela foi observada; esta seção não transforma build/teste IPC em aceite visual.
+
+## Contrato de erros — 2026-10-14
+
+A candidata composta traduz os cinco códigos fechados de erro de automação para mensagens fixas em português, preservando a rejeição de códigos desconhecidos e campos extras. A reprodução, a correção, os testes sem janela e a decisão pendente sobre cifra em repouso estão em [LOCAL_AUTOMATION_ERRORS_2026-10-14.md](LOCAL_AUTOMATION_ERRORS_2026-10-14.md). Smoke manual permanece pendente.

@@ -2,12 +2,38 @@ import { useEffect, useRef, useState } from "react";
 import type { FormEvent } from "react";
 import { invoke, isTauri } from "@tauri-apps/api/core";
 import "./App.css";
-import { createG5Ipc, executeRuntimeCommand, grantIsDisplayedActive, parseLocalRuntimeConfig, parseRuntimeEnvelope, parseTransportSnapshot } from "./runtimeCommand";
-import type { ConnectorStatus, G5CommandResult, G5Mission, G5PendingReview, G5ReviewDetail, G5SessionSnapshot, LocalAutomation, LocalAutomationRun, LocalCapture, LocalRuntimeConfig, RuntimeEnvelope, RuntimeState, RuntimeCommand, TransportSnapshot, TransportState, WorkflowState, WorkflowTask, WorkflowTaskSummary } from "./runtimeCommand";
+import { ConversationRequestGate, createG5Ipc, executeRuntimeCommand, grantIsDisplayedActive, parseLocalRuntimeConfig, parseRuntimeEnvelope, parseTransportSnapshot } from "./runtimeCommand";
+import type { CaptureOrigin, ConnectorStatus, G5CommandResult, G5Mission, G5PendingReview, G5ReviewDetail, G5SessionSnapshot, GroundedReadResult, LocalAutomation, LocalAutomationRun, LocalCapture, LocalMemoryRecord, LocalRuntimeConfig, MemoryCategory, MemoryDomain, RuntimeEnvelope, RuntimeState, RuntimeCommand, SyntheticDocumentArtifact, TransportSnapshot, TransportState, WorkflowState, WorkflowTask, WorkflowTaskSummary } from "./runtimeCommand";
 
 const g5Ipc = createG5Ipc((command, args) => invoke<string>(command, args));
-const sections = ["Agora", "Inbox", "Missões", "Aprovações", "Automações", "Runtime local", "Configurações"] as const;
+const sections = ["Agora", "Memória", "Conversa", "Artefatos", "Inbox", "Missões", "Aprovações", "Automações", "Runtime local", "Configurações"] as const;
 type Section = (typeof sections)[number];
+
+const memoryCategories: { value: MemoryCategory; label: string }[] = [
+  { value: "explicit_capture", label: "Capturas explícitas" },
+  { value: "confirmed_fact", label: "Fatos confirmados" },
+  { value: "external_evidence", label: "Evidências sintéticas" },
+  { value: "inferred_proposal", label: "Propostas inferidas" },
+];
+const memoryDomains: MemoryDomain[] = ["dom_synthetic_a", "dom_synthetic_b", "dom_synthetic_c", "dom_synthetic_d", "dom_synthetic_e", "dom_synthetic_f", "dom_synthetic_g", "dom_synthetic_h"];
+const memorySourceLabels: Record<LocalMemoryRecord["source_kind"], string> = {
+  user_authored_capture: "captura escrita pelo usuário",
+  owner_confirmation: "confirmação do proprietário",
+  synthetic_source: "fonte sintética",
+  assistant_inference: "inferência do assistente (proposta, não fato)",
+};
+
+const groundedReadStatusLabels: Record<GroundedReadResult["status"], string> = {
+  evidence: "Evidência local",
+  insufficient_basis: "Base insuficiente",
+  budget_exhausted: "Orçamento local esgotado",
+  context_limit: "Limite de contexto atingido",
+  provider_timeout: "Tempo limite atingido",
+  provider_failed: "Leitura local falhou",
+  cancelled: "Consulta cancelada",
+  stale_session: "Sessão encerrada ou expirada",
+  response_too_large: "Resposta recusada pelo limite",
+};
 
 const connectorBlockLabels = {
   missing_oauth_client: "não conectada: falta o client ID OAuth",
@@ -72,14 +98,38 @@ function formatAutomationTime(value: string, timezone: string): string {
 function App() {
   const [section, setSection] = useState<Section>("Agora");
   const [captures, setCaptures] = useState<LocalCapture[]>([]);
+  const [searchQuery, setSearchQuery] = useState("");
+  const [searchHits, setSearchHits] = useState<LocalCapture[] | null>(null);
+  const [openedOrigin, setOpenedOrigin] = useState<CaptureOrigin | null>(null);
+  const [memoryCategory, setMemoryCategory] = useState<MemoryCategory>("explicit_capture");
+  const [memoryDomain, setMemoryDomain] = useState<MemoryDomain>("dom_synthetic_a");
+  const [memoryRecords, setMemoryRecords] = useState<LocalMemoryRecord[]>([]);
+  const [memorySelectedId, setMemorySelectedId] = useState<string | null>(null);
+  const [memoryBody, setMemoryBody] = useState("");
+  const [memorySourceRef, setMemorySourceRef] = useState("explicit_capture");
+  const [memoryHasMore, setMemoryHasMore] = useState(false);
+  const [memoryOffset, setMemoryOffset] = useState(0);
+  const [memoryBusy, setMemoryBusy] = useState(false);
+  const [memoryError, setMemoryError] = useState("");
+  const [memoryNotice, setMemoryNotice] = useState("");
   const [text, setText] = useState("");
+  const [conversationId, setConversationId] = useState<string | null>(null);
+  const [conversationExpiresAt, setConversationExpiresAt] = useState<string | null>(null);
+  const [conversationQuestion, setConversationQuestion] = useState("");
+  const [conversationResult, setConversationResult] = useState<GroundedReadResult | null>(null);
+  const [conversationError, setConversationError] = useState("");
+  const [conversationBusy, setConversationBusy] = useState(false);
+  const [syntheticArtifact, setSyntheticArtifact] = useState<SyntheticDocumentArtifact | null>(null);
+  const [syntheticArtifactSha256, setSyntheticArtifactSha256] = useState<string | null>(null);
+  const [artifactBusy, setArtifactBusy] = useState(false);
+  const [artifactError, setArtifactError] = useState("");
   const [notice, setNotice] = useState("");
   const [runtime, setRuntime] = useState<RuntimeEnvelope | null>(null);
   const [transport, setTransport] = useState<TransportSnapshot | null>(null);
   const [runtimeError, setRuntimeError] = useState("");
   const [runtimeBusy, setRuntimeBusy] = useState(false);
   const [g5Status, setG5Status] = useState<G5SessionSnapshot | null>(null);
-  const [g5Busy, setG5Busy] = useState(false);
+  const [g5CommandBusy, setG5Busy] = useState(false);
   const [g5Error, setG5Error] = useState("");
   const [grantConfirmed, setGrantConfirmed] = useState(false);
   const [missions, setMissions] = useState<G5Mission[]>([]);
@@ -111,6 +161,13 @@ function App() {
   const [pendingReviews, setPendingReviews] = useState<G5PendingReview[]>([]);
   const [editingId, setEditingId] = useState<string | null>(null);
   const [reviewDetail, setReviewDetail] = useState<G5ReviewDetail | null>(null);
+  const workflowHistoryGeneration = useRef(0);
+  const conversationOpenGeneration = useRef(0);
+  const artifactGeneration = useRef(0);
+  const conversationGate = useRef<ConversationRequestGate | null>(null);
+  conversationGate.current ??= new ConversationRequestGate();
+  const [workflowPageBusy, setWorkflowPageBusy] = useState(false);
+  const [workflowCursor, setWorkflowCursor] = useState("");
   const [workflowTasks, setWorkflowTasks] = useState<WorkflowTaskSummary[]>([]);
   const [workflowDetail, setWorkflowDetail] = useState<WorkflowTask | null>(null);
   const [workflowTitle, setWorkflowTitle] = useState("");
@@ -118,7 +175,16 @@ function App() {
   const [simulationSubject, setSimulationSubject] = useState("");
   const [simulationBody, setSimulationBody] = useState("");
   const runtimeAvailable = isTauri();
+  const g5Busy = g5CommandBusy || workflowPageBusy;
   const grantActive = g5Status ? grantIsDisplayedActive(g5Status, nowMs) : false;
+
+  function clearWorkflowHistory() {
+    workflowHistoryGeneration.current += 1;
+    setWorkflowPageBusy(false);
+    setWorkflowTasks([]);
+    setWorkflowCursor("");
+    setWorkflowDetail(null);
+  }
 
   useEffect(() => {
     if (!runtimeAvailable) return;
@@ -140,13 +206,28 @@ function App() {
           setLocalConfig(parseLocalRuntimeConfig(configResponse));
           setNowMs(Date.now());
           if (next.snapshot.state !== "READY" || nextTransport.state !== "READY" || !g5Response.session_active) {
+            artifactGeneration.current += 1;
+            setSyntheticArtifact(null);
+            setSyntheticArtifactSha256(null);
+            setArtifactError("");
+            setArtifactBusy(false);
             setGrantConfirmed(false);
             setMissions([]);
             setCaptures([]);
+            setSearchHits(null);
+            setOpenedOrigin(null);
+            setMemoryRecords([]);
+            setMemorySelectedId(null);
+            setMemoryBody("");
+            setMemorySourceRef("explicit_capture");
+            setMemoryOffset(0);
+            setMemoryHasMore(false);
+            setMemoryNotice("");
+            setEditingId(null);
+            setText("");
             setConnectors(null);
             setReviewGrant(false);
-            setWorkflowTasks([]);
-            setWorkflowDetail(null);
+            clearWorkflowHistory();
             setPendingReviews([]);
             setReviewDetail(null);
             setApprovalConfirmed(false);
@@ -169,12 +250,54 @@ function App() {
   }, [runtimeAvailable]);
 
   useEffect(() => {
+    const generation = ++conversationOpenGeneration.current;
+    const gate = conversationGate.current;
+    const ready = runtimeAvailable && section === "Conversa" && g5Status?.session_active === true &&
+      runtime?.snapshot.state === "READY" && transport?.state === "READY";
+    if (!ready) {
+      const previousId = conversationId;
+      if (conversationBusy && previousId) void g5Ipc.cancelConversation(previousId).catch(() => undefined);
+      gate?.invalidate();
+      setConversationId(null);
+      setConversationExpiresAt(null);
+      setConversationBusy(false);
+      setConversationResult(null);
+      setConversationError("");
+      return;
+    }
+
+    let cancelled = false;
+    setConversationId(null);
+    setConversationExpiresAt(null);
+    gate?.invalidate();
+    setConversationBusy(false);
+    setConversationResult(null);
+    setConversationError("");
+    void g5Ipc.openConversation("resume").then((opened) => {
+      if (cancelled || generation !== conversationOpenGeneration.current) return;
+      if (!opened.ok || !opened.id || !opened.expires_at) {
+        setConversationError(opened.error ?? "A conversa local não pôde ser aberta.");
+        return;
+      }
+      setConversationId(opened.id);
+      setConversationExpiresAt(opened.expires_at);
+    }).catch(() => {
+      if (!cancelled && generation === conversationOpenGeneration.current) {
+        setConversationError("O canal autenticado não pôde abrir a conversa local.");
+      }
+    });
+    return () => { cancelled = true; };
+  }, [runtimeAvailable, section, g5Status?.session_active, runtime?.snapshot.state, transport?.state]);
+
+  useEffect(() => {
     if (!runtimeAvailable || !g5Status?.session_active) return;
     let cancelled = false;
+    const generation = ++workflowHistoryGeneration.current;
+    setWorkflowPageBusy(false);
     void (async () => {
       try {
-        const [listed, status, workflows] = await Promise.all([g5Ipc.listCaptures(), g5Ipc.connectorStatus(), g5Ipc.workflowList()]);
-        if (cancelled) return;
+        const [listed, status, workflows] = await Promise.all([g5Ipc.listCaptures(), g5Ipc.connectorStatus(), g5Ipc.workflowPage()]);
+        if (cancelled || generation !== workflowHistoryGeneration.current) return;
         if (listed.ok) {
           setCaptures(listed.captures ?? []);
           setG5Error("");
@@ -183,17 +306,20 @@ function App() {
           setG5Error(listed.error ?? "O banco local não está disponível; as ideias não foram atualizadas.");
         }
         setConnectors(status);
-        setWorkflowTasks(workflows.ok ? workflows.tasks ?? [] : []);
+        setWorkflowTasks(workflows.ok ? workflows.tasks : []);
+        setWorkflowCursor(workflows.ok ? workflows.next_cursor : "");
+        if (!workflows.ok) setG5Error(workflows.error);
       } catch {
-        if (!cancelled) {
+        if (!cancelled && generation === workflowHistoryGeneration.current) {
           setConnectors(null);
           setCaptures([]);
           setWorkflowTasks([]);
+          setWorkflowCursor("");
           setG5Error("Não foi possível ler o banco local autenticado.");
         }
       }
     })();
-    return () => { cancelled = true; };
+    return () => { cancelled = true; workflowHistoryGeneration.current += 1; };
   }, [runtimeAvailable, g5Status?.session_active, section]);
 
   useEffect(() => {
@@ -341,6 +467,19 @@ function App() {
       } else if (action === "revoke-grant" || action === "close-session") {
         setMissions([]);
         if (action === "close-session") {
+          artifactGeneration.current += 1;
+          setSyntheticArtifact(null);
+          setSyntheticArtifactSha256(null);
+          setArtifactError("");
+          setArtifactBusy(false);
+          conversationGate.current?.invalidate();
+          conversationOpenGeneration.current += 1;
+          setConversationId(null);
+          setConversationExpiresAt(null);
+          setConversationBusy(false);
+          setConversationResult(null);
+          setConversationError("");
+          clearWorkflowHistory();
           setReviewGrant(false);
           setPendingReviews([]);
           setReviewDetail(null);
@@ -367,11 +506,98 @@ function App() {
       } else {
         setCaptures([]);
         setConnectors(null);
+        clearWorkflowHistory();
       }
     } catch {
       setG5Error("Não foi possível falar com o backend local autenticado.");
     } finally {
       setG5Busy(false);
+    }
+  }
+
+  async function askLocalConversation(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    const question = conversationQuestion.trim();
+    const activeConversationId = conversationId;
+    if (!question || !activeConversationId || !g5Status?.session_active) return;
+    const gate = conversationGate.current;
+    if (!gate) return;
+    const ticket = gate.begin(activeConversationId);
+    setConversationBusy(true);
+    setConversationError("");
+    setConversationResult(null);
+    try {
+      const result = await g5Ipc.groundedRead(activeConversationId, question);
+      if (!gate.isCurrent(ticket, activeConversationId)) return;
+      if (!result.ok || !result.grounded_read) {
+        setConversationError(result.error ?? "A conversa local não retornou um resultado válido.");
+        return;
+      }
+      setConversationResult(result.grounded_read);
+    } catch (error) {
+      if (gate.isCurrent(ticket, activeConversationId)) {
+        setConversationError(error instanceof Error ? error.message : "Não foi possível consultar as fontes locais.");
+      }
+    } finally {
+      if (gate.isCurrent(ticket, activeConversationId)) setConversationBusy(false);
+    }
+  }
+
+  async function startLocalConversation() {
+    const oldId = conversationId;
+    const shouldCancel = conversationBusy;
+    const generation = ++conversationOpenGeneration.current;
+    conversationGate.current?.invalidate();
+    if (shouldCancel && oldId) void g5Ipc.cancelConversation(oldId).catch(() => undefined);
+    setConversationId(null);
+    setConversationExpiresAt(null);
+    setConversationBusy(false);
+    setConversationResult(null);
+    setConversationError("");
+    if (!g5Status?.session_active || runtime?.snapshot.state !== "READY" || transport?.state !== "READY") return;
+    try {
+      const opened = await g5Ipc.openConversation("new");
+      if (generation !== conversationOpenGeneration.current) return;
+      if (!opened.ok || !opened.id || !opened.expires_at) {
+        setConversationError(opened.error ?? "A nova conversa local não pôde ser aberta.");
+        return;
+      }
+      setConversationId(opened.id);
+      setConversationExpiresAt(opened.expires_at);
+    } catch {
+      if (generation === conversationOpenGeneration.current) setConversationError("O canal autenticado não pôde abrir uma nova conversa.");
+    }
+  }
+
+  function cancelLocalConversation() {
+    const activeId = conversationId;
+    conversationGate.current?.invalidate();
+    setConversationBusy(false);
+    setConversationResult(null);
+    setConversationError("Consulta cancelada.");
+    if (activeId) void g5Ipc.cancelConversation(activeId).catch(() => undefined);
+  }
+
+  async function generateSyntheticArtifact() {
+    if (!g5Status?.session_active) return;
+    const ticket = ++artifactGeneration.current;
+    setArtifactBusy(true);
+    setArtifactError("");
+    try {
+      const result = await g5Ipc.generateSyntheticDocument();
+      if (ticket !== artifactGeneration.current) return;
+      if (!result.ok || !result.artifact) {
+        setArtifactError(result.error ?? "O documento local não passou pela validação.");
+        return;
+      }
+      setSyntheticArtifact(result.artifact);
+      setSyntheticArtifactSha256(result.artifact_sha256 ?? null);
+    } catch (error) {
+      if (ticket === artifactGeneration.current) {
+        setArtifactError(error instanceof Error ? error.message : "Não foi possível gerar o documento local.");
+      }
+    } finally {
+      if (ticket === artifactGeneration.current) setArtifactBusy(false);
     }
   }
 
@@ -411,6 +637,118 @@ function App() {
     }
   }
 
+  async function loadMemoryPage(append = false) {
+    if (!g5Status?.session_active) return;
+    const start = append ? memoryOffset : 0;
+    const accumulated = append ? [...memoryRecords] : [];
+    setMemoryBusy(true);
+    setMemoryError("");
+    setMemoryNotice("");
+    try {
+      let hasMore = false;
+      for (let index = 0; index < 20; index += 1) {
+        const result = await g5Ipc.memoryPage(memoryCategory, memoryDomain, start + index);
+        if (!result.ok) throw new Error(result.error ?? "A lista de memória não pôde ser lida.");
+        if (!result.has_item || !result.memory_record) {
+          hasMore = false;
+          break;
+        }
+        accumulated.push(result.memory_record);
+        if (index === 19) {
+          const lookahead = await g5Ipc.memoryPage(memoryCategory, memoryDomain, start + index + 1);
+          if (!lookahead.ok) throw new Error(lookahead.error ?? "A lista de memória não pôde ser lida.");
+          hasMore = Boolean(lookahead.has_item);
+        }
+      }
+      setMemoryRecords(accumulated);
+      setMemoryOffset(start + accumulated.length - (append ? memoryRecords.length : 0));
+      setMemoryHasMore(hasMore);
+      if (!append && accumulated.length === 0) setMemorySelectedId(null);
+    } catch (error) {
+      setMemoryError(error instanceof Error ? error.message : "Não foi possível consultar a memória local.");
+    } finally {
+      setMemoryBusy(false);
+    }
+  }
+
+  function selectMemoryCategory(category: MemoryCategory) {
+    setMemoryCategory(category);
+    setMemoryDomain(category === "explicit_capture" ? "dom_synthetic_a" : memoryDomain);
+    setMemoryRecords([]);
+    setMemorySelectedId(null);
+    setMemoryOffset(0);
+    setMemoryHasMore(false);
+    setMemoryBody("");
+    setMemorySourceRef(category === "explicit_capture" ? "explicit_capture" : "synthetic_source");
+  }
+
+  async function saveMemory(event: React.FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (!g5Status?.session_active || !memoryBody.trim()) return;
+    setMemoryBusy(true);
+    setMemoryError("");
+    setMemoryNotice("");
+    try {
+      const selected = memoryRecords.find((item) => item.id === memorySelectedId);
+      const result = selected
+        ? await g5Ipc.memoryEdit(memoryCategory, memoryDomain, selected.id, memoryBody.trim(), selected.version)
+        : await g5Ipc.memoryCreate(memoryCategory, memoryDomain, memoryBody.trim(), memorySourceRef);
+      if (!result.ok) throw new Error(result.error ?? "O item não foi gravado.");
+      setMemoryBody("");
+      setMemorySelectedId(null);
+      await loadMemoryPage();
+      setMemoryNotice(selected ? "Revisão atualizada no banco local." : "Item criado no banco local.");
+    } catch (error) {
+      setMemoryError(error instanceof Error ? error.message : "Não foi possível gravar o item de memória.");
+    } finally {
+      setMemoryBusy(false);
+    }
+  }
+
+  async function deleteMemory(record: LocalMemoryRecord) {
+    if (!window.confirm("Apagar este item do banco aberto? Backups anteriores podem continuar contendo o conteúdo.")) return;
+    setMemoryBusy(true);
+    setMemoryError("");
+    setMemoryNotice("");
+    try {
+      const result = await g5Ipc.memoryDelete(record.category, record.domain_id, record.id, record.version);
+      if (!result.ok) throw new Error(result.error ?? "O item não foi apagado.");
+      setMemoryRecords((current) => current.filter((item) => item.id !== record.id));
+      if (record.category === "explicit_capture") {
+        setCaptures((current) => current.filter((item) => item.id !== record.id));
+        setSearchHits((current) => current?.filter((item) => item.id !== record.id) ?? current);
+        setOpenedOrigin((current) => current?.id === record.id ? null : current);
+        if (editingId === record.id) { setEditingId(null); setText(""); }
+      }
+      if (memorySelectedId === record.id) {
+        setMemorySelectedId(null);
+        setMemoryBody("");
+      }
+      setMemoryNotice("Linha removida do banco aberto e exclusão registrada para reaplicação em backups novos. Cópias históricas antigas não foram apagadas.");
+      await loadMemoryPage();
+    } catch (error) {
+      setMemoryError(error instanceof Error ? error.message : "Não foi possível apagar o item.");
+    } finally {
+      setMemoryBusy(false);
+    }
+  }
+
+  async function exportMemory() {
+    if (!g5Status?.session_active) return;
+    setMemoryBusy(true);
+    setMemoryError("");
+    setMemoryNotice("");
+    try {
+      const result = await g5Ipc.memoryExport();
+      if (!result.ok) throw new Error(result.error ?? "A exportação foi cancelada ou falhou.");
+      setMemoryNotice("Exportação JSON gravada no caminho escolhido no seletor nativo.");
+    } catch (error) {
+      setMemoryError(error instanceof Error ? error.message : "Não foi possível exportar a memória local.");
+    } finally {
+      setMemoryBusy(false);
+    }
+  }
+
   async function removeCapture(captureId: string) {
     setG5Busy(true);
     setG5Error("");
@@ -420,6 +758,8 @@ function App() {
         setG5Error(removed.error ?? "A ideia não foi apagada.");
         return;
       }
+      setMemoryRecords((current) => current.filter((item) => item.id !== captureId));
+      if (memorySelectedId === captureId) { setMemorySelectedId(null); setMemoryBody(""); }
       const listed = await g5Ipc.listCaptures();
       if (listed.ok) {
         setCaptures(listed.captures ?? []);
@@ -431,9 +771,56 @@ function App() {
         setEditingId(null);
         setText("");
       }
-      setNotice("Ideia apagada do banco local. Nada foi enviado para fora.");
+      setNotice("Ideia apagada deste banco. Um backup anterior ainda pode conter o texto.");
+      if (openedOrigin?.id === captureId) setOpenedOrigin(null);
+      setSearchHits((current) => current?.filter((item) => item.id !== captureId) ?? current);
     } catch {
       setG5Error("Não foi possível apagar a ideia.");
+    } finally {
+      setG5Busy(false);
+    }
+  }
+
+  async function searchIdeas(event: React.FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    const query = searchQuery.trim();
+    if (!query || [...query].length > 80) return;
+    setG5Busy(true);
+    setG5Error("");
+    try {
+      const found = await g5Ipc.searchCaptures(query);
+      if (!found.ok) {
+        setSearchHits(null);
+        setG5Error(found.error ?? "A busca local não foi concluída.");
+        return;
+      }
+      setSearchHits(found.captures ?? []);
+      setOpenedOrigin(null);
+      if ((found.omitted ?? 0) > 0) {
+        setNotice(`A busca encontrou mais ${found.omitted} ideia(s) do que esta resposta pode levar. Não há próxima página.`);
+      }
+    } catch {
+      setSearchHits(null);
+      setG5Error("Não foi possível buscar no banco local.");
+    } finally {
+      setG5Busy(false);
+    }
+  }
+
+  async function openIdea(captureId: string) {
+    setG5Busy(true);
+    setG5Error("");
+    try {
+      const opened = await g5Ipc.openCapture(captureId);
+      if (!opened.ok || !opened.origin) {
+        setOpenedOrigin(null);
+        setG5Error(opened.error ?? "A origem da ideia não pôde ser aberta.");
+        return;
+      }
+      setOpenedOrigin(opened.origin);
+    } catch {
+      setOpenedOrigin(null);
+      setG5Error("Não foi possível abrir a origem da ideia.");
     } finally {
       setG5Busy(false);
     }
@@ -552,9 +939,37 @@ function App() {
   }
 
   async function refreshWorkflowTasks() {
-    const listed = await g5Ipc.workflowList();
-    if (!listed.ok) throw new Error(listed.error ?? "Não foi possível listar as tarefas locais.");
-    setWorkflowTasks(listed.tasks ?? []);
+    const generation = ++workflowHistoryGeneration.current;
+    setWorkflowPageBusy(false);
+    try {
+      const listed = await g5Ipc.workflowPage();
+      if (generation !== workflowHistoryGeneration.current) return;
+      if (!listed.ok) throw new Error(listed.error ?? "Não foi possível listar as tarefas locais.");
+      setWorkflowTasks(listed.tasks);
+      setWorkflowCursor(listed.next_cursor);
+    } catch (error) {
+      if (generation === workflowHistoryGeneration.current) throw error;
+    }
+  }
+
+  async function loadWorkflowPage() {
+    if (!workflowCursor || g5Busy) return;
+    const generation = workflowHistoryGeneration.current;
+    setWorkflowPageBusy(true);
+    setG5Error("");
+    try {
+      const page = await g5Ipc.workflowPage(workflowCursor);
+      if (generation !== workflowHistoryGeneration.current) return;
+      if (!page.ok) throw new Error(page.error);
+      setWorkflowTasks((current) => [...current, ...page.tasks]);
+      setWorkflowCursor(page.next_cursor);
+    } catch (error) {
+      if (generation === workflowHistoryGeneration.current) {
+        setG5Error(error instanceof Error ? error.message : "Não foi possível carregar o histórico.");
+      }
+    } finally {
+      if (generation === workflowHistoryGeneration.current) setWorkflowPageBusy(false);
+    }
   }
 
   async function submitDraftWorkflow(event: FormEvent<HTMLFormElement>) {
@@ -639,7 +1054,15 @@ function App() {
         return;
       }
       setCaptures([]);
-      setNotice("Capturas locais apagadas do banco sintético.");
+      setSearchHits(null);
+      setOpenedOrigin(null);
+      setMemoryRecords((current) => current.filter((item) => item.category !== "explicit_capture"));
+      if (memoryCategory === "explicit_capture") { setMemorySelectedId(null); setMemoryBody(""); }
+      if (editingId) {
+        setEditingId(null);
+        setText("");
+      }
+      setNotice("Capturas apagadas deste banco. Um backup anterior ainda pode conter o texto.");
     } catch {
       setG5Error("Não foi possível apagar as capturas locais.");
     } finally {
@@ -759,7 +1182,7 @@ function App() {
       <div className="brand" aria-label="JARVIS"><span className="mark">JV</span><span>JARVIS</span></div>
       <nav aria-label="Seções do JARVIS">{sections.map((item) => <button
         aria-current={section === item ? "page" : undefined} className={section === item ? "nav-item active" : "nav-item"}
-        key={item} onClick={() => { setSection(item); setNotice(""); if (item !== "Missões") { setGrantConfirmed(false); } }} type="button">{item}</button>)}</nav>
+        key={item} onClick={() => { if (section === "Conversa" && item !== "Conversa") { conversationGate.current?.invalidate(); setConversationBusy(false); } setSection(item); setNotice(""); if (item !== "Missões") { setGrantConfirmed(false); } }} type="button">{item}</button>)}</nav>
       <p className="rail-note">macOS local · banco sintético · sem conta externa</p>
     </aside>
     <main className="content" id="conteudo">
@@ -775,6 +1198,28 @@ function App() {
           <textarea id="agora-capture" maxLength={80} value={text} onChange={(event) => setText(event.currentTarget.value)} placeholder="Ex.: revisar a missão sintética amanhã" />
           <button className="action" type="submit" disabled={g5Busy || !text.trim() || [...text.trim()].length > 80}>{editingId ? "Atualizar ideia" : "Gravar no banco local"}</button>
         </form> : <p>Abra a sessão em Missões para gravar a ideia no SQLite. O texto abaixo permanece só neste formulário até lá.</p>}
+        {g5Status?.session_active && <form onSubmit={(event) => void searchIdeas(event)}>
+          <label htmlFor="agora-search">Buscar ideia</label>
+          <input id="agora-search" maxLength={80} value={searchQuery} onChange={(event) => setSearchQuery(event.currentTarget.value)} placeholder="Trecho literal, com ou sem acento" />
+          <button className="action secondary" type="submit" disabled={g5Busy || !searchQuery.trim() || [...searchQuery.trim()].length > 80}>Buscar</button>
+        </form>}
+        {searchHits && <section aria-live="polite">
+          <h3>Resultado da busca ({searchHits.length})</h3>
+          {searchHits.length === 0 ? <p>Nenhuma ideia encontrada nesse trecho.</p> : <ul className="capture-list">{searchHits.map((item) => <li key={item.id}>
+            <span>{item.text}</span><small>{item.created_at}</small>
+            <button className="action secondary" type="button" disabled={g5Busy} onClick={() => void openIdea(item.id)}>Abrir origem</button>
+          </li>)}</ul>}
+        </section>}
+        {openedOrigin && <section aria-labelledby="capture-origin-title">
+          <h3 id="capture-origin-title">Origem da ideia</h3>
+          <p>Categoria <code>{openedOrigin.category}</code></p>
+          <p>Domínio <code>{openedOrigin.domain_id}</code></p>
+          <p>Identificador <code>{openedOrigin.id}</code></p>
+          <p>Gravada em {openedOrigin.created_at}</p>
+          <p>{openedOrigin.text}</p>
+          <button className="action secondary" type="button" disabled={g5Busy} onClick={() => { setEditingId(openedOrigin.id); setText(openedOrigin.text); }}>Corrigir</button>
+          <button className="action secondary" type="button" disabled={g5Busy} onClick={() => void removeCapture(openedOrigin.id)}>Apagar</button>
+        </section>}
         {captures.length > 0 && <ul className="capture-list">{captures.map((item) => <li key={item.id}>
           <span>{item.text}</span><small>{item.created_at}</small>
           <span>
@@ -782,6 +1227,130 @@ function App() {
             <button className="action secondary" type="button" disabled={g5Busy} onClick={() => void removeCapture(item.id)}>Apagar</button>
           </span>
         </li>)}</ul>}
+      </article>}
+      {section === "Memória" && <article className="card g5-card">
+        <p className="badge">MEMÓRIA LOCAL · SQLITE CIFRADO</p>
+        <h2>Categorias e itens locais</h2>
+        <p>As categorias são separadas por domínio. A origem é metadado de proveniência; propostas inferidas não são fatos confirmados. A lista só é consultada quando você solicita.</p>
+        {!runtimeAvailable && <p className="runtime-hint">A memória autenticada está disponível somente no aplicativo macOS.</p>}
+        {runtimeAvailable && !g5Status?.session_active && <p>Abra uma sessão local em Missões para consultar ou alterar a memória.</p>}
+        {runtimeAvailable && g5Status?.session_active && <>
+          <div className="g5-actions">
+            <label htmlFor="memory-category">Categoria</label>
+            <select id="memory-category" value={memoryCategory} disabled={memoryBusy} onChange={(event) => selectMemoryCategory(event.currentTarget.value as MemoryCategory)}>
+              {memoryCategories.map((item) => <option key={item.value} value={item.value}>{item.label}</option>)}
+            </select>
+            <label htmlFor="memory-domain">Domínio</label>
+            <select id="memory-domain" value={memoryDomain} disabled={memoryBusy || memoryCategory === "explicit_capture"} onChange={(event) => {
+              setMemoryDomain(event.currentTarget.value as MemoryDomain);
+              setMemoryRecords([]); setMemorySelectedId(null); setMemoryOffset(0); setMemoryHasMore(false);
+            }}>
+              {memoryDomains.map((domain) => <option key={domain} value={domain}>{domain}</option>)}
+            </select>
+            <button className="action secondary" type="button" disabled={memoryBusy} onClick={() => void loadMemoryPage()}>
+              {memoryBusy ? "Consultando…" : "Listar itens desta categoria"}
+            </button>
+          </div>
+          <form onSubmit={(event) => void saveMemory(event)}>
+            <label htmlFor="memory-body">{memorySelectedId ? "Corrigir conteúdo" : "Novo item"}</label>
+            <textarea id="memory-body" maxLength={80} value={memoryBody} onChange={(event) => setMemoryBody(event.currentTarget.value)} placeholder="Até 80 caracteres" />
+            {memoryCategory !== "explicit_capture" && <>
+              <label htmlFor="memory-source-ref">Referência da origem</label>
+              <input id="memory-source-ref" maxLength={64} pattern="[A-Za-z0-9_-]{1,64}" value={memorySourceRef} onChange={(event) => setMemorySourceRef(event.currentTarget.value)} required />
+            </>}
+            <div className="g5-actions">
+              <button className="action" type="submit" disabled={memoryBusy || !memoryBody.trim() || (memoryCategory !== "explicit_capture" && !/^[A-Za-z0-9_-]{1,64}$/.test(memorySourceRef))}>
+                {memorySelectedId ? "Salvar correção" : "Criar item local"}
+              </button>
+              {memorySelectedId && <button className="action secondary" type="button" disabled={memoryBusy} onClick={() => { setMemorySelectedId(null); setMemoryBody(""); setMemorySourceRef(memoryCategory === "explicit_capture" ? "explicit_capture" : "synthetic_source"); }}>Cancelar correção</button>}
+              <button className="action secondary" type="button" disabled={memoryBusy} onClick={() => void exportMemory()}>
+                {memoryBusy ? "Aguarde…" : "Exportar… escolher destino"}
+              </button>
+            </div>
+          </form>
+          {memoryError && <p className="notice" role="alert">{memoryError}</p>}
+          {memoryNotice && <p className="notice" role="status">{memoryNotice}</p>}
+          <section aria-live="polite">
+            <h3>{memoryCategories.find((item) => item.value === memoryCategory)?.label} · {memoryDomain} ({memoryRecords.length})</h3>
+            {memoryRecords.length === 0 ? <p>Nenhum item listado. Use “Listar itens desta categoria”.</p> : <ul className="capture-list">
+              {memoryRecords.map((item) => <li key={item.id}>
+                <span>{item.body}</span><small>{memorySourceLabels[item.source_kind]} · {item.source_ref} · v{item.version}</small>
+                <button className="action secondary" type="button" disabled={memoryBusy} onClick={() => {
+                  setMemorySelectedId(item.id); setMemoryBody(item.body); setMemorySourceRef(item.source_ref);
+                }}>Ver origem / corrigir</button>
+              </li>)}
+            </ul>}
+            {memoryHasMore && <button className="action secondary" type="button" disabled={memoryBusy} onClick={() => void loadMemoryPage(true)}>Carregar próxima página</button>}
+            {memoryRecords.find((item) => item.id === memorySelectedId) && (() => {
+              const item = memoryRecords.find((entry) => entry.id === memorySelectedId)!;
+              return <section aria-labelledby="memory-origin-title">
+                <h4 id="memory-origin-title">Origem e revisão</h4>
+                <p>ID <code>{item.id}</code> · categoria <code>{item.category}</code> · domínio <code>{item.domain_id}</code></p>
+                <p>Origem: {memorySourceLabels[item.source_kind]} · referência <code>{item.source_ref}</code></p>
+                <p>Registrado {item.recorded_at} · revisado {item.revised_at} · revisão {item.version} · estado ativo no banco aberto</p>
+                <p>{item.body}</p>
+                <button className="action secondary" type="button" disabled={memoryBusy} onClick={() => void deleteMemory(item)}>Apagar item</button>
+              </section>;
+            })()}
+          </section>
+        </>}
+      </article>}
+      {section === "Conversa" && <article className="card g5-card">
+        <p className="badge">LEITURA LOCAL · PROVIDER FALSO</p>
+        <h2>Pergunte às capturas autorizadas</h2>
+        <p>A resposta cita trechos locais do domínio <code>dom_synthetic_a</code>. Sem evidência suficiente, não apresenta resposta. O conteúdo recuperado não autoriza ferramentas.</p>
+        {!runtimeAvailable && <p className="runtime-hint">A conversa autenticada está disponível somente no aplicativo macOS.</p>}
+        {runtimeAvailable && !g5Status?.session_active && <p>Abra uma sessão local em Missões para consultar capturas.</p>}
+        {runtimeAvailable && g5Status?.session_active && <>
+          <p className="notice" role="status" aria-live="polite">A entrada por voz está desativada nesta candidata. Microfone, transcrição acústica e voz de saída não estão disponíveis. Use o campo de texto; nada está sendo capturado.</p>
+          <p>Conversa local {conversationId ? <><code>{conversationId}</code>{conversationExpiresAt && <> · expira {conversationExpiresAt}</>}</> : "abrindo sessão local…"}</p>
+          <form onSubmit={(event) => void askLocalConversation(event)}>
+            <label htmlFor="conversation-question">Pergunta</label>
+            <textarea id="conversation-question" maxLength={400} value={conversationQuestion} onChange={(event) => setConversationQuestion(event.currentTarget.value)} placeholder="Ex.: qual prazo foi anotado?" />
+            <div className="g5-actions">
+              <button className="action" type="submit" disabled={conversationBusy || !conversationId || !conversationQuestion.trim()}>Perguntar às fontes locais</button>
+              <button className="action secondary" type="button" disabled={!runtimeAvailable || !g5Status?.session_active} onClick={() => void startLocalConversation()}>Nova conversa</button>
+              {conversationBusy && <button className="action secondary" type="button" onClick={cancelLocalConversation}>Cancelar leitura</button>}
+            </div>
+          </form>
+        </>}
+        {conversationBusy && <p role="status">Consultando capturas locais…</p>}
+        {conversationError && <p className="notice" role="alert">{conversationError}</p>}
+        {conversationResult && <section aria-live="polite">
+          <h3>{groundedReadStatusLabels[conversationResult.status]}</h3>
+          {conversationResult.status === "evidence" ? <>
+            <p>{conversationResult.text}</p>
+            <h4>Fontes usadas</h4>
+            <ul>{conversationResult.sources.map((source) => <li key={`${source.kind}:${source.id}`}>
+              <strong>{source.kind === "capture" ? "Captura" : source.kind === "confirmed_fact" ? "Fato confirmado" : "Documento autorizado"}</strong> · ID <code>{source.id}</code> · domínio <code>{source.domain_id}</code><br />Trecho textual literal: “{source.snippet}”
+            </li>)}</ul>
+            {conversationResult.omitted > 0 && <p>{conversationResult.omitted} fonte(s) omitida(s) pelo limite da resposta.</p>}
+          </> : <p>{conversationResult.status === "insufficient_basis" ? "Não encontrei um trecho local que sustente a pergunta; nenhuma resposta foi produzida." : `A consulta terminou: ${groundedReadStatusLabels[conversationResult.status]}. Nenhuma resposta foi produzida.`}</p>}
+          <p>Provider <code>{conversationResult.provider_id}</code> · custo {conversationResult.cost}. Inferência: não produzida; os trechos citados são texto presente nas fontes.</p>
+        </section>}
+      </article>}
+      {section === "Artefatos" && <article className="card g5-card">
+        <p className="badge">ARTEFATO LOCAL · JSON VALIDADO</p>
+        <h2>Documento sintético</h2>
+        <p>A geração é manual e usa um exemplo sintético fixo. O conteúdo fica no store SQLite cifrado do runtime e pode ser lido por 24 horas; a expiração impede leitura pela API, sem prometer remoção física imediata. Imports em quarentena não são executados.</p>
+        {runtimeAvailable && !g5Status?.session_active && <p>Abra uma sessão local em Missões para gerar o exemplo.</p>}
+        {!runtimeAvailable && <p className="runtime-hint">A geração autenticada está disponível somente no aplicativo macOS.</p>}
+        {runtimeAvailable && g5Status?.session_active && <button className="action" type="button" disabled={artifactBusy} onClick={() => void generateSyntheticArtifact()}>
+          {artifactBusy ? "Validando e gravando…" : "Gerar exemplo sintético"}
+        </button>}
+        {artifactError && <p className="notice" role="alert">{artifactError}</p>}
+        {syntheticArtifact && syntheticArtifactSha256 && <section aria-live="polite">
+          <h3>{syntheticArtifact.title}</h3>
+          {syntheticArtifact.sections.map((section) => <div key={section.index}>
+            <h4>{section.heading}</h4>
+            {section.paragraphs.map((paragraph, index) => <p key={index}>{paragraph}</p>)}
+            <p>Origem do conteúdo: <code>{section.source_id}</code></p>
+          </div>)}
+          <p>Artefato <code>{syntheticArtifact.id}</code> · skill <code>{syntheticArtifact.origin.skill_id}@{syntheticArtifact.origin.skill_version}</code></p>
+          <p>Conteúdo SHA-256 <code>{syntheticArtifactSha256}</code></p>
+          <p>Manifesto SHA-256 <code>{syntheticArtifact.origin.manifest_sha256}</code> · licença <code>{syntheticArtifact.origin.license_name}</code></p>
+          <p>Permissão <code>{syntheticArtifact.permission.capability}</code> · escopo <code>{syntheticArtifact.permission.scope}</code></p>
+        </section>}
       </article>}
       {section === "Inbox" && <article className="card"><p className="badge">FONTES REAIS DESTE CLIENTE</p>
         <h2>O que está ligado</h2>
@@ -861,7 +1430,7 @@ function App() {
             <p className="badge">EXECUTOR TIPADO · EFEITOS LOCAIS</p>
             <h3 id="workflow-title">Tarefas de missão locais</h3>
             <p>O modelo pode apenas recomendar uma ferramenta fechada e argumentos tipados. Rascunho e simulação ficam no SQLite local. Envio, pagamento, exclusão e convite estão bloqueados.</p>
-            <p className="field-hint">A lista mostra as quatro tarefas recentes para respeitar o limite de resposta MAC-003; tarefas antigas ficam armazenadas, sem paginação nesta versão.</p>
+            <p className="field-hint">Cada página respeita o limite de resposta MAC-003. Use “Carregar mais tarefas” para percorrer o histórico armazenado.</p>
             <form className="g5-form" onSubmit={(event) => void submitDraftWorkflow(event)}>
               <label htmlFor="workflow-draft-title">Título do rascunho local</label>
               <input id="workflow-draft-title" maxLength={80} value={workflowTitle} onChange={(event) => setWorkflowTitle(event.currentTarget.value)} required />
@@ -887,6 +1456,8 @@ function App() {
               {["proposed", "awaiting_approval"].includes(task.state) && <button className="action secondary" type="button" disabled={g5Busy} onClick={() => void runWorkflowAction("pause", task.task_id)}>Pausar</button>}
               {["proposed", "awaiting_approval", "paused", "interrupted", "failed"].includes(task.state) && <button className="action secondary" type="button" disabled={g5Busy} onClick={() => void runWorkflowAction("cancel", task.task_id)}>Cancelar</button>}
             </li>)}</ul>}
+            <p>Histórico por criação, do mais recente ao mais antigo. Atualizar uma tarefa recarrega a primeira página.</p>
+            {workflowCursor && <button className="action secondary" type="button" disabled={g5Busy} onClick={() => void loadWorkflowPage()}>Carregar mais tarefas</button>}
             {workflowDetail && <section className="review-detail" aria-label="Detalhe da tarefa local">
               <h4>Detalhe da tarefa · {workflowStateLabels[workflowDetail.state]}</h4>
               <p>Hash dos parâmetros: <code>{workflowDetail.arguments_sha}</code></p>

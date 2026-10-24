@@ -24,13 +24,19 @@ const INIT_PREFIX: &[u8] = b"JARVIS_TRANSPORT_INIT ";
 const SOCKET_LEAF: &[u8] = b"runtime.sock\0";
 pub(crate) const PROTOCOL_VERSION: &str = "3";
 const RUNTIME_KIND: &str = "jarvis-synthetic";
-const BUILD_ID: &str = "g6-mac-002-2-encrypted-uds-v3";
+const BUILD_ID: &str = "g6-mac-002-3-locked-storage-v3";
 const HEALTH_ROUTE: &str = "/v1/health";
 const VERSION_ROUTE: &str = "/v1/version";
 const PROOF_ROUTE: &str = "/v1/instance-proof";
 const APPLICATION_ENVELOPE_ROUTE: &str = "/v3/secure";
 const APP_SESSION_OPEN_ROUTE: &str = "/v1/app/session/open";
 const APP_SESSION_CLOSE_ROUTE: &str = "/v1/app/session/close";
+const APP_STORAGE_STATUS_ROUTE: &str = "/v1/app/storage/status";
+const APP_STORAGE_UNLOCK_ROUTE: &str = "/v1/app/storage/unlock";
+const APP_STORAGE_ROTATE_ROUTE: &str = "/v1/app/storage/rotate";
+const APP_STORAGE_ROTATE_RETIRE_ROUTE: &str = "/v1/app/storage/rotate-retire";
+const APP_STORAGE_ROTATE_FINALIZE_ROUTE: &str = "/v1/app/storage/rotate-finalize";
+const APP_STORAGE_LOCK_ROUTE: &str = "/v1/app/storage/lock";
 const APP_GRANT_CREATE_ROUTE: &str = "/v1/app/grants/mission-read";
 const APP_GRANT_REVOKE_ROUTE: &str = "/v1/app/grants/mission-read/revoke";
 const APP_MISSIONS_LIST_ROUTE: &str = "/v1/app/missions/list";
@@ -38,7 +44,17 @@ const APP_CAPTURE_CREATE_ROUTE: &str = "/v1/app/captures/create";
 const APP_CAPTURE_EDIT_ROUTE: &str = "/v1/app/captures/edit";
 const APP_CAPTURE_DELETE_ROUTE: &str = "/v1/app/captures/delete";
 const APP_CAPTURE_LIST_ROUTE: &str = "/v1/app/captures/list";
+const APP_CAPTURE_SEARCH_ROUTE: &str = "/v1/app/captures/search";
+const APP_CAPTURE_OPEN_ROUTE: &str = "/v1/app/captures/open";
 const APP_CAPTURE_CLEAR_ROUTE: &str = "/v1/app/captures/clear";
+const APP_MEMORY_PAGE_ROUTE: &str = "/v1/app/memory/page";
+const APP_MEMORY_CREATE_ROUTE: &str = "/v1/app/memory/create";
+const APP_MEMORY_EDIT_ROUTE: &str = "/v1/app/memory/edit";
+const APP_MEMORY_DELETE_ROUTE: &str = "/v1/app/memory/delete";
+const APP_CONVERSATION_ASK_ROUTE: &str = "/v1/app/conversation/ask";
+const APP_CONVERSATION_OPEN_ROUTE: &str = "/v1/app/conversation/open";
+const APP_CONVERSATION_CANCEL_ROUTE: &str = "/v1/app/conversation/cancel";
+const APP_SYNTHETIC_DOCUMENT_ROUTE: &str = "/v1/app/artifacts/synthetic-document";
 const APP_CONNECTORS_STATUS_ROUTE: &str = "/v1/app/connectors/status";
 const APP_REVIEW_GRANT_ROUTE: &str = "/v1/app/grants/mission-review";
 const APP_REVIEW_GRANT_REVOKE_ROUTE: &str = "/v1/app/grants/mission-review/revoke";
@@ -47,6 +63,7 @@ const APP_REVIEW_DRAFT_ROUTE: &str = "/v1/app/reviews/draft";
 const APP_REVIEW_DETAIL_ROUTE: &str = "/v1/app/reviews/detail";
 const APP_REVIEW_APPROVE_ROUTE: &str = "/v1/app/reviews/approve";
 const APP_WORKFLOW_SUBMIT_ROUTE: &str = "/v1/app/workflows/submit";
+const APP_WORKFLOW_PAGE_ROUTE: &str = "/v1/app/workflows/page";
 const APP_WORKFLOW_LIST_ROUTE: &str = "/v1/app/workflows/list";
 const APP_WORKFLOW_DETAIL_ROUTE: &str = "/v1/app/workflows/detail";
 const APP_WORKFLOW_APPROVE_ROUTE: &str = "/v1/app/workflows/approve";
@@ -61,7 +78,13 @@ const APP_AUTOMATION_RUN_ROUTE: &str = "/v1/app/automations/run";
 const APP_AUTOMATION_CREATE_ROUTE: &str = "/v1/app/automations/create";
 const APP_AUTOMATION_TIMEZONE_ROUTE: &str = "/v1/app/automations/timezone";
 const APP_AUTOMATION_CONTROL_ROUTE: &str = "/v1/app/automations/control";
-const APP_ROUTES: [&str; 32] = [
+const APP_ROUTES: [&str; 49] = [
+    APP_STORAGE_STATUS_ROUTE,
+    APP_STORAGE_UNLOCK_ROUTE,
+    APP_STORAGE_ROTATE_ROUTE,
+    APP_STORAGE_ROTATE_RETIRE_ROUTE,
+    APP_STORAGE_ROTATE_FINALIZE_ROUTE,
+    APP_STORAGE_LOCK_ROUTE,
     APP_SESSION_OPEN_ROUTE,
     APP_SESSION_CLOSE_ROUTE,
     APP_GRANT_CREATE_ROUTE,
@@ -71,7 +94,17 @@ const APP_ROUTES: [&str; 32] = [
     APP_CAPTURE_EDIT_ROUTE,
     APP_CAPTURE_DELETE_ROUTE,
     APP_CAPTURE_LIST_ROUTE,
+    APP_CAPTURE_SEARCH_ROUTE,
+    APP_CAPTURE_OPEN_ROUTE,
     APP_CAPTURE_CLEAR_ROUTE,
+    APP_MEMORY_PAGE_ROUTE,
+    APP_MEMORY_CREATE_ROUTE,
+    APP_MEMORY_EDIT_ROUTE,
+    APP_MEMORY_DELETE_ROUTE,
+    APP_CONVERSATION_ASK_ROUTE,
+    APP_CONVERSATION_OPEN_ROUTE,
+    APP_CONVERSATION_CANCEL_ROUTE,
+    APP_SYNTHETIC_DOCUMENT_ROUTE,
     APP_CONNECTORS_STATUS_ROUTE,
     APP_REVIEW_GRANT_ROUTE,
     APP_REVIEW_GRANT_REVOKE_ROUTE,
@@ -81,6 +114,7 @@ const APP_ROUTES: [&str; 32] = [
     APP_REVIEW_APPROVE_ROUTE,
     APP_WORKFLOW_SUBMIT_ROUTE,
     APP_WORKFLOW_LIST_ROUTE,
+    APP_WORKFLOW_PAGE_ROUTE,
     APP_WORKFLOW_DETAIL_ROUTE,
     APP_WORKFLOW_APPROVE_ROUTE,
     APP_WORKFLOW_EXECUTE_ROUTE,
@@ -250,6 +284,20 @@ struct RequestLockGuard<'a> {
     session: &'a TransportSession,
 }
 
+struct InFlightGuard<'a> {
+    session: &'a TransportSession,
+}
+
+impl Drop for InFlightGuard<'_> {
+    fn drop(&mut self) {
+        self.session
+            .in_flight_requests
+            .fetch_sub(1, Ordering::AcqRel);
+        let _state = lock(&self.session.flight_state);
+        self.session.flight_cv.notify_all();
+    }
+}
+
 impl Drop for RequestLockGuard<'_> {
     fn drop(&mut self) {
         let mut state = lock(&self.session.request_state);
@@ -272,12 +320,16 @@ pub(crate) struct TransportSession {
     expected_peer_pid: AtomicU32,
     envelope_sequence: AtomicU64,
     active: AtomicBool,
+    closing: AtomicBool,
     cleanup_done: AtomicBool,
     /// Logical transaction lock. The mutex is not held across socket IO; `held`
     /// stays true until the guard drops, and waiters block on `request_cv`.
     request_state: Mutex<RequestLockState>,
     request_cv: Condvar,
     request_lock_depth: AtomicUsize,
+    in_flight_requests: AtomicUsize,
+    flight_state: Mutex<()>,
+    flight_cv: Condvar,
     #[cfg(test)]
     transaction_barrier: Mutex<Option<Arc<dyn Fn(&str) + Send + Sync>>>,
 }
@@ -332,6 +384,7 @@ impl TransportSession {
             expected_peer_pid: AtomicU32::new(test_default_peer_pid()),
             envelope_sequence: AtomicU64::new(0),
             active: AtomicBool::new(true),
+            closing: AtomicBool::new(false),
             cleanup_done: AtomicBool::new(false),
             request_state: Mutex::new(RequestLockState {
                 held: false,
@@ -339,6 +392,9 @@ impl TransportSession {
             }),
             request_cv: Condvar::new(),
             request_lock_depth: AtomicUsize::new(0),
+            in_flight_requests: AtomicUsize::new(0),
+            flight_state: Mutex::new(()),
+            flight_cv: Condvar::new(),
             #[cfg(test)]
             transaction_barrier: Mutex::new(None),
         }))
@@ -382,6 +438,7 @@ impl TransportSession {
 
     fn probe_endpoint(&self, endpoint: &std::path::Path) -> Result<(), TransportError> {
         let _serial = self.lock_request();
+        self.ensure_accepting()?;
         self.probe_endpoint_locked(endpoint)
     }
 
@@ -422,6 +479,41 @@ impl TransportSession {
         self.call_g5_application_after_probe(route, body, || {})
     }
 
+    /// Calls a closed application operation concurrently with an outstanding
+    /// response. Used only by conversation cancellation so the UI can deliver
+    /// its cancellation while the read request is waiting for the provider.
+    pub(crate) fn call_g5_application_concurrent(
+        &self,
+        route: &'static str,
+        body: &[u8],
+    ) -> Result<Vec<u8>, TransportError> {
+        if !APP_ROUTES.contains(&route) {
+            return Err(TransportError::HttpRejected);
+        }
+        if body.len() > MAX_APP_REQUEST_BODY_BYTES {
+            return Err(TransportError::ApplicationRequestTooLarge);
+        }
+        let (nonce, envelope) = {
+            let _serial = self.lock_request();
+            self.ensure_accepting()?;
+            self.probe_endpoint_locked(&self.socket_path)?;
+            let nonce = self.next_envelope_nonce_locked()?;
+            let envelope = self.seal_application_request_locked(route, body, &nonce)?;
+            self.in_flight_requests.fetch_add(1, Ordering::AcqRel);
+            (nonce, envelope)
+        };
+        let _in_flight = InFlightGuard { session: self };
+        let response = self.exchange_at(
+            &self.socket_path,
+            Verb::Post,
+            APPLICATION_ENVELOPE_ROUTE,
+            &envelope,
+        )?;
+        let result = self.open_application_response(&response, &nonce)?;
+        self.ensure_active()?;
+        Ok(result)
+    }
+
     #[cfg(feature = "mac003-production-supervisor-test")]
     pub(crate) fn call_g5_application_after_probe_for_test(
         &self,
@@ -445,7 +537,7 @@ impl TransportSession {
             return Err(TransportError::ApplicationRequestTooLarge);
         }
         let _serial = self.lock_request();
-        self.ensure_active()?;
+        self.ensure_accepting()?;
         #[cfg(test)]
         self.pause_transaction_for_test("admitted");
         self.probe_endpoint_locked(&self.socket_path)?;
@@ -521,6 +613,17 @@ impl TransportSession {
         // acquiring it here cannot deadlock with `call_g5_application` or `probe`,
         // which release the manager lock before taking this one. The wait is
         // bounded by the connect and request timeouts of the transaction.
+        let request = self.lock_request();
+        self.closing.store(true, Ordering::Release);
+        drop(request);
+        let mut flight = lock(&self.flight_state);
+        while self.in_flight_requests.load(Ordering::Acquire) != 0 {
+            flight = self
+                .flight_cv
+                .wait(flight)
+                .unwrap_or_else(|error| error.into_inner());
+        }
+        drop(flight);
         let _request = self.lock_request();
         self.deactivate_locked();
     }
@@ -552,6 +655,14 @@ impl TransportSession {
         }
     }
 
+    fn ensure_accepting(&self) -> Result<(), TransportError> {
+        if self.active.load(Ordering::Acquire) && !self.closing.load(Ordering::Acquire) {
+            Ok(())
+        } else {
+            Err(TransportError::Inactive)
+        }
+    }
+
     fn exchange_at(
         &self,
         endpoint: &std::path::Path,
@@ -563,7 +674,10 @@ impl TransportSession {
         // write below. `deactivate` takes that same lock first, so it cannot
         // return while this send is still running, and a later caller fails here
         // before connecting or writing.
-        debug_assert!(self.request_lock_depth.load(Ordering::Acquire) > 0);
+        debug_assert!(
+            self.request_lock_depth.load(Ordering::Acquire) > 0
+                || self.in_flight_requests.load(Ordering::Acquire) > 0
+        );
         self.ensure_active()?;
         let mut stream = connect_bounded(endpoint, CONNECT_TIMEOUT).map_err(|error| {
             eprintln!(
@@ -605,7 +719,10 @@ impl TransportSession {
         #[cfg(test)]
         self.pause_transaction_for_test("checked");
         self.ensure_active()?;
-        debug_assert!(self.request_lock_depth.load(Ordering::Acquire) > 0);
+        debug_assert!(
+            self.request_lock_depth.load(Ordering::Acquire) > 0
+                || self.in_flight_requests.load(Ordering::Acquire) > 0
+        );
         stream
             .write_all(request.as_bytes())
             .and_then(|_| stream.write_all(body))
@@ -645,7 +762,10 @@ impl TransportSession {
     }
 
     fn next_envelope_nonce_locked(&self) -> Result<[u8; ENVELOPE_NONCE_BYTES], TransportError> {
-        debug_assert!(self.request_lock_depth.load(Ordering::Acquire) > 0);
+        debug_assert!(
+            self.request_lock_depth.load(Ordering::Acquire) > 0
+                || self.in_flight_requests.load(Ordering::Acquire) > 0
+        );
         let secret = lock(&self.secret);
         if !self.active.load(Ordering::Acquire) || secret.is_none() {
             return Err(TransportError::Inactive);
@@ -678,7 +798,10 @@ impl TransportSession {
         body: &[u8],
         nonce: &[u8; ENVELOPE_NONCE_BYTES],
     ) -> Result<Vec<u8>, TransportError> {
-        debug_assert!(self.request_lock_depth.load(Ordering::Acquire) > 0);
+        debug_assert!(
+            self.request_lock_depth.load(Ordering::Acquire) > 0
+                || self.in_flight_requests.load(Ordering::Acquire) > 0
+        );
         let path = route.as_bytes();
         let path_len = u16::try_from(path.len()).map_err(|_| TransportError::HttpRejected)?;
         let body_len =
@@ -723,7 +846,10 @@ impl TransportSession {
         envelope: &[u8],
         expected_nonce: &[u8; ENVELOPE_NONCE_BYTES],
     ) -> Result<Vec<u8>, TransportError> {
-        debug_assert!(self.request_lock_depth.load(Ordering::Acquire) > 0);
+        debug_assert!(
+            self.request_lock_depth.load(Ordering::Acquire) > 0
+                || self.in_flight_requests.load(Ordering::Acquire) > 0
+        );
         if envelope.len() > MAX_ENVELOPE_RESPONSE_BYTES
             || envelope.len() < ENVELOPE_NONCE_BYTES + ENVELOPE_TAG_BYTES
             || &envelope[..ENVELOPE_NONCE_BYTES] != expected_nonce
@@ -768,7 +894,10 @@ impl TransportSession {
         &self,
         direction: &[u8],
     ) -> Result<([u8; 32], [u8; 32]), TransportError> {
-        debug_assert!(self.request_lock_depth.load(Ordering::Acquire) > 0);
+        debug_assert!(
+            self.request_lock_depth.load(Ordering::Acquire) > 0
+                || self.in_flight_requests.load(Ordering::Acquire) > 0
+        );
         let secret = lock(&self.secret);
         if !self.active.load(Ordering::Acquire) {
             return Err(TransportError::Inactive);
@@ -1472,6 +1601,12 @@ impl ChildTransportConfig {
             match listener.accept() {
                 Ok((mut stream, _)) => {
                     after_accept();
+                    // accept on a nonblocking listener inherits O_NONBLOCK. A
+                    // read before the peer is scheduled then returns immediately
+                    // and was reported as a rejected request.
+                    stream
+                        .set_nonblocking(false)
+                        .map_err(|_| TransportError::EndpointUnavailable)?;
                     stream
                         .set_read_timeout(Some(SERVER_REQUEST_TIMEOUT))
                         .and_then(|_| stream.set_write_timeout(Some(SERVER_REQUEST_TIMEOUT)))
@@ -2200,6 +2335,45 @@ mod tests {
         stream.read_to_end(&mut response).unwrap();
         server.join().unwrap();
         response
+    }
+
+    #[test]
+    fn accepted_socket_reads_the_request_written_after_accept() {
+        let session = TransportSession::create("accept-before-write").unwrap();
+        let config = ChildTransportConfig {
+            instance_id: session.instance_id.clone(),
+            secret: lock(&session.secret).as_ref().unwrap().to_owned(),
+            directory: session.directory_handle.try_clone().unwrap(),
+        };
+        let listener = std::os::unix::net::UnixListener::bind(&session.socket_path).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let (accepted_tx, accepted_rx) = std::sync::mpsc::channel();
+        let server = thread::spawn(move || {
+            config.serve_one_with_accept_hook_for_test(
+                &listener,
+                Duration::from_secs(2),
+                &std::sync::atomic::AtomicBool::new(true),
+                accepted_tx,
+            )
+        });
+        let mut stream = std::os::unix::net::UnixStream::connect(&session.socket_path).unwrap();
+        accepted_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("server accepted before the request was written");
+        let request = format!(
+            "GET {HEALTH_ROUTE} HTTP/1.1\r\nHost: jarvis.local\r\nConnection: close\r\nContent-Length: 0\r\nContent-Type: text/plain\r\n\r\n"
+        );
+        stream.write_all(request.as_bytes()).unwrap();
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).unwrap();
+        assert!(server.join().unwrap().unwrap());
+        let text = String::from_utf8(response).unwrap();
+        assert!(
+            text.starts_with("HTTP/1.1 200 OK\r\n"),
+            "resposta após o accept: {text:?}"
+        );
+        assert!(text.ends_with("ok\n"), "corpo após o accept: {text:?}");
+        session.revoke();
     }
 
     #[test]
@@ -3580,5 +3754,74 @@ sys.stdout.buffer.write(python_envelope)
             fs::remove_dir(&retained).unwrap();
         }
         canaries.assert_intact();
+    }
+}
+
+#[cfg(test)]
+mod workflow_page_route_tests {
+    use super::*;
+    #[test]
+    fn workflow_page_route_is_explicit_and_closed() {
+        assert!(APP_ROUTES.contains(&"/v1/app/workflows/list"));
+        assert!(APP_ROUTES.contains(&"/v1/app/workflows/page"));
+        assert!(!APP_ROUTES.contains(&"/v1/app/workflows/page?limit=20"));
+        assert!(!APP_ROUTES.contains(&"/v1/app/workflows/page/execute"));
+        assert_eq!(
+            APP_ROUTES
+                .iter()
+                .filter(|route| **route == APP_WORKFLOW_PAGE_ROUTE)
+                .count(),
+            1
+        );
+        assert!(APP_ROUTES.contains(&"/v1/app/captures/search"));
+        assert!(APP_ROUTES.contains(&"/v1/app/captures/open"));
+        for route in [
+            "/v1/app/memory/page",
+            "/v1/app/memory/create",
+            "/v1/app/memory/edit",
+            "/v1/app/memory/delete",
+        ] {
+            assert!(APP_ROUTES.contains(&route));
+        }
+        assert!(!APP_ROUTES.contains(&"/v1/app/memory/page?category=confirmed_fact"));
+        assert!(APP_ROUTES.contains(&"/v1/app/conversation/ask"));
+        assert_eq!(
+            APP_ROUTES
+                .iter()
+                .filter(|route| **route == APP_CONVERSATION_ASK_ROUTE)
+                .count(),
+            1
+        );
+        assert!(APP_ROUTES.contains(&APP_CONVERSATION_OPEN_ROUTE));
+        assert_eq!(
+            APP_ROUTES
+                .iter()
+                .filter(|route| **route == APP_CONVERSATION_OPEN_ROUTE)
+                .count(),
+            1
+        );
+        assert!(APP_ROUTES.contains(&APP_CONVERSATION_CANCEL_ROUTE));
+        assert_eq!(
+            APP_ROUTES
+                .iter()
+                .filter(|route| **route == APP_CONVERSATION_CANCEL_ROUTE)
+                .count(),
+            1
+        );
+        assert!(!APP_ROUTES.contains(&"/v1/app/conversation/ask?domain_id=dom_synthetic_a"));
+        assert!(!APP_ROUTES.contains(&"/v1/app/conversation/open?mode=new"));
+        assert!(!APP_ROUTES.contains(
+            &"/v1/app/conversation/cancel?conversation_id=0123456789abcdef0123456789abcdef"
+        ));
+        assert!(APP_ROUTES.contains(&APP_SYNTHETIC_DOCUMENT_ROUTE));
+        assert_eq!(
+            APP_ROUTES
+                .iter()
+                .filter(|route| **route == APP_SYNTHETIC_DOCUMENT_ROUTE)
+                .count(),
+            1
+        );
+        assert!(!APP_ROUTES.contains(&"/v1/app/artifacts/synthetic-document?title=override"));
+        assert!(!APP_ROUTES.contains(&"/v1/app/captures/search?q=ideia"));
     }
 }

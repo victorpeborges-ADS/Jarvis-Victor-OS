@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from api_test_support import sqlite_rows, start_loopback_test_server, stop_loopback_test_server
+
 import json
 import hashlib
 import os
@@ -20,6 +22,7 @@ from fastapi.testclient import TestClient
 from backup_recovery import create_backup, restore_backup
 from local_security import Grant, put_grant_for_tests, put_session_for_tests, reset_state
 from main import create_app
+from memory_store import SQLiteMemoryStore
 from server_config import LocalServerConfig
 
 PASSPHRASE = "senha-sintetica-de-missao"
@@ -32,14 +35,16 @@ def _expire(seconds: float = 86400) -> str:
 
 
 @pytest.fixture
-def client(tmp_path, monkeypatch):
+def client(tmp_path, monkeypatch, encrypted_store_factory):
     reset_state()
     monkeypatch.setenv("JARVIS_LOCAL_PASSPHRASE", PASSPHRASE)
     private = tmp_path / "private"
     private.mkdir(mode=0o700)
     app = create_app(LocalServerConfig(), database_path=private / "memory.sqlite3")
+    app.state.memory_store.unlock(encrypted_store_factory.storage_key)
     with TestClient(app, base_url="http://127.0.0.1", client=("127.0.0.1", 50993)) as test_client:
         test_client.database_path = app.state.memory_store.path
+        test_client.storage_key = encrypted_store_factory.storage_key
         yield test_client
     reset_state()
 
@@ -180,9 +185,11 @@ def test_approved_decision_appends_ledger_event_and_persists_after_restart(clien
 
     # Restart API against same SQLite store
     database = client.database_path
+    client.__exit__(None, None, None)
     reset_state()
     monkeypatch.setenv("JARVIS_LOCAL_PASSPHRASE", PASSPHRASE)
     restarted = create_app(LocalServerConfig(), database_path=database)
+    restarted.state.memory_store.unlock(client.storage_key)
     with TestClient(restarted, base_url="http://127.0.0.1", client=("127.0.0.1", 50994)) as again:
         again_csrf = login(again)
         mission_all_grants(again, again_csrf)
@@ -216,11 +223,18 @@ def test_backup_and_restore_preserves_reviews_and_decisions(client, tmp_path, mo
 
     backup_dir = tmp_path / "backups"
     restore_dir = tmp_path / "restores"
-    archive = create_backup(client.database_path, backup_dir, "senha-super-secreta-backup-1234")
-    restored_db = restore_backup(archive, restore_dir, "senha-super-secreta-backup-1234")
+    archive = create_backup(
+        client.database_path, backup_dir, "senha-super-secreta-backup-1234",
+        storage_key=client.storage_key,
+    )
+    restored_db = restore_backup(
+        archive, restore_dir, "senha-super-secreta-backup-1234",
+        storage_key=client.storage_key, confirm_legacy_resurrection=True,
+    )
+    restored_store = SQLiteMemoryStore(restored_db, storage_key=client.storage_key)
+    restored_store.initialize()
 
-    with sqlite3.connect(restored_db) as con:
-        con.row_factory = sqlite3.Row
+    with sqlite_rows(restored_store, row_factory=sqlite3.Row) as con:
         rev = con.execute("SELECT * FROM mission_artifact_reviews WHERE id=?", (review_id,)).fetchone()
         assert rev is not None
         assert rev["state"] == "approved"
@@ -284,7 +298,8 @@ def test_concurrent_conflicting_decisions_on_same_version_have_one_winner(client
     results = []
 
     def make_decision(decision: str, reason: str | None, key: str):
-        with TestClient(client.app, base_url="http://127.0.0.1", client=("127.0.0.1", 50993)) as c:
+        from contextlib import closing
+        with closing(TestClient(client.app, base_url="http://127.0.0.1", client=("127.0.0.1", 50993))) as c:
             c.cookies.set("jarvis_session", client.cookies.get("jarvis_session"))
             resp = c.post(
                 f"/real/reviews/{review_id}/decide",
@@ -499,7 +514,7 @@ def test_mission_review_operations_can_reuse_create_key_and_replay_history(clien
     assert replayed_revision.status_code == 200
     assert replayed_revision.json()["replayed"] is True
 
-    with sqlite3.connect(client.database_path) as connection:
+    with sqlite_rows(client.app.state.memory_store) as connection:
         operations = connection.execute(
             "SELECT operation FROM mission_idempotency WHERE owner='owner' AND idempotency_key=? "
             "ORDER BY operation",
@@ -528,7 +543,7 @@ def test_ledger_snapshot_hash_and_immutability(client):
               "idempotency_key": "snapshot-hash-key"},
     )
     assert response.status_code == 200
-    with sqlite3.connect(client.database_path) as con:
+    with sqlite_rows(client.app.state.memory_store) as con:
         row = con.execute(
             "SELECT id, artifact_sha256, snapshot_json FROM mission_review_decisions WHERE review_id=?",
             (review_id,),
@@ -571,7 +586,7 @@ def test_session_closed_before_decision_commit_fails_closed(client, monkeypatch)
         release.set()
         worker.join(timeout=5)
     assert sink == [403]
-    with sqlite3.connect(client.database_path) as con:
+    with sqlite_rows(client.app.state.memory_store) as con:
         assert con.execute("SELECT state FROM mission_artifact_reviews WHERE id=?", (review_id,)).fetchone()[0] == "pending"
         assert con.execute("SELECT COUNT(*) FROM mission_review_decisions WHERE review_id=?", (review_id,)).fetchone()[0] == 0
 
@@ -611,7 +626,7 @@ def test_write_grant_revoked_before_revision_commit_fails_closed(client, monkeyp
         release.set()
         worker.join(timeout=5)
     assert sink == [403]
-    with sqlite3.connect(client.database_path) as con:
+    with sqlite_rows(client.app.state.memory_store) as con:
         assert con.execute("SELECT COUNT(*) FROM mission_artifact_reviews WHERE artifact_id=?",
                            (detail["artifact_id"],)).fetchone()[0] == 1
 
@@ -622,7 +637,7 @@ def test_review_queue_filters_domain_before_pagination(client):
     hidden_grants = mission_all_grants(client, csrf, "dom_synthetic_b")
     _, visible_id = create_and_run_step(client, csrf, "Visível", "dom_synthetic_a")
     _, hidden_id = create_and_run_step(client, csrf, "Oculto", "dom_synthetic_b")
-    with sqlite3.connect(client.database_path) as con:
+    with sqlite_rows(client.app.state.memory_store) as con:
         con.execute("UPDATE mission_artifact_reviews SET id='rev_000_hidden' WHERE id=?", (hidden_id,))
         con.execute("UPDATE mission_artifact_reviews SET id='rev_999_visible' WHERE id=?", (visible_id,))
     for resource in ("read", "review"):
@@ -639,7 +654,7 @@ def test_corrupt_review_pointer_returns_409_on_mutation(client):
     mission_all_grants(client, csrf)
     _, review_id = create_and_run_step(client, csrf, "Ponteiro inválido")
     detail = client.get(f"/real/reviews/{review_id}", headers={"origin": ORIGIN}).json()
-    with sqlite3.connect(client.database_path) as con:
+    with sqlite_rows(client.app.state.memory_store) as con:
         con.execute("UPDATE mission_artifact_reviews SET artifact_snapshot_json='{}' WHERE id=?", (review_id,))
     response = client.post(
         f"/real/reviews/{review_id}/decide",
@@ -658,7 +673,7 @@ def test_corrupted_review_data_fails_closed_without_deleting_row(client):
     _, review_id = create_and_run_step(client, csrf, "Registro corrompido")
 
     # Corrupt the parent mission document_json
-    with sqlite3.connect(client.database_path) as con:
+    with sqlite_rows(client.app.state.memory_store) as con:
         con.execute("UPDATE missions SET document_json='{invalid json'")
 
     # Single read of review returns 409
@@ -671,7 +686,7 @@ def test_corrupted_review_data_fails_closed_without_deleting_row(client):
     assert any(c["id"] == review_id and c["integrity"] == "corrupt" for c in queue.get("corrupt", []))
 
     # Row was NOT deleted
-    with sqlite3.connect(client.database_path) as con:
+    with sqlite_rows(client.app.state.memory_store) as con:
         assert con.execute("SELECT COUNT(*) FROM mission_artifact_reviews WHERE id=?", (review_id,)).fetchone()[0] == 1
 
 
@@ -704,31 +719,18 @@ def test_cancelled_mission_rejects_review_decision(client):
     assert "missão cancelada" in attempt.json()["detail"]
 
 
-def test_revoked_or_expired_review_grant_during_pause_fails_closed(tmp_path):
+def test_revoked_or_expired_review_grant_during_pause_fails_closed(tmp_path, encrypted_store_factory):
     port = 18872
     pause = tmp_path / "pause_review.txt"
     private = tmp_path / "private"
     private.mkdir(mode=0o700)
     database = private / "memory.sqlite3"
-    env = os.environ.copy()
-    env.update({
-        "JARVIS_BIND_HOST": "127.0.0.1",
-        "JARVIS_BIND_PORT": str(port),
-        "JARVIS_DATABASE_PATH": str(database),
+    app = create_app(LocalServerConfig(host="127.0.0.1", port=port), database_path=database)
+    app.state.memory_store.unlock(encrypted_store_factory.storage_key)
+    server = start_loopback_test_server(app, port, environment={
         "JARVIS_LOCAL_PASSPHRASE": PASSPHRASE,
         "JARVIS_TEST_PAUSE_REVIEW_FILE": str(pause),
     })
-    proc = subprocess.Popen(
-        [str(ROOT / ".venv" / "bin" / "python"), "serve.py"], cwd=ROOT, env=env,
-        stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, start_new_session=True,
-    )
-    deadline = time.time() + 20
-    while time.time() < deadline:
-        try:
-            if httpx.get(f"http://127.0.0.1:{port}/health", timeout=0.4).status_code == 200:
-                break
-        except httpx.HTTPError:
-            time.sleep(0.1)
 
     try:
         with httpx.Client(base_url=f"http://127.0.0.1:{port}", timeout=8) as http:
@@ -792,6 +794,4 @@ def test_revoked_or_expired_review_grant_during_pause_fails_closed(tmp_path):
             assert final["state"] == "pending"
             assert final["history"] == []
     finally:
-        if proc.poll() is None:
-            os.killpg(proc.pid, signal.SIGKILL)
-            proc.wait(timeout=5)
+        stop_loopback_test_server(server)

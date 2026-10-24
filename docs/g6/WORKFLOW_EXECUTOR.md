@@ -29,7 +29,7 @@ Revogar `mission:review` usa uma rota UDS fixa e invalida a autorização antes 
 
 Estados persistidos: `proposed`, `awaiting_approval`, `paused`, `running`, `interrupted`, `succeeded`, `failed` e `cancelled`. A inicialização do FastAPI converte execuções abertas em `interrupted`. Para as duas ferramentas locais, repetir após crash é seguro porque o rascunho é parte do registro e a simulação não tem efeito fora do banco. Nenhuma decisão de retry se baseia no LLM.
 
-A listagem nativa entrega no máximo quatro tarefas recentes. Esse limite mantém a resposta serializada abaixo dos 2.048 bytes do MAC-003; o histórico completo continua persistido e uma versão futura do protocolo pode adicionar paginação explícita.
+A chamada histórica `/v1/app/workflows/list` continua entregando no máximo quatro tarefas por `updated_at DESC, id`, com os mesmos campos. A nova operação paginada descrita abaixo percorre o histórico por criação, sem mudar o contrato de consumidores antigos.
 
 Timeouts são aplicados às funções locais em worker limitado; retries são limitados ao erro local transitório declarado. O limite atual é um item por execução. Cancelamento impede iniciar uma tarefa em estado cancelado; ferramentas longas e cancelamento cooperativo durante I/O ainda não existem. Não há execução de I/O externo para interromper.
 
@@ -40,3 +40,22 @@ Migração: `apps/api/migrations/0019_workflow_tasks.sql`. O número 0019 evita 
 ## Verificações desta candidata
 
 Os testes devem cobrir schema fechado, ferramentas bloqueadas, alteração de parâmetros, replay concorrente, expiração/revogação de grant, reinício e crash, retry, resposta perdida, hash de resultado, cancelamento e ausência de payload nos logs. O teste Rust de integração usa FastAPI real supervisionado via UDS e dados sintéticos. Build e testes automatizados não substituem smoke da janela Tauri real; nenhuma verificação visual manual está alegada por este documento.
+
+
+## Paginação explícita do histórico — 2026-10-14
+
+Contrato aditivo: `POST /v1/app/workflows/page`, pedido com **exatamente**, nesta ordem, `session_token` e `cursor`; sucesso com `ok=true`, `tasks_json` e `next_cursor`. IPC dedicado `g5_workflow_page(cursor)` e cliente TypeScript `workflowPage(cursor="")`. A WebView recebe apenas resumos e cursor; token permanece no Rust. Cada leitura exige sessão G5 ativa sob o lock existente. Cursor é navegação, nunca autorização. Não aceita limite, offset, filtro, método ou rota arbitrários.
+
+A primeira consulta usa cursor vazio. Ordem keyset: `created_at DESC, id DESC`; a próxima consulta aplica `(created_at,id) < (data,id)` da última linha entregue. Ambos são imutáveis no executor. Estado e `updated_at` podem mudar sem mover itens entre páginas. Empates de criação são resolvidos pelo ID. Cursor canônico `wf1|<created_at UTC ISO>|<id hexadecimal minúsculo de 32 caracteres>`: até 80 bytes ASCII, data válida, segundos e opcionalmente seis dígitos de microssegundos **não todos zero**, deslocamento `+00:00`. Framing/percent-encoding e campos extras continuam recusados; cursor inválido recebe `schema_rejected`, sem eco.
+
+No máximo quatro resumos por resposta; o backend lê no máximo cinco linhas para detectar continuação. A quantidade pode ser menor pelo orçamento de bytes. O empacotamento mede a resposta textual ASCII já percent-encoded **incluindo `ok`, JSON, cursor, nomes e quebras de linha**, com teto de 1.792 bytes. Reserva 256 bytes para o frame interno de 7 bytes e nonce/tag de 48 bytes e margem: o corpo do envelope criptográfico fica estritamente abaixo de 2.048 bytes, comprovado pelo teste da resposta real v3. Headers HTTP conservam seus limites independentes; não se somam ao orçamento de corpo do protocolo. Nenhum limite global de transporte foi ampliado.
+
+`next_cursor=""` significa fim da página final, inclusive histórico vazio. Não há truncamento de campos, salto de item ou cursor avançado além de item entregue. Se o primeiro item restante não couber, a resposta é `ok=false, code=limit_exceeded`; é necessário corrigir o registro por procedimento autorizado antes de continuar. Se um item posterior não couber, a página entrega apenas o prefixo que cabe e devolve o cursor desse prefixo; a consulta seguinte recusa explicitamente o item grande. Nenhum conteúdo/argumento/resultado completo é incluído no resumo.
+
+A leitura é de histórico vivo, não um snapshot durável: remoções entre consultas são omitidas, e remover a linha âncora não invalida o cursor. Inserções com chave mais nova que o cursor ficam para uma nova travessia; inserções retrodatadas ou com relógio recuado abaixo do cursor podem aparecer nas páginas seguintes. Reconsultar o mesmo cursor é uma leitura idempotente, sujeita às alterações atuais, sem efeito de execução. Atualizar tarefas na interface reinicia a travessia; “Carregar mais tarefas” usa somente a operação nova. Respostas atrasadas após reinício da listagem/sessão são descartadas por geração local.
+
+Sem migration ou dependência nova. Os índices existentes permitem restringir `owner`, mas não cobrem a nova ordenação: SQLite pode ordenar o histórico com estrutura temporária. Não se promete custo constante em bases grandes; um índice composto futuro exige medição e migration aditiva, não alteração da 0019 aplicada.
+
+Rust e TypeScript têm decodificadores próprios, estritos para o novo DTO: campos exatos, catálogo/estados fechados, no máximo quatro itens, ordem decrescente, avanço estrito em relação ao cursor solicitado e cursor de continuação vinculado à última linha. Os decodificadores e DTOs da chamada antiga não receberam campos novos. Aplicação v1 e envelope v3 permanecem; runtimes antigos recusam a operação desconhecida sem fallback para uma semântica diferente. A emenda consta do contrato MAC-003; cliente/backend desta candidata precisam ser usados juntos.
+
+Evidências e comandos: [WORKFLOW_HISTORY_PAGINATION_2026-10-14.md](WORKFLOW_HISTORY_PAGINATION_2026-10-14.md). **Smoke visual e P2 de Aprovações continuam pendentes.**

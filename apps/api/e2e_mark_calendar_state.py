@@ -5,8 +5,20 @@ from __future__ import annotations
 import sqlite3
 import sys
 import tempfile
+from contextlib import closing, contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+
+import database_leases as leases
+
+
+@contextmanager
+def _connection(path: Path):
+    from restore_activation import assert_ready
+    with leases.lock(path):
+        assert_ready(path)
+        with closing(sqlite3.connect(path.as_uri() + "?mode=rw", uri=True, timeout=2)) as connection:
+            yield connection
 
 
 def main() -> None:
@@ -31,7 +43,7 @@ def main() -> None:
         last_attempt = last_success
         status, error_code = "simulated", None
     else:
-        with sqlite3.connect(f"file:{path}?mode=rw", uri=True, timeout=2) as connection:
+        with _connection(path) as connection:
             row = connection.execute(
                 "SELECT last_success_at FROM calendar_sync_states WHERE calendar_id = ?",
                 (calendar_id,),
@@ -42,7 +54,7 @@ def main() -> None:
         last_attempt = now + timedelta(seconds=1)
         status, error_code = "error", "simulated_network"
 
-    with sqlite3.connect(f"file:{path}?mode=rw", uri=True, timeout=2) as connection:
+    with _connection(path) as connection:
         cursor = connection.execute(
             "UPDATE calendar_sync_states SET sync_status = ?, last_success_at = ?, last_attempt_at = ?, error_code = ? WHERE calendar_id = ?",
             (status, last_success.isoformat() if last_success else None, last_attempt.isoformat(), error_code, calendar_id),

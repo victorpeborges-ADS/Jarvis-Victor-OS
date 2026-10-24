@@ -3,15 +3,19 @@
 import hashlib
 import json
 import sqlite3
+from contextlib import contextmanager
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from shutil import copyfile
 
+import pytest
 from fastapi.testclient import TestClient
 
+from api_test_support import sqlite_rows
 from backup_recovery import create_backup, restore_backup
 from local_security import Grant, put_grant_for_tests, put_session_for_tests
 from memory_store import MIGRATIONS_DIR, SQLiteMemoryStore
+from sealed_database import PlaintextDatabaseRefused
 from mission_repository import _sha
 from source_admission import reconcile_legacy_selected_sources
 from source_catalog import fixture_for
@@ -29,6 +33,27 @@ def _mission(client, csrf):
     })
     assert response.status_code == 201, response.text
     return response.json()["mission"]["id"]
+
+
+class LegacySQLiteTestStore:
+    """Explicit temporary clear-SQLite fixture for a legacy migration test."""
+
+    def __init__(self, path):
+        self.path = path
+
+    @contextmanager
+    def transaction(self):
+        connection = sqlite3.connect(self.path)
+        connection.row_factory = sqlite3.Row
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            yield connection
+            connection.commit()
+        except BaseException:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
 
 
 def _body(fixture_id="tarefas-de-exemplo", idempotency_key="selected-source-key"):
@@ -83,14 +108,21 @@ def test_selected_source_needs_two_decisions_and_survives_backup(client, tmp_pat
     final_status = client.get(path, headers={"origin": ORIGIN}).json()["items"][0]
     assert final_status["artifact_review_state"] == "approved"
     assert final_status["knowledge_state"] == "approved"
-    archive = create_backup(client.database_path, tmp_path / "backups", "senha-sintetica-arquivo-selecionado")
-    restored = restore_backup(archive, tmp_path / "restore", "senha-sintetica-arquivo-selecionado")
-    with sqlite3.connect(restored) as con:
+    archive = create_backup(
+        client.database_path, tmp_path / "backups", "senha-sintetica-arquivo-selecionado",
+        storage_key=client.storage_key,
+    )
+    restored = restore_backup(
+        archive, tmp_path / "restore", "senha-sintetica-arquivo-selecionado",
+        storage_key=client.storage_key, confirm_legacy_resurrection=True,
+    )
+    restored_store = SQLiteMemoryStore(restored, storage_key=client.storage_key)
+    restored_store.initialize()
+    with sqlite_rows(restored_store) as con:
         assert con.execute("SELECT COUNT(*) FROM selected_synthetic_sources").fetchone()[0] == 1
         persisted = con.execute("SELECT classification, state, fixture_id, catalog_version FROM selected_synthetic_sources").fetchone()
         assert persisted == ("synthetic_verified", "selected", "tarefas-de-exemplo", "1.0.0")
         assert con.execute("PRAGMA foreign_key_check").fetchall() == []
-    SQLiteMemoryStore(restored).initialize()
 
 
 def test_selected_source_rejects_client_owned_content_metadata_and_unknown_fixtures(client):
@@ -133,7 +165,8 @@ def test_selected_source_rejects_revoked_write_and_other_owner(client):
         resource_ids=frozenset({"mission:write"}), domain_ids=frozenset({"dom_synthetic_a"}),
         expires_at=datetime.now(timezone.utc) + timedelta(days=1),
     ))
-    with TestClient(client.app, base_url="http://127.0.0.1", client=("127.0.0.1", 50994)) as other:
+    from contextlib import closing
+    with closing(TestClient(client.app, base_url="http://127.0.0.1", client=("127.0.0.1", 50994))) as other:
         other.cookies.set("jarvis_session", other_token)
         assert other.post(path, headers=_headers("other-owner-csrf"), json=_body()).status_code == 404
         assert other.get(path, headers={"origin": ORIGIN}).status_code == 404
@@ -154,7 +187,7 @@ def test_concurrent_identical_selection_creates_one_artifact(client):
     assert sorted(response.status_code for response in responses) == [201, 201]
     assert sorted(response.json()["replayed"] for response in responses) == [False, True]
     assert len(client.get(path, headers={"origin": ORIGIN}).json()["items"]) == 1
-    with sqlite3.connect(client.database_path) as con:
+    with sqlite_rows(client.app.state.memory_store) as con:
         assert con.execute("SELECT COUNT(*) FROM mission_knowledge WHERE kind='selected_original'").fetchone()[0] == 1
 
 
@@ -173,18 +206,18 @@ def test_selected_original_cannot_diverge_from_approved_artifact_snapshot(client
     assert approved.status_code == 200, approved.text
     knowledge = next(item for item in client.get("/real/knowledge", headers={"origin": ORIGIN}).json()["items"]
                      if item["kind"] == "selected_original")
-    with sqlite3.connect(client.database_path) as con:
+    with sqlite_rows(client.app.state.memory_store) as con:
         con.execute("UPDATE mission_knowledge SET content='texto divergente' WHERE id=?", (knowledge["id"],))
     decision = {"decision": "approved", "expected_content_sha256": hashlib.sha256(b"texto divergente").hexdigest(),
                 "idempotency_key": "approve-divergent-original"}
     refused = client.post(f"/real/knowledge/{knowledge['id']}/decide", headers=_headers(csrf), json=decision)
     assert refused.status_code == 409
-    with sqlite3.connect(client.database_path) as con:
+    with sqlite_rows(client.app.state.memory_store) as con:
         con.execute("UPDATE mission_knowledge SET content=? WHERE id=?", (_fixture_content(), knowledge["id"]))
     decision["expected_content_sha256"] = knowledge["content_sha256"]
     decision["idempotency_key"] = "approve-matching-original"
     assert client.post(f"/real/knowledge/{knowledge['id']}/decide", headers=_headers(csrf), json=decision).status_code == 200
-    with sqlite3.connect(client.database_path) as con:
+    with sqlite_rows(client.app.state.memory_store) as con:
         con.execute("UPDATE mission_knowledge SET content='texto divergente' WHERE id=?", (knowledge["id"],))
     bundle = client.get(f"/real/knowledge/context/{mission_id}", headers={"origin": ORIGIN}).json()
     assert bundle["included"] == []
@@ -235,7 +268,7 @@ def test_r4_postchange_unknown_content_probe_is_refused_without_echo_or_partial_
     assert response.status_code == 422
     assert content not in response.text
     assert client.get(f"/real/missions/{mission_id}/sources", headers={"origin": ORIGIN}).json()["items"] == []
-    with sqlite3.connect(client.database_path) as con:
+    with sqlite_rows(client.app.state.memory_store) as con:
         assert con.execute("SELECT COUNT(*) FROM mission_knowledge WHERE mission_id=?", (mission_id,)).fetchone()[0] == 0
         assert con.execute("SELECT COUNT(*) FROM selected_synthetic_sources WHERE mission_id=?", (mission_id,)).fetchone()[0] == 0
 
@@ -260,14 +293,15 @@ def test_source_insert_failure_rolls_back_artifact_knowledge_and_source(client):
     csrf = login(client)
     mission_all_grants(client, csrf)
     mission_id = _mission(client, csrf)
-    with sqlite3.connect(client.database_path) as con:
+    with sqlite_rows(client.app.state.memory_store) as con:
         before = con.execute("SELECT revision, document_json FROM missions WHERE id=?", (mission_id,)).fetchone()
+    with client.app.state.memory_store.transaction() as con:
         con.execute("""CREATE TRIGGER refuse_selected_source BEFORE INSERT ON selected_synthetic_sources
                        BEGIN SELECT RAISE(ABORT, 'synthetic failure'); END""")
     response = client.post(f"/real/missions/{mission_id}/sources", headers=_headers(csrf), json=_body())
     assert response.status_code == 503
     assert "synthetic failure" not in response.text
-    with sqlite3.connect(client.database_path) as con:
+    with sqlite_rows(client.app.state.memory_store) as con:
         after = con.execute("SELECT revision, document_json FROM missions WHERE id=?", (mission_id,)).fetchone()
         assert after == before
         assert con.execute("SELECT COUNT(*) FROM selected_synthetic_sources WHERE mission_id=?", (mission_id,)).fetchone()[0] == 0
@@ -275,19 +309,22 @@ def test_source_insert_failure_rolls_back_artifact_knowledge_and_source(client):
         assert con.execute("SELECT COUNT(*) FROM mission_artifact_reviews WHERE mission_id=? AND artifact_id LIKE 'artifact_selected_%'", (mission_id,)).fetchone()[0] == 0
 
 
-def test_migration_preserves_unknown_sources_and_reconciles_only_byte_exact_fixture(tmp_path):
+def test_migration_preserves_unknown_sources_and_reconciles_only_byte_exact_fixture(
+    tmp_path, encrypted_store_factory,
+):
     old_dir = tmp_path / "migrations-0013"
     old_dir.mkdir()
     for migration in sorted(MIGRATIONS_DIR.glob("[0-9][0-9][0-9][0-9]_*.sql")):
-        if migration.stem not in {
-            "0014_curated_source_admission",
-            "0015_selected_source_reconciliation",
-            "0016_local_captures",
-        }:
+        if int(migration.stem[:4]) <= 13:
             copyfile(migration, old_dir / migration.name)
     db_path = tmp_path / "private" / "legacy.sqlite3"
+    db_path.parent.mkdir(mode=0o700)
     old_store = SQLiteMemoryStore(db_path, migrations_dir=old_dir)
-    old_store.initialize()
+    with sqlite3.connect(db_path) as bootstrap:
+        bootstrap.row_factory = sqlite3.Row
+        old_store._apply_migrations(bootstrap)
+        old_store._validate_schema(bootstrap)
+    db_path.chmod(0o600)
     owner = "legacy-owner"
     mission_id = "mission_legacy_source_r4"
     now = "2026-09-26T00:00:00+00:00"
@@ -335,8 +372,23 @@ def test_migration_preserves_unknown_sources_and_reconciles_only_byte_exact_fixt
             current.setdefault("artifacts", []).append(artifact)
             con.execute("UPDATE missions SET document_json=? WHERE id=? AND owner=?",
                         (json.dumps(current, ensure_ascii=False), mission_id, owner))
-    store = SQLiteMemoryStore(db_path)
-    store.initialize()
+    upgrade_dir = tmp_path / "migrations-0015"
+    upgrade_dir.mkdir()
+    for migration in sorted(MIGRATIONS_DIR.glob("[0-9][0-9][0-9][0-9]_*.sql")):
+        if int(migration.stem[:4]) <= 15:
+            copyfile(migration, upgrade_dir / migration.name)
+    legacy_migrator = SQLiteMemoryStore(db_path, migrations_dir=upgrade_dir)
+    with sqlite3.connect(db_path) as bootstrap:
+        bootstrap.row_factory = sqlite3.Row
+        legacy_migrator._apply_migrations(bootstrap)
+        legacy_migrator._validate_schema(bootstrap)
+    before_bytes = db_path.read_bytes()
+    sealed_runtime = SQLiteMemoryStore(db_path, storage_key=encrypted_store_factory.storage_key)
+    with pytest.raises(PlaintextDatabaseRefused):
+        sealed_runtime.initialize()
+    assert db_path.read_bytes() == before_bytes
+
+    store = LegacySQLiteTestStore(db_path)
     with store.transaction() as connection:
         before = connection.execute("SELECT COUNT(*) FROM selected_synthetic_sources").fetchone()[0]
         quarantined = connection.execute("""SELECT COUNT(*) FROM selected_synthetic_sources
@@ -361,7 +413,7 @@ def test_unverified_legacy_source_is_quarantined_from_reads_reviews_and_context(
     mission_id = _mission(client, csrf)
     path = f"/real/missions/{mission_id}/sources"
     source = client.post(path, headers=_headers(csrf), json=_body()).json()
-    with sqlite3.connect(client.database_path) as con:
+    with sqlite_rows(client.app.state.memory_store) as con:
         con.execute("""UPDATE selected_synthetic_sources
                         SET classification='unverified', state='quarantined', fixture_id=NULL,
                             catalog_id=NULL, catalog_version=NULL, fixture_sha256=NULL, provenance_json=NULL

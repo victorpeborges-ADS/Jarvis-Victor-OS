@@ -1,0 +1,17 @@
+{
+  "fixture_id": "calendar_all_day",
+  "connector": "calendar",
+  "source_claimed_at": "2026-10-17T11:50:00Z",
+  "items": [
+    {
+      "kind": "calendar",
+      "external_id": "evt-all-day",
+      "summary": "Dia inteiro sintético",
+      "start_at": "2026-10-18T00:00:00Z",
+      "end_at": "2026-10-19T00:00:00Z",
+      "time_zone": "America/Sao_Paulo",
+      "status": "confirmed",
+      "all_day": true
+    }
+  ]
+}

@@ -1,0 +1,15 @@
+{
+  "fixture_id": "github_current",
+  "connector": "github",
+  "source_claimed_at": "2026-10-17T11:50:00Z",
+  "revoked": false,
+  "elapsed_ms": 0,
+  "items": [
+    {
+      "kind": "github",
+      "external_id": "gh-1",
+      "repository": "synthetic/notes",
+      "path": "docs/nota.md"
+    }
+  ]
+}

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from api_test_support import sqlite_rows
+
 import sqlite3
 import hashlib
 import socket
@@ -30,13 +32,15 @@ LETTERS = "abcdefgh"
 
 
 @pytest.fixture
-def client(tmp_path, monkeypatch):
+def client(tmp_path, monkeypatch, encrypted_store_factory):
     reset_state()
     monkeypatch.setenv("JARVIS_LOCAL_PASSPHRASE", PASSPHRASE)
     app = create_app(
         LocalServerConfig(), database_path=tmp_path / "private" / "memory.sqlite3"
     )
+    app.state.memory_store.unlock(encrypted_store_factory.storage_key)
     with TestClient(app, base_url="http://127.0.0.1", client=("127.0.0.1", 50991)) as test_client:
+        test_client.storage_key = encrypted_store_factory.storage_key
         yield test_client
     reset_state()
 
@@ -98,7 +102,7 @@ def sync_one(client: TestClient, csrf: str, letter: str):
 
 
 @contextmanager
-def actual_http_server(tmp_path):
+def actual_http_server(tmp_path, encrypted_store_factory):
     """Run a loopback Uvicorn socket for browser CORS preflight regression tests."""
     with socket.socket() as reservation:
         reservation.bind(("127.0.0.1", 0))
@@ -107,6 +111,7 @@ def actual_http_server(tmp_path):
         LocalServerConfig(host="127.0.0.1", port=port),
         database_path=tmp_path / "actual-http" / "memory.sqlite3",
     )
+    app.state.memory_store.unlock(encrypted_store_factory.storage_key)
     server = uvicorn.Server(uvicorn.Config(
         app,
         host="127.0.0.1",
@@ -192,7 +197,7 @@ def test_calendar_requires_explicit_mapping_and_missing_grant_is_quarantined(cli
     assert {entry["reason"] for entry in unclassified.json()["quarantined"]} == {"unclassified"}
     assert client.get("/real/events").status_code == 200
     assert client.get("/real/events").json() == []
-    with sqlite3.connect(client.app.state.memory_store.path) as connection:
+    with sqlite_rows(client.app.state.memory_store) as connection:
         assert connection.execute("SELECT COUNT(*) FROM events").fetchone()[0] == 0
 
     service = client.app.state.calendar_sync_service
@@ -268,7 +273,7 @@ def test_cancellation_is_soft_deleted_and_not_returned_in_reads(client):
     visible = client.get("/real/events")
     assert visible.status_code == 200
     assert len(visible.json()) == 1
-    with sqlite3.connect(service.store.path) as connection:
+    with sqlite_rows(service.store) as connection:
         cancelled = connection.execute(
             "SELECT cancelled_at FROM events WHERE id IN (SELECT event_id FROM event_provenance WHERE external_ref=?)",
             ("sim_calendar_a:evt-synth-a-1",),
@@ -297,7 +302,7 @@ def test_republished_event_reactivates_same_identity_after_cancellation(client):
     reactivated = sync_one(client, csrf, "a")
     assert reactivated.status_code == 200
     assert len(client.get("/real/events").json()) == 2
-    with sqlite3.connect(service.store.path) as connection:
+    with sqlite_rows(service.store) as connection:
         state = connection.execute(
             "SELECT cancelled_at FROM events WHERE id IN (SELECT event_id FROM event_provenance WHERE external_ref=?)",
             ("sim_calendar_a:evt-synth-a-1",),
@@ -454,8 +459,10 @@ def test_sync_cursor_and_explicit_mapping_survive_store_restart(client):
     assert first.events_written == 2
     old_checkpoint = service.store.get_calendar_checkpoint(CALENDAR_SOURCE.id, "sim_calendar_a")
     assert old_checkpoint is not None and old_checkpoint.sync_token
+    storage_key = client.storage_key
 
-    reopened_store = SQLiteMemoryStore(service.store.path)
+    client.__exit__(None, None, None)  # restart releases the previous runtime lease
+    reopened_store = SQLiteMemoryStore(service.store.path, storage_key=storage_key)
     reopened_store.initialize()
     restarted_service = CalendarSyncService(reopened_store, service.provider)
     persisted = reopened_store.get_calendar_checkpoint(CALENDAR_SOURCE.id, "sim_calendar_a")
@@ -501,7 +508,7 @@ def test_page_conflict_rolls_back_events_provenance_audit_and_cursor(client):
     ])
     assert len(records) == 1
     assert records[0].event.title == "Registro sintético anterior"
-    with sqlite3.connect(service.store.path) as connection:
+    with sqlite_rows(service.store) as connection:
         assert connection.execute("SELECT COUNT(*) FROM event_provenance").fetchone()[0] == 1
         assert connection.execute("SELECT COUNT(*) FROM audit_entries WHERE operation='event_write'").fetchone()[0] == 1
 
@@ -516,7 +523,7 @@ def test_sync_state_becomes_stale_after_24_hours_and_never_claims_real_connectio
     assert report.json()["states"][0]["status"] == "simulated"
     service = client.app.state.calendar_sync_service
     old = datetime.now(timezone.utc) - timedelta(hours=24, seconds=1)
-    with sqlite3.connect(service.store.path) as connection:
+    with sqlite_rows(service.store) as connection:
         connection.execute(
             "UPDATE calendar_sync_states SET last_success_at=?, sync_status='simulated' WHERE source_id=? AND calendar_id=?",
             (old.isoformat(), CALENDAR_SOURCE.id, "sim_calendar_a"),
@@ -598,7 +605,7 @@ def test_revocation_completed_before_page_commit_prevents_rows_and_cursor_advanc
         report = pending.result(timeout=5)
 
     checkpoint = service.store.get_calendar_checkpoint(CALENDAR_SOURCE.id, "sim_calendar_a")
-    with sqlite3.connect(service.store.path) as connection:
+    with sqlite_rows(service.store) as connection:
         event_count = connection.execute("SELECT COUNT(*) FROM events").fetchone()[0]
     assert report.quarantined[0].reason == "grant_missing"
     assert event_count == 0
@@ -649,7 +656,7 @@ def test_revocation_after_commit_before_http_response_suppresses_report(client):
     assert "dom_synthetic_a" not in response.text
     assert "events_written" not in response.text
     assert client.get("/real/events").status_code == 403
-    with sqlite3.connect(service.store.path) as connection:
+    with sqlite_rows(service.store) as connection:
         assert connection.execute("SELECT COUNT(*) FROM events").fetchone()[0] == 2
 
 
@@ -664,7 +671,7 @@ def test_complete_snapshot_reconciles_missing_event_and_later_reappearance(clien
     removed = provider._current["sim_calendar_a"].pop("evt-synth-a-1")
     incremental = service.sync(frozenset({"dom_synthetic_a"}), "sim_calendar_a")
     assert incremental.cancellations_applied == 0
-    with sqlite3.connect(service.store.path) as connection:
+    with sqlite_rows(service.store) as connection:
         not_inferred_deleted = connection.execute(
             "SELECT cancelled_at FROM events WHERE id IN "
             "(SELECT event_id FROM event_provenance WHERE external_ref=?)",
@@ -675,7 +682,7 @@ def test_complete_snapshot_reconciles_missing_event_and_later_reappearance(clien
     provider.invalidate_cursors("sim_calendar_a")
     reconciled = service.sync(frozenset({"dom_synthetic_a"}), "sim_calendar_a")
     assert reconciled.cancellations_applied == 1
-    with sqlite3.connect(service.store.path) as connection:
+    with sqlite_rows(service.store) as connection:
         row = connection.execute(
             "SELECT e.cancelled_at, p.external_ref FROM events e JOIN event_provenance p ON p.event_id=e.id "
             "WHERE p.external_ref=?", ("sim_calendar_a:evt-synth-a-1",)
@@ -727,7 +734,7 @@ def test_partial_full_snapshot_failure_does_not_reconcile_until_retry(client):
     service.store.apply_calendar_page = commit_then_inject_provider_failure
     failed = service.sync(frozenset({"dom_synthetic_a"}), "sim_calendar_a")
     assert failed.states[0].status == "error"
-    with sqlite3.connect(service.store.path) as connection:
+    with sqlite_rows(service.store) as connection:
         before_retry = connection.execute(
             "SELECT cancelled_at FROM events WHERE id IN "
             "(SELECT event_id FROM event_provenance WHERE external_ref=?)",
@@ -742,7 +749,7 @@ def test_partial_full_snapshot_failure_does_not_reconcile_until_retry(client):
     service.store.apply_calendar_page = original_apply
     retried = service.sync(frozenset({"dom_synthetic_a"}), "sim_calendar_a")
     assert retried.cancellations_applied == 1
-    with sqlite3.connect(service.store.path) as connection:
+    with sqlite_rows(service.store) as connection:
         after_retry = connection.execute(
             "SELECT cancelled_at FROM events WHERE id IN "
             "(SELECT event_id FROM event_provenance WHERE external_ref=?)",
@@ -798,7 +805,7 @@ def test_revocation_mid_full_snapshot_discards_staging_without_reconciliation(cl
 
     assert report.quarantined[0].reason == "grant_missing"
     checkpoint = service.store.get_calendar_checkpoint(CALENDAR_SOURCE.id, "sim_calendar_a")
-    with sqlite3.connect(service.store.path) as connection:
+    with sqlite_rows(service.store) as connection:
         missing_event = connection.execute(
             "SELECT cancelled_at FROM events WHERE id IN "
             "(SELECT event_id FROM event_provenance WHERE external_ref=?)",
@@ -844,10 +851,12 @@ def test_new_provider_epoch_forces_full_reconciled_sync_after_restart(client):
     assert next(item.event.title for item in records if item.event.provenance.external_ref.endswith("evt-synth-a-1")) == "Compromisso sintético A-1"
 
 
-def test_real_http_cors_preflight_and_classification_put(tmp_path, monkeypatch):
+def test_real_http_cors_preflight_and_classification_put(
+    tmp_path, monkeypatch, encrypted_store_factory,
+):
     reset_state()
     monkeypatch.setenv("JARVIS_LOCAL_PASSPHRASE", PASSPHRASE)
-    with actual_http_server(tmp_path) as base_url:
+    with actual_http_server(tmp_path, encrypted_store_factory) as base_url:
         with httpx.Client(base_url=base_url, timeout=3, trust_env=False) as http:
             headers = {
                 "origin": ORIGIN,

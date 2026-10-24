@@ -6,6 +6,8 @@ import hmac
 import os
 import re
 import sqlite3
+import tempfile
+import threading
 from pathlib import Path
 
 from fastapi import APIRouter, FastAPI, HTTPException, Request, Response
@@ -37,8 +39,12 @@ from native_app_api import router as native_app_router
 from native_runtime import NativeProtocolBoundary, NativeRuntimeIdentity, create_native_runtime_router
 from loopback import ALLOWED_ORIGINS, is_allowed_host_header, is_loopback_address
 from memory_store import MemoryStoreError, SQLiteMemoryStore
+from database_leases import LeaseError
+from restore_activation import ActivationError
 from mission_engine import recover_interrupted
 from workflow_executor import WorkflowExecutor
+from conversation_gateway import Budget, ConversationGateway, FakeProvider, ProviderOutput
+from skill_registry import Permission, SkillRegistry
 from server_config import LocalServerConfig, validate_local_server_config
 
 demo_router = APIRouter()
@@ -125,12 +131,10 @@ def create_app(config: LocalServerConfig, *, database_path: str | Path | None = 
         # Revalidate values at startup in case the frozen dataclass was altered
         # through low-level Python APIs after app construction.
         validate_local_server_config(config)
-        store.initialize()
-        from source_admission import reconcile_legacy_selected_sources
-        reconcile_legacy_selected_sources(store)
-        recover_interrupted(store)
-        WorkflowExecutor(store).recover(datetime.now(timezone.utc))
-        yield
+        # The loopback launcher has no authenticated Keychain bootstrap channel.
+        # Keep the store locked instead of opening/creating the configured path.
+        with store.runtime():
+            yield
 
     app = FastAPI(
         title="JARVIS API — Gate 1 mock",
@@ -191,7 +195,7 @@ def create_app(config: LocalServerConfig, *, database_path: str | Path | None = 
     async def memory_store_unavailable(request: Request, exc: Exception):
         return JSONResponse({"detail": "memória local indisponível"}, status_code=503)
 
-    for error_type in (MemoryStoreError, sqlite3.Error, OSError):
+    for error_type in (MemoryStoreError, LeaseError, ActivationError, sqlite3.Error, OSError):
         app.add_exception_handler(error_type, memory_store_unavailable)
 
     return app
@@ -207,22 +211,50 @@ def create_native_app(
     automation_scheduler = LocalAutomationScheduler(store)
     calendar_provider = CalendarProvider()
     calendar_sync_service = CalendarSyncService(store, calendar_provider)
+    prepared_answer = {"text": ""}
+    conversation_provider = FakeProvider(
+        lambda _call, _cancel, _deadline, _clock: ProviderOutput(
+            text=prepared_answer["text"], output_tokens=1, cost="unmeasured", repeat=False
+        )
+    )
+    conversation_gateway = ConversationGateway(conversation_provider)
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
-        store.initialize()
-        from source_admission import reconcile_legacy_selected_sources
-        reconcile_legacy_selected_sources(store)
-        recover_interrupted(store)
-        worker = asyncio.create_task(run_app_worker(automation_scheduler))
-        try:
-            yield
-        finally:
-            worker.cancel()
+        with store.runtime():
+            original_umask = os.umask(0o077)
+            artifact_storage = None
             try:
-                await worker
-            except asyncio.CancelledError:
-                pass
+                artifact_storage = tempfile.TemporaryDirectory(prefix="jarvis-synthetic-artifacts-")
+                artifact_root = Path(artifact_storage.name)
+                approved_root = artifact_root / "approved"
+                state_dir = artifact_root / "state"
+                approved_root.mkdir(mode=0o700)
+                state_dir.mkdir(mode=0o700)
+                skill_registry = SkillRegistry(approved_root, state_dir)
+            except BaseException:
+                if artifact_storage is not None:
+                    artifact_storage.cleanup()
+                raise
+            finally:
+                os.umask(original_umask)
+            with artifact_storage:
+                _app.state.skill_registry = skill_registry
+                _app.state.storage_worker = None
+                _app.state.storage_lifecycle_lock = asyncio.Lock()
+                try:
+                    yield
+                finally:
+                    worker = _app.state.storage_worker
+                    if worker is not None:
+                        worker.cancel()
+                        try:
+                            await worker
+                        except asyncio.CancelledError:
+                            pass
+                    conversation_gateway.clear_all()
+                    store.lock()
+                    _app.state.skill_registry = None
 
     app = FastAPI(
         title="JARVIS MAC-003 local runtime",
@@ -235,14 +267,40 @@ def create_native_app(
     app.state.local_automation_scheduler = automation_scheduler
     app.state.calendar_sim_provider = calendar_provider
     app.state.calendar_sync_service = calendar_sync_service
+    app.state.conversation_gateway = conversation_gateway
+    app.state.grounded_reply = prepared_answer
+    app.state.grounded_read_lock = threading.Lock()
+    app.state.conversation_cancellations = {}
+    app.state.conversation_cancellation_lock = threading.Lock()
+    app.state.grounded_documents = ()
+    app.state.skill_registry = None
     app.include_router(create_native_runtime_router(identity))
     app.include_router(native_app_router)
-    app.add_middleware(NativeProtocolBoundary, identity=identity)
+
+    @app.middleware("http")
+    async def require_unlocked_storage(request: Request, call_next):
+        bootstrap_routes = {
+            "/v1/app/storage/status",
+            "/v1/app/storage/unlock",
+            "/v1/app/storage/lock",
+        }
+        if (
+            request.url.path.startswith("/v1/app/")
+            and request.url.path not in bootstrap_routes
+            and not store.is_unlocked
+        ):
+            return PlainTextResponse("ok=false\ncode=storage_locked\n", status_code=200)
+        return await call_next(request)
 
     @app.exception_handler(MemoryStoreError)
+    @app.exception_handler(LeaseError)
+    @app.exception_handler(ActivationError)
     @app.exception_handler(sqlite3.Error)
     @app.exception_handler(OSError)
     async def memory_store_unavailable(_request: Request, _exc: Exception):
         return PlainTextResponse("ok=false\ncode=operation_failed\n", status_code=200)
 
+    # Keep the closed protocol boundary outermost: lock-state middleware must
+    # only run after the authenticated envelope has been admitted and decoded.
+    app.add_middleware(NativeProtocolBoundary, identity=identity)
     return app

@@ -3,8 +3,11 @@ use crate::transport::{
     PROTOCOL_VERSION,
 };
 use serde_json::Value as JsonValue;
+use sha2::{Digest, Sha256};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::{
     env,
+    fs::{self, OpenOptions},
     io::{self, BufRead, BufReader, Write},
     path::{Path, PathBuf},
     process::{Child, Command, ExitStatus, Stdio},
@@ -29,7 +32,14 @@ const SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(700);
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
 const POLL_INTERVAL: Duration = Duration::from_millis(10);
 const MAX_G5_APP_REQUEST_BODY_BYTES: usize = 1024;
+const MAX_G5_APP_RESPONSE_BODY_BYTES: usize = 2048;
+const CONVERSATION_OPEN_WIRE_FIELDS: [&str; 3] = ["session_token", "domain_id", "mode"];
+const CONVERSATION_CANCEL_WIRE_FIELDS: [&str; 3] =
+    ["session_token", "conversation_id", "domain_id"];
+const CONVERSATION_ASK_WIRE_FIELDS: [&str; 4] =
+    ["session_token", "conversation_id", "question", "domain_id"];
 const APP_WORKFLOW_SUBMIT_ROUTE: &str = "/v1/app/workflows/submit";
+const APP_WORKFLOW_PAGE_ROUTE: &str = "/v1/app/workflows/page";
 const APP_WORKFLOW_LIST_ROUTE: &str = "/v1/app/workflows/list";
 const APP_WORKFLOW_DETAIL_ROUTE: &str = "/v1/app/workflows/detail";
 const APP_WORKFLOW_APPROVE_ROUTE: &str = "/v1/app/workflows/approve";
@@ -37,6 +47,28 @@ const APP_WORKFLOW_EXECUTE_ROUTE: &str = "/v1/app/workflows/execute";
 const APP_WORKFLOW_PAUSE_ROUTE: &str = "/v1/app/workflows/pause";
 const APP_WORKFLOW_RESUME_ROUTE: &str = "/v1/app/workflows/resume";
 const APP_WORKFLOW_CANCEL_ROUTE: &str = "/v1/app/workflows/cancel";
+const APP_SYNTHETIC_DOCUMENT_ROUTE: &str = "/v1/app/artifacts/synthetic-document";
+const APP_MEMORY_PAGE_ROUTE: &str = "/v1/app/memory/page";
+const APP_MEMORY_CREATE_ROUTE: &str = "/v1/app/memory/create";
+const APP_MEMORY_EDIT_ROUTE: &str = "/v1/app/memory/edit";
+const APP_MEMORY_DELETE_ROUTE: &str = "/v1/app/memory/delete";
+const MAX_MEMORY_EXPORT_RECORDS: usize = 5000;
+const MEMORY_EXPORT_CATEGORIES: [&str; 4] = [
+    "explicit_capture",
+    "confirmed_fact",
+    "external_evidence",
+    "inferred_proposal",
+];
+const MEMORY_EXPORT_DOMAINS: [&str; 8] = [
+    "dom_synthetic_a",
+    "dom_synthetic_b",
+    "dom_synthetic_c",
+    "dom_synthetic_d",
+    "dom_synthetic_e",
+    "dom_synthetic_f",
+    "dom_synthetic_g",
+    "dom_synthetic_h",
+];
 const MAX_WORKFLOW_LIST_ITEMS: usize = 4;
 const APP_REVIEW_GRANT_REVOKE_ROUTE: &str = "/v1/app/grants/mission-review/revoke";
 #[cfg(test)]
@@ -1083,7 +1115,7 @@ impl RuntimeManager {
         let Some(parsed) = parsed else {
             return g5_error_json("protocol_failure");
         };
-        let mut rendered = String::from("{\"ok\":true,\"items\":[");
+        let mut rendered = String::from("{\"ok\":true,\"captures\":[");
         for (index, item) in parsed.iter().enumerate() {
             if index > 0 {
                 rendered.push(',');
@@ -1096,6 +1128,652 @@ impl RuntimeManager {
             ));
         }
         rendered.push_str("]}");
+        let inner = lock_inner(&self.shared);
+        if !g5_generation_matches(&inner, &instance_id, &transport)
+            || inner
+                .g5_session
+                .as_ref()
+                .is_none_or(|session| session.token.as_str() != token.as_str())
+        {
+            return g5_error_json("stale_generation");
+        }
+        rendered
+    }
+
+    fn g5_memory_call(
+        &self,
+        route: &'static str,
+        fields: &[(&str, &str)],
+        mutation: bool,
+    ) -> Result<Vec<(String, SecretText)>, &'static str> {
+        let _operation = self
+            .g5_operation
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        self.g5_memory_call_locked(route, fields, mutation)
+    }
+
+    fn g5_memory_call_locked(
+        &self,
+        route: &'static str,
+        fields: &[(&str, &str)],
+        mutation: bool,
+    ) -> Result<Vec<(String, SecretText)>, &'static str> {
+        let (instance_id, transport, token, csrf_token) = self.g5_credentials_for_active()?;
+        let mut wire = vec![("session_token", token.as_str())];
+        if mutation {
+            wire.push(("csrf_token", csrf_token.as_str()));
+        }
+        wire.extend_from_slice(fields);
+        let body = SecretBytes::new(encode_application_fields(&wire));
+        let response = transport
+            .call_g5_application(route, body.as_slice())
+            .map_err(|_| "transport_failure")?;
+        let response = SecretBytes::new(response);
+        let parsed =
+            parse_application_response(response.as_slice()).map_err(|_| "protocol_failure")?;
+        if let Some(error) = app_response_error(&parsed) {
+            clear_cached_authorization_after_rejection(
+                &self.shared,
+                &instance_id,
+                &transport,
+                token.as_str(),
+                error,
+            );
+            return Err(error);
+        }
+        let inner = lock_inner(&self.shared);
+        if !g5_generation_matches(&inner, &instance_id, &transport)
+            || inner
+                .g5_session
+                .as_ref()
+                .is_none_or(|session| session.token.as_str() != token.as_str())
+        {
+            return Err("stale_generation");
+        }
+        Ok(parsed)
+    }
+
+    fn g5_memory_page(&self, category: String, domain_id: String, offset: usize) -> String {
+        if !is_memory_category(&category) || !is_memory_domain(&domain_id) || offset > 5000 {
+            return g5_error_json("memory_rejected");
+        }
+        let offset_text = offset.to_string();
+        let fields = match self.g5_memory_call(
+            APP_MEMORY_PAGE_ROUTE,
+            &[
+                ("category", &category),
+                ("domain_id", &domain_id),
+                ("offset", &offset_text),
+            ],
+            false,
+        ) {
+            Ok(value) => value,
+            Err(error) => return g5_error_json(error),
+        };
+        if app_field(&fields, "has_item") == Some("false")
+            && app_fields_match(&fields, &["ok", "has_item"])
+            && app_field(&fields, "ok") == Some("true")
+        {
+            return "{\"ok\":true,\"has_item\":false}".to_owned();
+        }
+        if !app_fields_match(&fields, &["ok", "has_item", "record"])
+            || app_field(&fields, "ok") != Some("true")
+            || app_field(&fields, "has_item") != Some("true")
+        {
+            return g5_error_json("protocol_failure");
+        }
+        let record = match parse_memory_record(app_field(&fields, "record").unwrap_or_default()) {
+            Some(value) if value["category"] == category && value["domain_id"] == domain_id => {
+                value
+            }
+            _ => return g5_error_json("protocol_failure"),
+        };
+        format!(
+            "{{\"ok\":true,\"has_item\":true,\"record\":{}}}",
+            serde_json::to_string(&record).unwrap_or_else(|_| "null".to_owned())
+        )
+    }
+
+    fn g5_memory_create(
+        &self,
+        category: String,
+        domain_id: String,
+        body: String,
+        source_ref: String,
+    ) -> String {
+        if !is_memory_category(&category)
+            || !is_memory_domain(&domain_id)
+            || !is_memory_body(&body)
+            || !is_memory_source_ref(&source_ref)
+        {
+            return g5_error_json("memory_rejected");
+        }
+        let fields = match self.g5_memory_call(
+            APP_MEMORY_CREATE_ROUTE,
+            &[
+                ("category", &category),
+                ("domain_id", &domain_id),
+                ("body", &body),
+                ("source_ref", &source_ref),
+            ],
+            true,
+        ) {
+            Ok(value) => value,
+            Err(error) => return g5_error_json(error),
+        };
+        if !app_fields_match(&fields, &["ok", "record"]) || app_field(&fields, "ok") != Some("true")
+        {
+            return g5_error_json("protocol_failure");
+        }
+        let record = match parse_memory_record(app_field(&fields, "record").unwrap_or_default()) {
+            Some(value) if value["category"] == category && value["domain_id"] == domain_id => {
+                value
+            }
+            _ => return g5_error_json("protocol_failure"),
+        };
+        format!(
+            "{{\"ok\":true,\"record\":{}}}",
+            serde_json::to_string(&record).unwrap_or_else(|_| "null".to_owned())
+        )
+    }
+
+    fn g5_memory_edit(
+        &self,
+        category: String,
+        domain_id: String,
+        record_id: String,
+        body: String,
+        expected_revision: u32,
+    ) -> String {
+        if !is_memory_category(&category)
+            || !is_memory_domain(&domain_id)
+            || !is_hex_identifier(&record_id)
+            || !is_memory_body(&body)
+            || expected_revision == 0
+        {
+            return g5_error_json("memory_rejected");
+        }
+        let revision = expected_revision.to_string();
+        let fields = match self.g5_memory_call(
+            APP_MEMORY_EDIT_ROUTE,
+            &[
+                ("category", &category),
+                ("domain_id", &domain_id),
+                ("record_id", &record_id),
+                ("body", &body),
+                ("expected_revision", &revision),
+            ],
+            true,
+        ) {
+            Ok(value) => value,
+            Err(error) => return g5_error_json(error),
+        };
+        if !app_fields_match(&fields, &["ok", "record"]) || app_field(&fields, "ok") != Some("true")
+        {
+            return g5_error_json("protocol_failure");
+        }
+        let record = match parse_memory_record(app_field(&fields, "record").unwrap_or_default()) {
+            Some(value)
+                if value["category"] == category
+                    && value["domain_id"] == domain_id
+                    && value["id"] == record_id
+                    && value["version"].as_u64() == Some(expected_revision as u64 + 1) =>
+            {
+                value
+            }
+            _ => return g5_error_json("protocol_failure"),
+        };
+        format!(
+            "{{\"ok\":true,\"record\":{}}}",
+            serde_json::to_string(&record).unwrap_or_else(|_| "null".to_owned())
+        )
+    }
+
+    fn g5_memory_delete(
+        &self,
+        category: String,
+        domain_id: String,
+        record_id: String,
+        expected_revision: u32,
+    ) -> String {
+        if !is_memory_category(&category)
+            || !is_memory_domain(&domain_id)
+            || !is_hex_identifier(&record_id)
+            || expected_revision == 0
+        {
+            return g5_error_json("memory_rejected");
+        }
+        let revision = expected_revision.to_string();
+        let fields = match self.g5_memory_call(
+            APP_MEMORY_DELETE_ROUTE,
+            &[
+                ("category", &category),
+                ("domain_id", &domain_id),
+                ("record_id", &record_id),
+                ("expected_revision", &revision),
+            ],
+            true,
+        ) {
+            Ok(value) => value,
+            Err(error) => return g5_error_json(error),
+        };
+        if !app_fields_match(
+            &fields,
+            &["ok", "deleted", "deleted_revision", "operation_id"],
+        ) || app_field(&fields, "ok") != Some("true")
+            || app_field(&fields, "deleted") != Some("true")
+            || app_field(&fields, "deleted_revision").and_then(|value| value.parse::<u32>().ok())
+                != Some(expected_revision)
+            || !app_field(&fields, "operation_id").is_some_and(is_lower_hex_sha256)
+        {
+            return g5_error_json("protocol_failure");
+        }
+        "{\"ok\":true,\"deleted\":true}".to_owned()
+    }
+
+    fn g5_memory_export_json(&self) -> Result<String, &'static str> {
+        let _operation = self
+            .g5_operation
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let mut records = Vec::new();
+        for category in MEMORY_EXPORT_CATEGORIES {
+            for domain in MEMORY_EXPORT_DOMAINS {
+                if category == "explicit_capture" && domain != "dom_synthetic_a" {
+                    continue;
+                }
+                for offset in 0..=MAX_MEMORY_EXPORT_RECORDS {
+                    let offset_text = offset.to_string();
+                    let fields = self.g5_memory_call_locked(
+                        APP_MEMORY_PAGE_ROUTE,
+                        &[
+                            ("category", category),
+                            ("domain_id", domain),
+                            ("offset", &offset_text),
+                        ],
+                        false,
+                    )?;
+                    if app_field(&fields, "has_item") == Some("false")
+                        && app_fields_match(&fields, &["ok", "has_item"])
+                        && app_field(&fields, "ok") == Some("true")
+                    {
+                        break;
+                    }
+                    if !app_fields_match(&fields, &["ok", "has_item", "record"])
+                        || app_field(&fields, "ok") != Some("true")
+                        || app_field(&fields, "has_item") != Some("true")
+                    {
+                        return Err("protocol_failure");
+                    }
+                    let record =
+                        parse_memory_record(app_field(&fields, "record").unwrap_or_default())
+                            .filter(|value| {
+                                value["category"] == category && value["domain_id"] == domain
+                            })
+                            .ok_or("protocol_failure")?;
+                    if records.len() == MAX_MEMORY_EXPORT_RECORDS {
+                        return Err("memory_export_limit");
+                    }
+                    records.push(record);
+                    if offset == MAX_MEMORY_EXPORT_RECORDS {
+                        return Err("memory_export_limit");
+                    }
+                }
+            }
+        }
+        serde_json::to_string(&serde_json::json!({
+            "format": "jarvis-local-memory-export",
+            "schema_version": 1,
+            "records": records,
+        }))
+        .map_err(|_| "protocol_failure")
+    }
+
+    fn g5_capture_search(&self, query: String) -> String {
+        let _operation = self
+            .g5_operation
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if query.chars().count() == 0
+            || query.chars().count() > 80
+            || query.chars().any(|character| character.is_control())
+        {
+            return g5_error_json("capture_rejected");
+        }
+        let (instance_id, transport, token, _csrf_token) = match self.g5_credentials_for_active() {
+            Ok(value) => value,
+            Err(error) => return g5_error_json(error),
+        };
+        let body = SecretBytes::new(encode_application_fields(&[
+            ("session_token", token.as_str()),
+            ("query", query.as_str()),
+        ]));
+        let response =
+            match transport.call_g5_application("/v1/app/captures/search", body.as_slice()) {
+                Ok(value) => SecretBytes::new(value),
+                Err(_) => return g5_error_json("transport_failure"),
+            };
+        let fields = match parse_application_response(response.as_slice()) {
+            Ok(value) => value,
+            Err(()) => return g5_error_json("protocol_failure"),
+        };
+        if let Some(error) = app_response_error(&fields) {
+            clear_cached_authorization_after_rejection(
+                &self.shared,
+                &instance_id,
+                &transport,
+                token.as_str(),
+                error,
+            );
+            return g5_error_json(error);
+        }
+        let count = app_field(&fields, "count").and_then(|value| value.parse::<usize>().ok());
+        let Some(count) = count.filter(|value| *value <= 3) else {
+            return g5_error_json("protocol_failure");
+        };
+        if !app_fields_match(&fields, &["ok", "count", "omitted", "items"])
+            || app_field(&fields, "ok") != Some("true")
+        {
+            return g5_error_json("protocol_failure");
+        }
+        let omitted = app_field(&fields, "omitted").and_then(|value| value.parse::<usize>().ok());
+        let Some(omitted) = omitted else {
+            return g5_error_json("protocol_failure");
+        };
+        if count < 3 && omitted != 0 {
+            return g5_error_json("protocol_failure");
+        }
+        let items = app_field(&fields, "items").unwrap_or_default();
+        let Some(parsed) = parse_capture_items(items, count) else {
+            return g5_error_json("protocol_failure");
+        };
+        let mut rendered = String::from("{\"ok\":true,\"captures\":[");
+        for (index, item) in parsed.iter().enumerate() {
+            if index > 0 {
+                rendered.push(',');
+            }
+            rendered.push_str(&format!(
+                "{{\"id\":{},\"text\":{},\"created_at\":{}}}",
+                json_string(&item.0),
+                json_string(&item.2),
+                json_string(&item.1)
+            ));
+        }
+        rendered.push_str(&format!("],\"omitted\":{omitted}}}"));
+        let inner = lock_inner(&self.shared);
+        if !g5_generation_matches(&inner, &instance_id, &transport)
+            || inner
+                .g5_session
+                .as_ref()
+                .is_none_or(|session| session.token.as_str() != token.as_str())
+        {
+            return g5_error_json("stale_generation");
+        }
+        rendered
+    }
+
+    fn g5_capture_open(&self, capture_id: String) -> String {
+        let _operation = self
+            .g5_operation
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if !is_hex_identifier(&capture_id) {
+            return g5_error_json("capture_rejected");
+        }
+        let (instance_id, transport, token, _csrf_token) = match self.g5_credentials_for_active() {
+            Ok(value) => value,
+            Err(error) => return g5_error_json(error),
+        };
+        let body = SecretBytes::new(encode_application_fields(&[
+            ("session_token", token.as_str()),
+            ("capture_id", capture_id.as_str()),
+        ]));
+        let response = match transport.call_g5_application("/v1/app/captures/open", body.as_slice())
+        {
+            Ok(value) => SecretBytes::new(value),
+            Err(_) => return g5_error_json("transport_failure"),
+        };
+        let fields = match parse_application_response(response.as_slice()) {
+            Ok(value) => value,
+            Err(()) => return g5_error_json("protocol_failure"),
+        };
+        if let Some(error) = app_response_error(&fields) {
+            clear_cached_authorization_after_rejection(
+                &self.shared,
+                &instance_id,
+                &transport,
+                token.as_str(),
+                error,
+            );
+            return g5_error_json(error);
+        }
+        if !app_fields_match(
+            &fields,
+            &["ok", "id", "created_at", "domain_id", "category", "text"],
+        ) || app_field(&fields, "ok") != Some("true")
+            || app_field(&fields, "id") != Some(capture_id.as_str())
+            || app_field(&fields, "domain_id") != Some("dom_synthetic_a")
+            || app_field(&fields, "category") != Some("explicit_capture")
+            || !app_field(&fields, "created_at")
+                .is_some_and(|value| parse_rfc3339_micros(value).is_some())
+            || !app_field(&fields, "text").is_some_and(|value| {
+                !value.is_empty()
+                    && value.chars().count() <= 80
+                    && !value.chars().any(|character| character.is_control())
+            })
+        {
+            return g5_error_json("protocol_failure");
+        }
+        let created_at = app_field(&fields, "created_at").unwrap_or_default();
+        let text = app_field(&fields, "text").unwrap_or_default();
+        let result = format!(
+            "{{\"ok\":true,\"origin\":{{\"id\":{},\"text\":{},\"created_at\":{},\"domain_id\":\"dom_synthetic_a\",\"category\":\"explicit_capture\"}}}}",
+            json_string(&capture_id),
+            json_string(text),
+            json_string(created_at)
+        );
+        let inner = lock_inner(&self.shared);
+        if !g5_generation_matches(&inner, &instance_id, &transport)
+            || inner
+                .g5_session
+                .as_ref()
+                .is_none_or(|session| session.token.as_str() != token.as_str())
+        {
+            return g5_error_json("stale_generation");
+        }
+        result
+    }
+
+    fn g5_conversation_ask(&self, conversation_id: String, question: String) -> String {
+        let _operation = self
+            .g5_operation
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if !is_hex_identifier(&conversation_id)
+            || question.is_empty()
+            || question.chars().count() > 400
+            || question.chars().any(char::is_control)
+        {
+            return g5_error_json("capture_rejected");
+        }
+        let (instance_id, transport, token, _csrf_token) = match self.g5_credentials_for_active() {
+            Ok(value) => value,
+            Err(error) => return g5_error_json(error),
+        };
+        let body = SecretBytes::new(encode_application_fields(&[
+            (CONVERSATION_ASK_WIRE_FIELDS[0], token.as_str()),
+            (CONVERSATION_ASK_WIRE_FIELDS[1], conversation_id.as_str()),
+            (CONVERSATION_ASK_WIRE_FIELDS[2], question.as_str()),
+            (CONVERSATION_ASK_WIRE_FIELDS[3], "dom_synthetic_a"),
+        ]));
+        if body.as_slice().len() > MAX_G5_APP_REQUEST_BODY_BYTES {
+            return g5_error_json("capture_rejected");
+        }
+        let response =
+            match transport.call_g5_application("/v1/app/conversation/ask", body.as_slice()) {
+                Ok(value) => SecretBytes::new(value),
+                Err(_) => return g5_error_json("transport_failure"),
+            };
+        let fields = match parse_application_response(response.as_slice()) {
+            Ok(value) => value,
+            Err(()) => return g5_error_json("protocol_failure"),
+        };
+        if let Some(error) = app_response_error(&fields) {
+            clear_cached_authorization_after_rejection(
+                &self.shared,
+                &instance_id,
+                &transport,
+                token.as_str(),
+                error,
+            );
+            return g5_error_json(error);
+        }
+        let expected = [
+            "ok",
+            "status",
+            "reason",
+            "provider_id",
+            "cost",
+            "text",
+            "omitted",
+            "sources",
+        ];
+        if !app_fields_match(&fields, &expected) || app_field(&fields, "ok") != Some("true") {
+            return g5_error_json("protocol_failure");
+        }
+        let status = app_field(&fields, "status").unwrap_or_default();
+        if !matches!(
+            status,
+            "evidence"
+                | "insufficient_basis"
+                | "budget_exhausted"
+                | "context_limit"
+                | "provider_timeout"
+                | "provider_failed"
+                | "cancelled"
+                | "stale_session"
+                | "response_too_large"
+        ) || app_field(&fields, "provider_id") != Some("fake-deterministic")
+            || app_field(&fields, "cost") != Some("unmeasured")
+        {
+            return g5_error_json("protocol_failure");
+        }
+        let omitted = app_field(&fields, "omitted").and_then(|value| value.parse::<usize>().ok());
+        let Some(omitted) = omitted.filter(|value| *value <= 1_000_000) else {
+            return g5_error_json("protocol_failure");
+        };
+        let sources =
+            match parse_grounded_sources(app_field(&fields, "sources").unwrap_or_default()) {
+                Some(value) => value,
+                None => return g5_error_json("protocol_failure"),
+            };
+        let text = app_field(&fields, "text").unwrap_or_default();
+        if (status == "evidence") != (!sources.is_empty() && !text.is_empty())
+            || (status != "evidence" && (!sources.is_empty() || !text.is_empty()))
+            || sources
+                .iter()
+                .map(|item| item.3.as_str())
+                .collect::<Vec<_>>()
+                .join(" | ")
+                != text
+        {
+            return g5_error_json("protocol_failure");
+        }
+        let reason = app_field(&fields, "reason").unwrap_or_default();
+        if reason.len() > 32
+            || !reason
+                .bytes()
+                .all(|byte| byte.is_ascii_lowercase() || byte == b'_')
+        {
+            return g5_error_json("protocol_failure");
+        }
+        let mut sources_json = String::from("[");
+        for (index, (id, kind, domain, snippet)) in sources.iter().enumerate() {
+            if index > 0 {
+                sources_json.push(',');
+            }
+            sources_json.push_str(&format!(
+                "{{\"id\":{},\"kind\":{},\"domain_id\":{},\"snippet\":{}}}",
+                json_string(id),
+                json_string(kind),
+                json_string(domain),
+                json_string(snippet),
+            ));
+        }
+        sources_json.push(']');
+        let rendered = format!(
+            "{{\"ok\":true,\"grounded_read\":{{\"status\":{},\"reason\":{},\"provider_id\":{},\"cost\":{},\"text\":{},\"omitted\":{},\"sources\":{}}}}}",
+            json_string(status), json_string(reason), json_string("fake-deterministic"),
+            json_string("unmeasured"), json_string(text), omitted, sources_json,
+        );
+        if rendered.len() > MAX_G5_APP_RESPONSE_BODY_BYTES {
+            return g5_error_json("protocol_failure");
+        }
+        let inner = lock_inner(&self.shared);
+        if !g5_generation_matches(&inner, &instance_id, &transport)
+            || inner
+                .g5_session
+                .as_ref()
+                .is_none_or(|session| session.token.as_str() != token.as_str())
+        {
+            return g5_error_json("stale_generation");
+        }
+        rendered
+    }
+
+    fn g5_synthetic_document_generate(&self) -> String {
+        let _operation = self
+            .g5_operation
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let (instance_id, transport, token, csrf_token) = match self.g5_credentials_for_active() {
+            Ok(value) => value,
+            Err(error) => return g5_error_json(error),
+        };
+        let body = SecretBytes::new(encode_application_fields(&[
+            ("session_token", token.as_str()),
+            ("csrf_token", csrf_token.as_str()),
+        ]));
+        if body.as_slice().len() > MAX_G5_APP_REQUEST_BODY_BYTES {
+            return g5_error_json("protocol_failure");
+        }
+        let response =
+            match transport.call_g5_application(APP_SYNTHETIC_DOCUMENT_ROUTE, body.as_slice()) {
+                Ok(value) => SecretBytes::new(value),
+                Err(_) => return g5_error_json("transport_failure"),
+            };
+        let fields = match parse_application_response(response.as_slice()) {
+            Ok(value) => value,
+            Err(()) => return g5_error_json("protocol_failure"),
+        };
+        if let Some(error) = app_response_error(&fields) {
+            clear_cached_authorization_after_rejection(
+                &self.shared,
+                &instance_id,
+                &transport,
+                token.as_str(),
+                error,
+            );
+            return g5_error_json(error);
+        }
+        if !app_fields_match(&fields, &["ok", "artifact_json", "artifact_sha256"])
+            || app_field(&fields, "ok") != Some("true")
+        {
+            return g5_error_json("protocol_failure");
+        }
+        let artifact_raw = app_field(&fields, "artifact_json").unwrap_or_default();
+        let artifact_sha256 = app_field(&fields, "artifact_sha256").unwrap_or_default();
+        if !artifact_sha256_matches(artifact_raw.as_bytes(), artifact_sha256) {
+            return g5_error_json("protocol_failure");
+        }
+        let Some(artifact) = parse_synthetic_artifact(artifact_raw) else {
+            return g5_error_json("protocol_failure");
+        };
+        let rendered = serde_json::json!({"ok": true, "artifact": artifact, "artifact_sha256": artifact_sha256}).to_string();
+        if rendered.len() > MAX_G5_APP_RESPONSE_BODY_BYTES {
+            return g5_error_json("protocol_failure");
+        }
         let inner = lock_inner(&self.shared);
         if !g5_generation_matches(&inner, &instance_id, &transport)
             || inner
@@ -1351,6 +2029,128 @@ impl RuntimeManager {
             return g5_error_json("stale_generation");
         }
         result
+    }
+
+    fn g5_conversation_open(&self, mode: String) -> String {
+        let _operation = self
+            .g5_operation
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if !matches!(mode.as_str(), "new" | "resume") {
+            return g5_error_json("capture_rejected");
+        }
+        let (instance_id, transport, token, _) = match self.g5_credentials_for_active() {
+            Ok(value) => value,
+            Err(error) => return g5_error_json(error),
+        };
+        let body = SecretBytes::new(encode_application_fields(&[
+            (CONVERSATION_OPEN_WIRE_FIELDS[0], token.as_str()),
+            (CONVERSATION_OPEN_WIRE_FIELDS[1], "dom_synthetic_a"),
+            (CONVERSATION_OPEN_WIRE_FIELDS[2], mode.as_str()),
+        ]));
+        if body.as_slice().len() > MAX_G5_APP_REQUEST_BODY_BYTES {
+            return g5_error_json("capture_rejected");
+        }
+        let response =
+            match transport.call_g5_application("/v1/app/conversation/open", body.as_slice()) {
+                Ok(value) => SecretBytes::new(value),
+                Err(_) => return g5_error_json("transport_failure"),
+            };
+        let fields = match parse_application_response(response.as_slice()) {
+            Ok(value) => value,
+            Err(()) => return g5_error_json("protocol_failure"),
+        };
+        if let Some(error) = app_response_error(&fields) {
+            clear_cached_authorization_after_rejection(
+                &self.shared,
+                &instance_id,
+                &transport,
+                token.as_str(),
+                error,
+            );
+            return g5_error_json(error);
+        }
+        if !app_fields_match(&fields, &["ok", "conversation_id", "expires_at"])
+            || app_field(&fields, "ok") != Some("true")
+        {
+            return g5_error_json("protocol_failure");
+        }
+        let id = app_field(&fields, "conversation_id").unwrap_or_default();
+        let expires_at = app_field(&fields, "expires_at").unwrap_or_default();
+        if !is_hex_identifier(id)
+            || parse_rfc3339_micros(expires_at)
+                .is_none_or(|expiry| expiry <= unix_time_microseconds())
+        {
+            return g5_error_json("protocol_failure");
+        }
+        let inner = lock_inner(&self.shared);
+        if !g5_generation_matches(&inner, &instance_id, &transport)
+            || inner
+                .g5_session
+                .as_ref()
+                .is_none_or(|session| session.token.as_str() != token.as_str())
+        {
+            return g5_error_json("stale_generation");
+        }
+        format!(
+            "{{\"ok\":true,\"id\":{},\"expires_at\":{}}}",
+            json_string(id),
+            json_string(expires_at)
+        )
+    }
+
+    fn g5_conversation_cancel(&self, conversation_id: String) -> String {
+        if !is_hex_identifier(&conversation_id) {
+            return g5_error_json("capture_rejected");
+        }
+        let (instance_id, transport, token, _) = match self.g5_credentials_for_active() {
+            Ok(value) => value,
+            Err(error) => return g5_error_json(error),
+        };
+        let body = SecretBytes::new(encode_application_fields(&[
+            (CONVERSATION_CANCEL_WIRE_FIELDS[0], token.as_str()),
+            (CONVERSATION_CANCEL_WIRE_FIELDS[1], conversation_id.as_str()),
+            (CONVERSATION_CANCEL_WIRE_FIELDS[2], "dom_synthetic_a"),
+        ]));
+        if body.as_slice().len() > MAX_G5_APP_REQUEST_BODY_BYTES {
+            return g5_error_json("capture_rejected");
+        }
+        let response = match transport
+            .call_g5_application_concurrent("/v1/app/conversation/cancel", body.as_slice())
+        {
+            Ok(value) => SecretBytes::new(value),
+            Err(_) => return g5_error_json("transport_failure"),
+        };
+        let fields = match parse_application_response(response.as_slice()) {
+            Ok(value) => value,
+            Err(()) => return g5_error_json("protocol_failure"),
+        };
+        if let Some(error) = app_response_error(&fields) {
+            clear_cached_authorization_after_rejection(
+                &self.shared,
+                &instance_id,
+                &transport,
+                token.as_str(),
+                error,
+            );
+            return g5_error_json(error);
+        }
+        if !app_fields_match(&fields, &["ok", "cancelled"])
+            || app_field(&fields, "ok") != Some("true")
+            || app_field(&fields, "cancelled") != Some("true")
+        {
+            return g5_error_json("protocol_failure");
+        }
+        let inner = lock_inner(&self.shared);
+        if !g5_generation_matches(&inner, &instance_id, &transport)
+            || inner
+                .g5_session
+                .as_ref()
+                .is_none_or(|session| session.token.as_str() != token.as_str())
+        {
+            return g5_error_json("stale_generation");
+        }
+        "{\"ok\":true,\"cancelled\":true}".to_owned()
     }
 
     fn g5_review_grant_create_confirmed(
@@ -2018,7 +2818,10 @@ impl RuntimeManager {
             kind.as_str(),
             "reminder" | "morning_briefing" | "idea_mission_review"
         ) || !matches!(recurrence.as_str(), "once" | "daily")
-            || title.len() > 96
+        {
+            return g5_error_json("scope_invalid");
+        }
+        if title.len() > 96
             || local_schedule.len() > 16
             || message.len() > 128
             || timezone.len() > 64
@@ -2037,7 +2840,7 @@ impl RuntimeManager {
                     .any(|byte| byte == b'\r' || byte == b'\n' || byte == 0)
             })
         {
-            return g5_error_json("scope_invalid");
+            return g5_error_json("automation_invalid");
         }
         if kind != "reminder" && !confirm_local_sources {
             return g5_error_json("scope_invalid");
@@ -2076,13 +2879,15 @@ impl RuntimeManager {
     }
 
     fn g5_automation_timezone(&self, automation_id: String, timezone: String) -> String {
-        if !is_hex_identifier(&automation_id)
-            || timezone.len() > 64
+        if !is_hex_identifier(&automation_id) {
+            return g5_error_json("scope_invalid");
+        }
+        if timezone.len() > 64
             || timezone
                 .bytes()
                 .any(|byte| matches!(byte, b'\r' | b'\n' | 0))
         {
-            return g5_error_json("scope_invalid");
+            return g5_error_json("automation_invalid");
         }
         let fields = match self.g5_automation_request(
             "/v1/app/automations/timezone",
@@ -2151,6 +2956,7 @@ impl RuntimeManager {
             route,
             APP_WORKFLOW_SUBMIT_ROUTE
                 | APP_WORKFLOW_LIST_ROUTE
+                | APP_WORKFLOW_PAGE_ROUTE
                 | APP_WORKFLOW_DETAIL_ROUTE
                 | APP_WORKFLOW_APPROVE_ROUTE
                 | APP_WORKFLOW_EXECUTE_ROUTE
@@ -2303,6 +3109,28 @@ impl RuntimeManager {
             "{{\"ok\":true,\"tasks\":{}}}",
             serde_json::to_string(&tasks).unwrap_or_else(|_| "[]".to_owned())
         )
+    }
+
+    fn g5_workflow_page(&self, cursor: &str) -> String {
+        if !valid_workflow_cursor(cursor) {
+            return g5_error_json("workflow_failed");
+        }
+        let _operation = self
+            .g5_operation
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let fields = match self.g5_workflow_call_locked(
+            APP_WORKFLOW_PAGE_ROUTE,
+            false,
+            &[("cursor", cursor)],
+        ) {
+            Ok(value) => value,
+            Err(error) => return g5_error_json(error),
+        };
+        match decode_workflow_page(&fields, cursor) {
+            Ok(page) => page.to_string(),
+            Err(()) => g5_error_json("protocol_failure"),
+        }
     }
 
     fn g5_workflow_detail(&self, task_id: &str) -> Result<JsonValue, &'static str> {
@@ -2527,7 +3355,352 @@ impl RuntimeManager {
     }
 
     pub(crate) fn start_on_launch(&self) -> Result<RuntimeSnapshot, ManagerError> {
+        // Database storage starts locked. Only runtime_storage_unlock crosses
+        // the Keychain key through the authenticated UDS application envelope.
         self.start_runtime()
+    }
+
+    fn storage_unlock_native(&self) -> String {
+        let _operation = self
+            .g5_operation
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let Some(database_path) = configured_synthetic_temporary_database() else {
+            return g5_error_json("synthetic_profile_required");
+        };
+        let database_exists = match std::fs::symlink_metadata(&database_path) {
+            Ok(info) if info.file_type().is_file() => true,
+            Ok(_) => return g5_error_json("storage_unlock_failed"),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => false,
+            Err(_) => return g5_error_json("storage_unlock_failed"),
+        };
+        let published = match crate::storage_keychain::published_generation_account(&database_path)
+        {
+            Ok(value) => value,
+            Err(_) => return g5_error_json("storage_rotation_blocked"),
+        };
+        let mut key = if let Some(account) = published {
+            match crate::storage_keychain::load_generation_key(&account) {
+                Ok(Some(key)) => key,
+                Ok(None) => return g5_error_json("keychain_item_missing"),
+                Err(_) => return g5_error_json("keychain_unavailable"),
+            }
+        } else {
+            let loaded = if database_exists {
+                crate::storage_keychain::load_existing_key()
+            } else {
+                crate::storage_keychain::load_or_create_key()
+            };
+            match loaded {
+                Ok(key) => key,
+                Err(crate::storage_keychain::KeychainError::MissingItem) => {
+                    return g5_error_json("keychain_item_missing")
+                }
+                Err(_) => return g5_error_json("keychain_unavailable"),
+            }
+        };
+        let (_instance_id, transport) = match self.active_transport_for_g5() {
+            Ok(value) => value,
+            Err(error) => {
+                key.fill(0);
+                return g5_error_json(error);
+            }
+        };
+        let encoded_key = SecretText::new(key.iter().map(|byte| format!("{byte:02x}")).collect());
+        let body = SecretBytes::new(encode_application_fields(&[(
+            "database_key",
+            encoded_key.as_str(),
+        )]));
+        key.fill(0);
+        let response =
+            match transport.call_g5_application("/v1/app/storage/unlock", body.as_slice()) {
+                Ok(value) => SecretBytes::new(value),
+                Err(_) => return g5_error_json("transport_failure"),
+            };
+        let fields = match parse_application_response(response.as_slice()) {
+            Ok(value) => value,
+            Err(()) => return g5_error_json("protocol_failure"),
+        };
+        if let Some(error) = app_response_error(&fields) {
+            return g5_error_json(error);
+        }
+        if app_fields_match(&fields, &["ok", "state"])
+            && app_field(&fields, "ok") == Some("true")
+            && app_field(&fields, "state") == Some("unlocked")
+        {
+            "{\"ok\":true,\"state\":\"unlocked\"}".to_owned()
+        } else {
+            g5_error_json("protocol_failure")
+        }
+    }
+
+    fn storage_rotate_native(&self) -> String {
+        self.storage_rotate_with(false)
+    }
+
+    fn storage_rotate_begin_native(&self) -> String {
+        self.storage_rotate_with(true)
+    }
+
+    fn storage_rotate_with(&self, explicit_begin: bool) -> String {
+        let _operation = self
+            .g5_operation
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let Some(database_path) = configured_synthetic_temporary_database() else {
+            return g5_error_json("synthetic_profile_required");
+        };
+        let database_exists = match std::fs::symlink_metadata(&database_path) {
+            Ok(info) if info.file_type().is_file() => true,
+            _ => false,
+        };
+        if !database_exists {
+            return g5_error_json("storage_rotation_blocked");
+        }
+        if crate::storage_keychain::authenticated_rotation_marker(&database_path).is_err() {
+            return g5_error_json("storage_rotation_blocked");
+        }
+        let journal_exists = match crate::storage_keychain::rotation_journal_exists(&database_path)
+        {
+            Ok(value) => value,
+            Err(_) => return g5_error_json("storage_rotation_blocked"),
+        };
+        let recovery_present = match crate::storage_keychain::recovery_still_present(&database_path)
+        {
+            Ok(value) => value,
+            Err(_) => return g5_error_json("storage_rotation_blocked"),
+        };
+        let (intent, generation, create_key) = if explicit_begin {
+            if recovery_present {
+                return g5_error_json("storage_rotation_blocked");
+            }
+            if journal_exists
+                && crate::storage_keychain::read_generation_marker(&database_path)
+                    .ok()
+                    .flatten()
+                    .is_none()
+            {
+                return g5_error_json("storage_rotation_blocked");
+            }
+            let generation = match crate::storage_keychain::rotation_generation_name(&database_path)
+            {
+                Ok(value) => value,
+                Err(_) => return g5_error_json("storage_rotation_blocked"),
+            };
+            ("begin", generation, true)
+        } else if recovery_present {
+            let generation =
+                match crate::storage_keychain::in_progress_generation_name(&database_path) {
+                    Ok(value) => value,
+                    Err(_) => return g5_error_json("storage_rotation_blocked"),
+                };
+            ("resume", generation, false)
+        } else if journal_exists {
+            let Some((generation, _)) =
+                (match crate::storage_keychain::read_generation_marker(&database_path) {
+                    Ok(value) => value,
+                    Err(_) => return g5_error_json("storage_rotation_blocked"),
+                })
+            else {
+                return g5_error_json("storage_rotation_blocked");
+            };
+            ("resume", generation, false)
+        } else {
+            let generation = match crate::storage_keychain::rotation_generation_name(&database_path)
+            {
+                Ok(value) => value,
+                Err(_) => return g5_error_json("storage_rotation_blocked"),
+            };
+            ("begin", generation, true)
+        };
+        let operation_id = crate::storage_keychain::operation_id_for(&generation);
+        let (generation, mut key) = match crate::storage_keychain::load_generation_key(&generation)
+        {
+            Ok(Some(key)) => (generation, key),
+            Ok(None) if create_key => {
+                let mut key = match crate::storage_keychain::random_storage_key() {
+                    Ok(value) => value,
+                    Err(_) => return g5_error_json("keychain_unavailable"),
+                };
+                if let Err(error) =
+                    crate::storage_keychain::install_platform_generation(&generation, &key)
+                {
+                    key.fill(0);
+                    let code = match error {
+                        crate::storage_keychain::KeychainError::DuplicateItem => {
+                            "storage_rotation_blocked"
+                        }
+                        crate::storage_keychain::KeychainError::MissingItem => {
+                            "keychain_item_missing"
+                        }
+                        _ => "keychain_unavailable",
+                    };
+                    return g5_error_json(code);
+                }
+                (generation, key)
+            }
+            Ok(None) => return g5_error_json("keychain_item_missing"),
+            Err(_) => return g5_error_json("keychain_unavailable"),
+        };
+        let (_instance_id, transport) = match self.active_transport_for_g5() {
+            Ok(value) => value,
+            Err(error) => {
+                key.fill(0);
+                return g5_error_json(error);
+            }
+        };
+        let encoded_key = SecretText::new(key.iter().map(|byte| format!("{byte:02x}")).collect());
+        key.fill(0);
+        let body = SecretBytes::new(encode_application_fields(&[
+            ("database_key", encoded_key.as_str()),
+            ("generation", generation.as_str()),
+            ("operation_id", operation_id.as_str()),
+            ("intent", intent),
+        ]));
+        let response =
+            match transport.call_g5_application("/v1/app/storage/rotate", body.as_slice()) {
+                Ok(value) => SecretBytes::new(value),
+                Err(_) => return g5_error_json("transport_failure"),
+            };
+        let fields = match parse_application_response(response.as_slice()) {
+            Ok(value) => value,
+            Err(()) => return g5_error_json("protocol_failure"),
+        };
+        if let Some(error) = app_response_error(&fields) {
+            return g5_error_json(error);
+        }
+        if !(app_fields_match(
+            &fields,
+            &["ok", "state", "retire_account", "operation_id", "cleanup"],
+        ) && app_field(&fields, "ok") == Some("true")
+            && matches!(
+                app_field(&fields, "state"),
+                Some("validated" | "committed" | "finalized")
+            )
+            && app_field(&fields, "operation_id") == Some(operation_id.as_str())
+            && matches!(app_field(&fields, "cleanup"), Some("pending" | "complete")))
+        {
+            return g5_error_json("protocol_failure");
+        }
+        let Some(retire_account) = app_field(&fields, "retire_account") else {
+            return g5_error_json("protocol_failure");
+        };
+        let retire_account = retire_account.to_owned();
+        if app_field(&fields, "state") == Some("finalized")
+            || app_field(&fields, "cleanup") == Some("complete")
+        {
+            return "{\"ok\":true,\"state\":\"finalized\"}".to_owned();
+        }
+        if retire_account.is_empty() {
+            return g5_error_json("storage_rotation_blocked");
+        }
+        let retire_body = SecretBytes::new(encode_application_fields(&[(
+            "from_account",
+            retire_account.as_str(),
+        )]));
+        let response = match transport
+            .call_g5_application("/v1/app/storage/rotate-retire", retire_body.as_slice())
+        {
+            Ok(value) => SecretBytes::new(value),
+            Err(_) => return g5_error_json("transport_failure"),
+        };
+        let fields = match parse_application_response(response.as_slice()) {
+            Ok(value) => value,
+            Err(()) => return g5_error_json("protocol_failure"),
+        };
+        if let Some(error) = app_response_error(&fields) {
+            return g5_error_json(error);
+        }
+        if app_fields_match(&fields, &["ok", "state"])
+            && app_field(&fields, "ok") == Some("true")
+            && app_field(&fields, "state") == Some("committed")
+        {
+            if crate::storage_keychain::retire_other_account(&retire_account, &generation).is_err()
+            {
+                return g5_error_json("storage_rotation_blocked");
+            }
+            match crate::storage_keychain::load_generation_key(&retire_account) {
+                Ok(None) => {}
+                Ok(Some(mut still_there)) => {
+                    still_there.fill(0);
+                    return g5_error_json("storage_rotation_blocked");
+                }
+                Err(_) => return g5_error_json("keychain_unavailable"),
+            }
+            let mut active = match crate::storage_keychain::load_generation_key(&generation) {
+                Ok(Some(value)) => value,
+                Ok(None) => return g5_error_json("keychain_item_missing"),
+                Err(_) => return g5_error_json("keychain_unavailable"),
+            };
+            let encoded_active =
+                SecretText::new(active.iter().map(|byte| format!("{byte:02x}")).collect());
+            active.fill(0);
+            let finalize_body = SecretBytes::new(encode_application_fields(&[
+                ("database_key", encoded_active.as_str()),
+                ("operation_id", operation_id.as_str()),
+            ]));
+            let response = match transport
+                .call_g5_application("/v1/app/storage/rotate-finalize", finalize_body.as_slice())
+            {
+                Ok(value) => SecretBytes::new(value),
+                Err(_) => return g5_error_json("transport_failure"),
+            };
+            let fields = match parse_application_response(response.as_slice()) {
+                Ok(value) => value,
+                Err(()) => return g5_error_json("protocol_failure"),
+            };
+            if let Some(error) = app_response_error(&fields) {
+                return g5_error_json(error);
+            }
+            if app_fields_match(&fields, &["ok", "state", "operation_id", "cleanup"])
+                && app_field(&fields, "ok") == Some("true")
+                && app_field(&fields, "state") == Some("finalized")
+                && app_field(&fields, "operation_id") == Some(operation_id.as_str())
+                && app_field(&fields, "cleanup") == Some("complete")
+            {
+                "{\"ok\":true,\"state\":\"finalized\"}".to_owned()
+            } else {
+                g5_error_json("protocol_failure")
+            }
+        } else {
+            g5_error_json("protocol_failure")
+        }
+    }
+
+    fn storage_lock_native(&self) -> String {
+        let _operation = self
+            .g5_operation
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let (instance_id, transport) = match self.active_transport_for_g5() {
+            Ok(value) => value,
+            Err(error) => return g5_error_json(error),
+        };
+        let response = match transport.call_g5_application("/v1/app/storage/lock", b"") {
+            Ok(value) => SecretBytes::new(value),
+            Err(_) => return g5_error_json("transport_failure"),
+        };
+        let fields = match parse_application_response(response.as_slice()) {
+            Ok(value) => value,
+            Err(()) => return g5_error_json("protocol_failure"),
+        };
+        if let Some(error) = app_response_error(&fields) {
+            return g5_error_json(error);
+        }
+        if app_fields_match(&fields, &["ok", "state"])
+            && app_field(&fields, "ok") == Some("true")
+            && app_field(&fields, "state") == Some("locked")
+        {
+            let mut inner = lock_inner(&self.shared);
+            if !g5_generation_matches(&inner, &instance_id, &transport) {
+                return g5_error_json("stale_generation");
+            }
+            inner.g5_session = None;
+            inner.g5_grant = None;
+            "{\"ok\":true,\"state\":\"locked\"}".to_owned()
+        } else {
+            g5_error_json("protocol_failure")
+        }
     }
 
     fn start_runtime(&self) -> Result<RuntimeSnapshot, ManagerError> {
@@ -3076,55 +4249,6 @@ pub fn run_production_supervisor_integration() -> Result<(), &'static str> {
     env::set_var("JARVIS_LOCAL_PASSPHRASE", &passphrase);
     env::set_var("JARVIS_DATABASE_PATH", &database);
 
-    let seed = std::process::Command::new(&python)
-        .arg("-B")
-        .arg("-c")
-        .arg(
-            r#"
-import os
-from datetime import datetime, timedelta, timezone
-from fastapi.testclient import TestClient
-from main import create_app
-from server_config import LocalServerConfig
-app = create_app(LocalServerConfig(), database_path=os.environ['JARVIS_DATABASE_PATH'])
-with TestClient(app, base_url='http://127.0.0.1', client=('127.0.0.1', 50999)) as client:
-    headers = {'origin': 'http://127.0.0.1:3000'}
-    opened = client.post('/real/session', json={'passphrase': os.environ['JARVIS_LOCAL_PASSPHRASE']}, headers=headers)
-    assert opened.status_code == 201
-    csrf = opened.json()['csrf_token']
-    mutation_headers = {**headers, 'x-csrf-token': csrf}
-    grant = client.post('/real/grants', headers=mutation_headers, json={
-        'connector': 'mission_sim', 'permission': 'read', 'resource_ids': ['mission:write'],
-        'domain_ids': ['dom_synthetic_a'],
-        'expires_at': (datetime.now(timezone.utc) + timedelta(days=1)).isoformat(),
-    })
-    assert grant.status_code == 201
-    created = client.post('/real/missions', headers=mutation_headers, json={
-        'title': 'MAC003 synthetic supervisor mission', 'domain_id': 'dom_synthetic_a',
-        'idempotency_key': 'mac003-production-supervisor-seed',
-    })
-    assert created.status_code == 201
-    mission_id = created.json()['mission']['id']
-    stepped = client.post(f'/real/missions/{mission_id}/transition', headers=mutation_headers, json={
-        'action': 'run_next', 'expected_revision': 1,
-        'idempotency_key': f'mac003-production-supervisor-step-{mission_id}',
-    })
-    assert stepped.status_code == 200
-"#
-        )
-        .current_dir(&api_root)
-        .env_clear()
-        .env("JARVIS_LOCAL_PASSPHRASE", &passphrase)
-        .env("JARVIS_DATABASE_PATH", &database)
-        .env("PYTHONDONTWRITEBYTECODE", "1")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map_err(|_| "synthetic database seeder could not start")?;
-    if !seed.success() {
-        return Err("synthetic database seeder failed");
-    }
-
     let manager = RuntimeManager::new();
     let result = (|| {
         let first_start = manager
@@ -3147,6 +4271,31 @@ with TestClient(app, base_url='http://127.0.0.1', client=('127.0.0.1', 50999)) a
         cleanup
             .transport_directories
             .push(first_session.directory_path().to_owned());
+
+        // Exercise the same authenticated UDS bootstrap as the Keychain path.
+        // The fixed value exists only in this synthetic test's process memory.
+        let mut test_key = [0x4a_u8; 32];
+        let mut key_hex = String::with_capacity(test_key.len() * 2);
+        for byte in test_key {
+            use std::fmt::Write as _;
+            write!(&mut key_hex, "{byte:02x}").unwrap();
+        }
+        test_key.fill(0);
+        let key_hex = SecretText::new(key_hex);
+        let unlock_body = SecretBytes::new(encode_application_fields(&[(
+            "database_key",
+            key_hex.as_str(),
+        )]));
+        drop(key_hex);
+        let unlocked = first_session
+            .call_g5_application("/v1/app/storage/unlock", unlock_body.as_slice())
+            .map_err(|_| "synthetic storage unlock did not cross authenticated UDS")?;
+        drop(unlock_body);
+        let unlocked = parse_application_response(&unlocked)
+            .map_err(|_| "synthetic storage unlock response was invalid")?;
+        if app_field(&unlocked, "state") != Some("unlocked") {
+            return Err("synthetic storage unlock did not open the encrypted database");
+        }
 
         let session_open_body = SecretBytes::new(encode_application_fields(&[(
             "passphrase",
@@ -3192,11 +4341,136 @@ with TestClient(app, base_url='http://127.0.0.1', client=('127.0.0.1', 50999)) a
             return Err("explicit mission:read grant creation failed");
         }
         let missions = manager.g5_missions_list();
-        if !missions.contains("MAC003 synthetic supervisor mission")
-            || !missions.contains("\"dataset\":\"api_synthetic\"")
+        if !missions.contains("\"items\":[]") || !missions.contains("\"dataset\":\"api_synthetic\"")
         {
-            return Err("G5 list did not return the synthetic mission");
+            return Err("G5 list did not return the empty synthetic dataset");
         }
+
+        let capture = manager.g5_capture_create("prazo sintetico do processo".to_owned());
+        let capture_id = integration_json_string(&capture, "id")
+            .ok_or("G5 synthetic conversation capture omitted its identifier")?
+            .to_owned();
+        if !capture.contains("\"ok\":true")
+            || !capture.contains("\"domain_id\":\"dom_synthetic_a\"")
+        {
+            return Err("G5 synthetic conversation capture was rejected");
+        }
+        // Memory export stays on the authenticated UDS path; the destination
+        // below models a native selection inside a fresh synthetic directory.
+        let mut categorized = Vec::new();
+        for (category, domain) in [
+            ("confirmed_fact", "dom_synthetic_b"),
+            ("external_evidence", "dom_synthetic_c"),
+            ("inferred_proposal", "dom_synthetic_d"),
+        ] {
+            let created: JsonValue = serde_json::from_str(&manager.g5_memory_create(
+                category.to_owned(),
+                domain.to_owned(),
+                "memória sintética".to_owned(),
+                "synthetic-origin".to_owned(),
+            ))
+            .map_err(|_| "memory create did not return JSON")?;
+            let id = created["record"]["id"]
+                .as_str()
+                .ok_or("memory create omitted record")?
+                .to_owned();
+            categorized.push((category, domain, id));
+        }
+        let exported = manager.g5_memory_export_json()?;
+        let parsed: JsonValue =
+            serde_json::from_str(&exported).map_err(|_| "memory export did not return JSON")?;
+        if parsed["format"] != "jarvis-local-memory-export"
+            || parsed["schema_version"] != 1
+            || parsed.as_object().is_none_or(|object| object.len() != 3)
+            || parsed["records"].as_array().is_none_or(|records| {
+                records.len() != 4
+                    || records
+                        .iter()
+                        .any(|record| parse_memory_record(&record.to_string()).is_none())
+            })
+        {
+            return Err("memory export schema, authorization or origin mismatch");
+        }
+        let allowed = scratch.join("Documents");
+        fs::create_dir(&allowed).map_err(|_| "synthetic export directory failed")?;
+        let allowed = allowed
+            .canonicalize()
+            .map_err(|_| "synthetic export root failed")?;
+        let destination =
+            validate_memory_export_path(&allowed.join("chosen-memory.json"), &allowed)?;
+        write_memory_export(&destination, exported.as_bytes(), false)?;
+        if fs::read_to_string(&destination).map_err(|_| "synthetic export read failed")? != exported
+        {
+            return Err("memory export did not reach the chosen destination");
+        }
+        for (category, domain, id) in categorized {
+            let edited: JsonValue = serde_json::from_str(&manager.g5_memory_edit(
+                category.to_owned(),
+                domain.to_owned(),
+                id.clone(),
+                "memória corrigida".to_owned(),
+                1,
+            ))
+            .map_err(|_| "memory edit response failed")?;
+            if edited["record"]["version"] != 2
+                || !manager
+                    .g5_memory_delete(category.to_owned(), domain.to_owned(), id.clone(), 1)
+                    .contains("\"ok\":false")
+                || manager.g5_memory_delete(category.to_owned(), domain.to_owned(), id, 2)
+                    != "{\"ok\":true,\"deleted\":true}"
+            {
+                return Err("memory revision/delete contract failed across UDS");
+            }
+        }
+        let after: JsonValue = serde_json::from_str(&manager.g5_memory_export_json()?)
+            .map_err(|_| "memory export after deletion failed")?;
+        if after["records"]
+            .as_array()
+            .is_none_or(|records| records.len() != 1)
+            || after["records"][0]["id"] != capture_id
+        {
+            return Err("deleted memory survived in export");
+        }
+        eprintln!("production_supervisor stage=memory_crud_chosen_export_over_uds PASS");
+        let opened_conversation = manager.g5_conversation_open("new".to_owned());
+        let conversation_id = integration_json_string(&opened_conversation, "id")
+            .ok_or("G5 conversation open omitted its opaque identifier")?
+            .to_owned();
+        if !opened_conversation.contains("\"ok\":true")
+            || conversation_id.len() != 32
+            || !conversation_id
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        {
+            return Err("G5 conversation did not open with a server-issued opaque identifier");
+        }
+        let grounded =
+            manager.g5_conversation_ask(conversation_id.clone(), "qual prazo processo".to_owned());
+        if !grounded.contains("\"ok\":true")
+            || !grounded.contains("\"status\":\"evidence\"")
+            || !grounded.contains(&format!("\"id\":{}", json_string(&capture_id)))
+            || !grounded.contains("\"kind\":\"capture\"")
+            || !grounded.contains("\"domain_id\":\"dom_synthetic_a\"")
+            || !grounded.contains("\"snippet\":\"prazo\"")
+            || grounded.len() > MAX_G5_APP_RESPONSE_BODY_BYTES
+        {
+            return Err("Rust conversation IPC path did not render bounded grounded evidence");
+        }
+        let cancelled = manager.g5_conversation_cancel(conversation_id.clone());
+        if cancelled != "{\"ok\":true,\"cancelled\":true}" {
+            return Err("Rust conversation cancellation did not reach the authenticated API");
+        }
+        let insufficient =
+            manager.g5_conversation_ask(conversation_id.clone(), "sem evidencia".to_owned());
+        if !insufficient.contains("\"status\":\"insufficient_basis\"")
+            || !insufficient.contains("\"text\":\"\"")
+            || !insufficient.contains("\"sources\":[]")
+        {
+            return Err("Rust conversation did not preserve the insufficient-basis terminal state");
+        }
+        eprintln!(
+            "production_supervisor stage=authenticated_grounded_conversation_cancel_resume PASS"
+        );
         eprintln!("production_supervisor stage=ready_g5_grant_read_revoke PASS");
 
         if !manager
@@ -3204,6 +4478,9 @@ with TestClient(app, base_url='http://127.0.0.1', client=('127.0.0.1', 50999)) a
             .contains("\"review_grant\":true")
         {
             return Err("explicit mission:review grant creation failed");
+        }
+        if !manager.g5_review_draft().contains("\"queued\":true") {
+            return Err("initial synthetic review draft did not enter the G5 queue");
         }
         let pending = manager.g5_reviews_pending();
         let review_id = integration_json_string(&pending, "id")
@@ -3248,7 +4525,7 @@ with TestClient(app, base_url='http://127.0.0.1', client=('127.0.0.1', 50999)) a
         let direct_probe = run_same_uid_uds_probe(&python, first_session.directory_path())?;
         eprintln!("same_uid_uds_probe={direct_probe}");
         if direct_probe.trim_end()
-            != "health=200;version=200;proof=200;open=404;close=404;grant=404;revoke=404;read=404;review_draft=404;review_detail=404;review_approve=404"
+            != "health=200;version=200;proof=200;open=404;close=404;grant=404;revoke=404;read=404;review_draft=404;review_detail=404;review_approve=404;conversation_open=404;conversation_ask=404;conversation_cancel=404"
         {
             return Err("same-UID direct UDS probe crossed an unexpected authorization boundary");
         }
@@ -3274,14 +4551,40 @@ with TestClient(app, base_url='http://127.0.0.1', client=('127.0.0.1', 50999)) a
             || !manager
                 .g5_session_close()
                 .contains("\"session_active\":false")
-            || !manager
-                .g5_session_open(SecretText::new(passphrase.clone()))
-                .contains("\"session_active\":true")
+        {
+            return Err("closing a session did not clear its active authorization");
+        }
+        if manager.g5_memory_export_json().is_ok() {
+            return Err("closed session retained memory export authority");
+        }
+        let stale_conversation =
+            manager.g5_conversation_ask(conversation_id.clone(), "qual prazo processo".to_owned());
+        if !stale_conversation.contains("\"ok\":false")
+            || stale_conversation.contains("\"status\":\"evidence\"")
+        {
+            return Err("a closed session retained authority to read a conversation");
+        }
+        if !manager
+            .g5_session_open(SecretText::new(passphrase.clone()))
+            .contains("\"session_active\":true")
             || !manager
                 .g5_session_status_json()
                 .contains("\"grant_active\":false")
         {
             return Err("closing and reopening a session did not clear its grant");
+        }
+        let resumed_conversation = manager.g5_conversation_open("resume".to_owned());
+        if integration_json_string(&resumed_conversation, "id") != Some(conversation_id.as_str()) {
+            return Err("encrypted conversation continuity did not resume the opaque identifier");
+        }
+        let resumed_grounded =
+            manager.g5_conversation_ask(conversation_id.clone(), "qual prazo processo".to_owned());
+        if !resumed_grounded.contains("\"status\":\"evidence\"")
+            || !resumed_grounded.contains(&format!("\"id\":{}", json_string(&capture_id)))
+        {
+            return Err(
+                "a newly authenticated session could not resume the conversation read path",
+            );
         }
 
         let first_pid = first_ready
@@ -3563,7 +4866,13 @@ try:
     detail = request("POST", "/v1/app/reviews/detail", b"session_token=fake-session\ndomain_id=dom_synthetic_a\nreview_id=review_12345678\nexpected_revision=1\nexpected_sha256=" + b"a" * 64 + b"\n")
     stage = "review_approve"
     approved = request("POST", "/v1/app/reviews/approve", b"session_token=fake-session\ncsrf_token=fake-csrf\nreview_id=review_12345678\nexpected_revision=1\nexpected_sha256=" + b"a" * 64 + b"\nidempotency_key=desktop-review_12345678-1\nconfirm=approve-local\n")
-    print(f"health={health};version={version};proof={proof};open={opened};close={closed};grant={granted};revoke={revoked};read={listed};review_draft={drafted};review_detail={detail};review_approve={approved}")
+    stage = "conversation_open"
+    conversation_open = request("POST", "/v1/app/conversation/open", b"session_token=fake-session\ndomain_id=dom_synthetic_a\nmode=new\n")
+    stage = "conversation_ask"
+    conversation_ask = request("POST", "/v1/app/conversation/ask", b"session_token=fake-session\nconversation_id=" + b"a" * 32 + b"\nquestion=prazo\ndomain_id=dom_synthetic_a\n")
+    stage = "conversation_cancel"
+    conversation_cancel = request("POST", "/v1/app/conversation/cancel", b"session_token=fake-session\nconversation_id=" + b"a" * 32 + b"\ndomain_id=dom_synthetic_a\n")
+    print(f"health={health};version={version};proof={proof};open={opened};close={closed};grant={granted};revoke={revoked};read={listed};review_draft={drafted};review_detail={detail};review_approve={approved};conversation_open={conversation_open};conversation_ask={conversation_ask};conversation_cancel={conversation_cancel}")
 except Exception as exc:
     print("probe_error=" + type(exc).__name__ + ";stage=" + stage + ";step=" + probe_step)
     raise SystemExit(2)
@@ -4275,6 +5584,7 @@ fn helper_command(
             .arg(api_root.join("serve.py"))
             .arg("--desktop-runtime")
             .arg(instance_id)
+            .env("TMPDIR", env::temp_dir())
             .env("PYTHONUNBUFFERED", "1")
             .env("PYTHONDONTWRITEBYTECODE", "1");
         for name in ["JARVIS_LOCAL_PASSPHRASE", "JARVIS_DATABASE_PATH"] {
@@ -4622,6 +5932,214 @@ fn parse_capture_items(raw: &str, count: usize) -> Option<Vec<(String, String, S
     Some(items)
 }
 
+fn exact_json_keys(value: &JsonValue, expected: &[&str]) -> bool {
+    value.as_object().is_some_and(|object| {
+        object.len() == expected.len() && expected.iter().all(|key| object.contains_key(*key))
+    })
+}
+
+fn parse_synthetic_artifact(raw: &str) -> Option<JsonValue> {
+    if raw.len() > 4096 {
+        return None;
+    }
+    let artifact: JsonValue = serde_json::from_str(raw).ok()?;
+    if !exact_json_keys(
+        &artifact,
+        &[
+            "id",
+            "schema_version",
+            "kind",
+            "title",
+            "sections",
+            "origin",
+            "permission",
+        ],
+    ) || artifact.get("schema_version")?.as_u64()? != 1
+        || artifact.get("kind")?.as_str()? != "synthetic_document"
+        || artifact.get("title")?.as_str()? != "Resumo sintético de exemplo"
+    {
+        return None;
+    }
+    let id = artifact.get("id")?.as_str()?;
+    if id.len() != 20
+        || !id.starts_with("doc_")
+        || !id[4..]
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return None;
+    }
+    let sections = artifact.get("sections")?.as_array()?;
+    if sections.len() != 1
+        || !exact_json_keys(
+            &sections[0],
+            &["index", "heading", "paragraphs", "source_id"],
+        )
+        || sections[0].get("index")?.as_u64()? != 1
+        || sections[0].get("heading")?.as_str()? != "Conteúdo de teste"
+        || sections[0].get("paragraphs")?.as_array()?.as_slice()
+            != [JsonValue::String(
+                "Este documento contém somente texto sintético local.".to_owned(),
+            )]
+        || sections[0].get("source_id")?.as_str()? != "src_exemplo_sintetico"
+    {
+        return None;
+    }
+    let origin = artifact.get("origin")?;
+    if !exact_json_keys(
+        origin,
+        &[
+            "skill_id",
+            "skill_version",
+            "manifest_sha256",
+            "license_name",
+        ],
+    ) || origin.get("skill_id")?.as_str()? != "generate-synthetic-document"
+        || origin.get("skill_version")?.as_str()? != "1.0.0"
+        || origin.get("license_name")?.as_str()? != "nao-declarada-no-arquivo-local"
+        || !origin
+            .get("manifest_sha256")?
+            .as_str()?
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        || origin.get("manifest_sha256")?.as_str()?.len() != 64
+    {
+        return None;
+    }
+    let permission = artifact.get("permission")?;
+    if !exact_json_keys(permission, &["capability", "scope", "principal"])
+        || permission.get("capability")?.as_str()? != "generate_synthetic_document"
+        || permission.get("scope")?.as_str()? != "synthetic"
+        || permission.get("principal")?.as_str()? != "owner"
+    {
+        return None;
+    }
+    Some(artifact)
+}
+
+fn parse_grounded_sources(raw: &str) -> Option<Vec<(String, String, String, String)>> {
+    if raw.is_empty() {
+        return Some(Vec::new());
+    }
+    let lines: Vec<&str> = raw.split('\n').collect();
+    if lines.len() > 3 {
+        return None;
+    }
+    let mut sources = Vec::with_capacity(lines.len());
+    for line in lines {
+        let fields: Vec<&str> = line.split('\t').collect();
+        if fields.len() != 4 {
+            return None;
+        }
+        let [id, kind, domain, snippet] = <[&str; 4]>::try_from(fields).ok()?;
+        let valid_id = is_hex_identifier(id)
+            || (!id.is_empty()
+                && id.len() <= 32
+                && id.bytes().all(|b| {
+                    b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'_' | b'-')
+                }));
+        if !valid_id
+            || !matches!(kind, "capture" | "confirmed_fact" | "document")
+            || domain != "dom_synthetic_a"
+            || snippet.is_empty()
+            || snippet.chars().count() > 4096
+            || snippet.chars().any(char::is_control)
+        {
+            return None;
+        }
+        sources.push((
+            id.to_owned(),
+            kind.to_owned(),
+            domain.to_owned(),
+            snippet.to_owned(),
+        ));
+    }
+    Some(sources)
+}
+
+#[cfg(test)]
+mod grounded_source_contract_tests {
+    use super::{
+        artifact_sha256_matches, encode_application_fields, parse_grounded_sources,
+        parse_synthetic_artifact, sha256_hex,
+    };
+
+    #[test]
+    fn citations_require_closed_synthetic_provenance() {
+        let parsed = parse_grounded_sources(
+            "0123456789abcdef0123456789abcdef\tcapture\tdom_synthetic_a\tprazo",
+        )
+        .unwrap();
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].3, "prazo");
+        assert_eq!(
+            parse_grounded_sources(
+                "0123456789abcdef0123456789abcdef\tconfirmed_fact\tdom_synthetic_a\testoque"
+            )
+            .unwrap()[0]
+                .1,
+            "confirmed_fact"
+        );
+        assert!(parse_grounded_sources("doc-1\tdocument\tdom_synthetic_b\tprazo").is_none());
+        assert!(parse_grounded_sources("doc-1\ttool\tdom_synthetic_a\tprazo").is_none());
+        assert!(
+            parse_grounded_sources("doc-1\tdocument\tdom_synthetic_a\tlinha\ninjetada").is_none()
+        );
+    }
+
+    #[test]
+    fn synthetic_artifact_requires_exact_validated_origin_and_permission() {
+        let good = serde_json::json!({
+            "id": "doc_0123456789abcdef",
+            "schema_version": 1,
+            "kind": "synthetic_document",
+            "title": "Resumo sintético de exemplo",
+            "sections": [{
+                "index": 1,
+                "heading": "Conteúdo de teste",
+                "paragraphs": ["Este documento contém somente texto sintético local."],
+                "source_id": "src_exemplo_sintetico"
+            }],
+            "origin": {
+                "skill_id": "generate-synthetic-document",
+                "skill_version": "1.0.0",
+                "manifest_sha256": "a".repeat(64),
+                "license_name": "nao-declarada-no-arquivo-local"
+            },
+            "permission": {
+                "capability": "generate_synthetic_document",
+                "scope": "synthetic",
+                "principal": "owner"
+            }
+        });
+        assert!(parse_synthetic_artifact(&good.to_string()).is_some());
+        let mut extra = good.clone();
+        extra["execute"] = serde_json::json!(true);
+        assert!(parse_synthetic_artifact(&extra.to_string()).is_none());
+        let mut wrong_scope = good.clone();
+        wrong_scope["permission"]["scope"] = serde_json::json!("external");
+        assert!(parse_synthetic_artifact(&wrong_scope.to_string()).is_none());
+        assert!(parse_synthetic_artifact(&"x".repeat(4097)).is_none());
+        let wire = encode_application_fields(&[
+            ("session_token", "synthetic-session"),
+            ("csrf_token", "synthetic-csrf"),
+        ]);
+        assert_eq!(
+            std::str::from_utf8(&wire).unwrap(),
+            "session_token=synthetic-session\ncsrf_token=synthetic-csrf\n"
+        );
+    }
+
+    #[test]
+    fn artifact_hash_is_recomputed_and_mismatch_is_rejected() {
+        let raw = br#"{"kind":"synthetic_document"}"#;
+        let digest = sha256_hex(raw);
+        assert!(artifact_sha256_matches(raw, &digest));
+        assert!(!artifact_sha256_matches(raw, &"0".repeat(64)));
+        assert!(!artifact_sha256_matches(raw, "not-a-digest"));
+    }
+}
+
 fn days_from_civil(year: i32, month: u32, day: u32) -> Option<i64> {
     if !(1..=12).contains(&month) || day == 0 || day > 31 {
         return None;
@@ -4717,9 +6235,31 @@ fn native_g5_secret_from_output(output: &[u8]) -> Result<SecretText, &'static st
     Ok(SecretText::new(secret.to_owned()))
 }
 
+fn configured_synthetic_temporary_database() -> Option<PathBuf> {
+    let configured = env::var_os("JARVIS_DATABASE_PATH")?;
+    let path = PathBuf::from(configured);
+    synthetic_temporary_database_path(&path, &env::temp_dir())
+}
+
+fn synthetic_temporary_database_path(path: &Path, temporary_root: &Path) -> Option<PathBuf> {
+    let file_name = path.file_name()?.to_os_string();
+    let parent = path.parent()?.canonicalize().ok()?;
+    let temporary_root = temporary_root.canonicalize().ok()?;
+    if !parent.starts_with(temporary_root) {
+        return None;
+    }
+    Some(parent.join(file_name))
+}
+
 fn g5_error_json(code: &str) -> String {
     let message = match code {
         "runtime_unavailable" => "O runtime local autenticado não está pronto.",
+        "keychain_unavailable" => "Não foi possível acessar a chave local no Keychain.",
+        "keychain_item_missing" => "A chave deste banco não está no Keychain; o arquivo foi preservado.",
+        "synthetic_profile_required" => "Configure um banco sintético novo dentro de um diretório temporário.",
+        "storage_unlock_failed" => "O banco local não pôde ser desbloqueado.",
+        "storage_rotation_blocked" => "A rotação da chave foi recusada. O banco anterior permanece preservado.",
+        "storage_locked" => "Desbloqueie o armazenamento local para continuar.",
         "credential_rejected" => "Credencial local recusada ou não configurada.",
         "session_required" => "Abra novamente a sessão G5 local.",
         "session_already_open" => "Já existe uma sessão G5 aberta neste runtime.",
@@ -4735,6 +6275,28 @@ fn g5_error_json(code: &str) -> String {
         "native_input_unavailable" => "A entrada nativa segura não está disponível neste sistema.",
         "capture_rejected" => {
             "A captura local foi recusada. Use até 80 caracteres, sem quebra de linha."
+        }
+        "memory_rejected" => "O item de memória ou domínio não atende às regras locais.",
+        "memory_conflict" => "O item mudou desde a última leitura. Atualize a lista antes de tentar novamente.",
+        "memory_export_path_rejected" => "Escolha um arquivo JSON dentro da pasta Documentos, sem links ou colisões inseguras.",
+        "memory_export_overwrite_required" => "Confirme a sobrescrita do arquivo escolhido.",
+        "memory_export_cancelled" => "A exportação foi cancelada; nenhum arquivo foi gravado.",
+        "memory_export_limit" => "A exportação excede o limite local de registros.",
+        "memory_export_failed" => "A exportação local não pôde ser gravada.",
+        "automation_invalid" => {
+            "O agendamento local foi recusado. Confira horário, fuso e campos informados."
+        }
+        "automation_not_found" => {
+            "O agendamento ou a execução local não está disponível. Atualize a lista."
+        }
+        "automation_limit" => {
+            "O limite local de três agendamentos foi atingido. Apague um agendamento antes de criar outro."
+        }
+        "automation_conflict" => {
+            "O estado deste agendamento ou execução mudou. Atualize a lista antes de tentar novamente."
+        }
+        "authorization_required" => {
+            "O briefing ou a revisão exige consentimento das fontes e uma concessão de leitura ativa."
         }
         "workflow_failed" => "A tarefa local foi recusada ou não pôde ser concluída.",
         "tool_blocked" => "Esta ferramenta permanece bloqueada por política local.",
@@ -4870,6 +6432,13 @@ fn app_response_error(fields: &[(String, SecretText)]) -> Option<&'static str> {
         "grant_expired" => "grant_expired",
         "operation_failed" => "operation_failed",
         "capture_rejected" => "capture_rejected",
+        "memory_rejected" => "memory_rejected",
+        "memory_conflict" => "memory_conflict",
+        "automation_invalid" => "automation_invalid",
+        "automation_not_found" => "automation_not_found",
+        "automation_limit" => "automation_limit",
+        "automation_conflict" => "automation_conflict",
+        "authorization_required" => "authorization_required",
         "recommendation_rejected"
         | "tool_blocked"
         | "schema_rejected"
@@ -4890,6 +6459,9 @@ fn app_response_error(fields: &[(String, SecretText)]) -> Option<&'static str> {
         | "result_corrupt"
         | "retry_exhausted"
         | "timeout"
+        | "storage_locked"
+        | "storage_unlock_failed"
+        | "storage_rotation_blocked"
         | "workflow_rejected" => "workflow_failed",
         _ => "protocol_failure",
     })
@@ -4923,6 +6495,222 @@ fn is_lower_hex_sha256(value: &str) -> bool {
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
+fn sha256_hex(bytes: &[u8]) -> String {
+    Sha256::digest(bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn artifact_sha256_matches(bytes: &[u8], expected: &str) -> bool {
+    is_lower_hex_sha256(expected) && sha256_hex(bytes) == expected
+}
+
+fn is_memory_category(value: &str) -> bool {
+    MEMORY_EXPORT_CATEGORIES.contains(&value)
+}
+
+fn is_memory_domain(value: &str) -> bool {
+    MEMORY_EXPORT_DOMAINS.contains(&value)
+}
+
+fn is_memory_body(value: &str) -> bool {
+    !value.is_empty() && value.chars().count() <= 80 && !value.chars().any(char::is_control)
+}
+
+fn is_memory_source_ref(value: &str) -> bool {
+    (1..=64).contains(&value.len())
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+}
+
+fn parse_memory_record(raw: &str) -> Option<JsonValue> {
+    let value: JsonValue = serde_json::from_str(raw).ok()?;
+    let object = value.as_object()?;
+    let expected = [
+        "id",
+        "category",
+        "domain_id",
+        "body",
+        "source_kind",
+        "source_ref",
+        "version",
+        "recorded_at",
+        "revised_at",
+    ];
+    if object.len() != expected.len() || expected.iter().any(|field| !object.contains_key(*field)) {
+        return None;
+    }
+    let string = |key: &str| value.get(key)?.as_str();
+    let id = string("id")?;
+    let category = string("category")?;
+    let domain = string("domain_id")?;
+    let body = string("body")?;
+    let source_kind = string("source_kind")?;
+    let source_ref = string("source_ref")?;
+    let recorded = string("recorded_at")?;
+    let revised = string("revised_at")?;
+    let version = value.get("version")?.as_u64()?;
+    if !is_hex_identifier(id)
+        || !is_memory_category(category)
+        || !is_memory_domain(domain)
+        || !is_memory_body(body)
+        || version == 0
+        || version > u32::MAX as u64
+        || parse_rfc3339_micros(recorded).is_none()
+        || parse_rfc3339_micros(revised).is_none()
+        || !is_memory_source_ref(source_ref)
+    {
+        return None;
+    }
+    let expected_kind = match category {
+        "explicit_capture" if domain == "dom_synthetic_a" => "user_authored_capture",
+        "confirmed_fact" => "owner_confirmation",
+        "external_evidence" => "synthetic_source",
+        "inferred_proposal" => "assistant_inference",
+        _ => return None,
+    };
+    if source_kind != expected_kind
+        || (category == "explicit_capture" && source_ref != "explicit_capture")
+    {
+        return None;
+    }
+    Some(value)
+}
+
+fn validate_memory_export_path(path: &Path, allowed_root: &Path) -> Result<PathBuf, &'static str> {
+    if !path.is_absolute() || path.extension().and_then(|value| value.to_str()) != Some("json") {
+        return Err("memory_export_path_rejected");
+    }
+    let file_name = path.file_name().ok_or("memory_export_path_rejected")?;
+    if file_name.to_string_lossy().is_empty() || file_name.to_string_lossy().contains('\0') {
+        return Err("memory_export_path_rejected");
+    }
+    let root = allowed_root
+        .canonicalize()
+        .map_err(|_| "memory_export_path_rejected")?;
+    let parent = path.parent().ok_or("memory_export_path_rejected")?;
+    let canonical_parent = parent
+        .canonicalize()
+        .map_err(|_| "memory_export_path_rejected")?;
+    if parent != canonical_parent || !canonical_parent.starts_with(&root) {
+        return Err("memory_export_path_rejected");
+    }
+    let relative = canonical_parent
+        .strip_prefix(&root)
+        .map_err(|_| "memory_export_path_rejected")?;
+    let mut current = root.clone();
+    for component in relative.components() {
+        current.push(component);
+        let info = fs::symlink_metadata(&current).map_err(|_| "memory_export_path_rejected")?;
+        if info.file_type().is_symlink() || !info.is_dir() {
+            return Err("memory_export_path_rejected");
+        }
+    }
+    let destination = canonical_parent.join(file_name);
+    match fs::symlink_metadata(&destination) {
+        Ok(info) if info.file_type().is_symlink() || !info.is_file() || info.nlink() != 1 => {
+            Err("memory_export_path_rejected")
+        }
+        Ok(_) => Ok(destination),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(destination),
+        Err(_) => Err("memory_export_path_rejected"),
+    }
+}
+
+static NEXT_MEMORY_EXPORT_TEMP: AtomicU64 = AtomicU64::new(1);
+
+fn write_memory_export(
+    destination: &Path,
+    contents: &[u8],
+    overwrite_confirmed: bool,
+) -> Result<(), &'static str> {
+    let parent = destination.parent().ok_or("memory_export_path_rejected")?;
+    let original = match fs::symlink_metadata(destination) {
+        Ok(info) if info.is_file() && !info.file_type().is_symlink() && info.nlink() == 1 => {
+            if !overwrite_confirmed {
+                return Err("memory_export_overwrite_required");
+            }
+            Some((info.dev(), info.ino()))
+        }
+        Ok(_) => return Err("memory_export_path_rejected"),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+        Err(_) => return Err("memory_export_path_rejected"),
+    };
+    let temporary = loop {
+        let sequence = NEXT_MEMORY_EXPORT_TEMP.fetch_add(1, Ordering::Relaxed);
+        let candidate = parent.join(format!(
+            ".jarvis-memory-export-{}-{sequence}.pending",
+            std::process::id()
+        ));
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&candidate)
+        {
+            Ok(mut file) => {
+                let result = (|| {
+                    file.write_all(contents)
+                        .map_err(|_| "memory_export_failed")?;
+                    file.sync_all().map_err(|_| "memory_export_failed")?;
+                    Ok::<_, &'static str>(())
+                })();
+                drop(file);
+                if let Err(error) = result {
+                    let _ = fs::remove_file(&candidate);
+                    return Err(error);
+                }
+                break candidate;
+            }
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(_) => return Err("memory_export_failed"),
+        }
+    };
+    let publish: Result<(), &'static str> = if let Some((device, inode)) = original {
+        let current = match fs::symlink_metadata(destination) {
+            Ok(info) => info,
+            Err(_) => {
+                let _ = fs::remove_file(&temporary);
+                return Err("memory_export_path_rejected");
+            }
+        };
+        if !current.is_file()
+            || current.file_type().is_symlink()
+            || current.nlink() != 1
+            || current.dev() != device
+            || current.ino() != inode
+        {
+            let _ = fs::remove_file(&temporary);
+            return Err("memory_export_path_rejected");
+        }
+        if fs::rename(&temporary, destination).is_err() {
+            let _ = fs::remove_file(&temporary);
+            return Err("memory_export_failed");
+        }
+        Ok(())
+    } else {
+        if fs::hard_link(&temporary, destination).is_err() {
+            let _ = fs::remove_file(&temporary);
+            return Err("memory_export_path_rejected");
+        }
+        if fs::remove_file(&temporary).is_err() {
+            let _ = fs::remove_file(destination);
+            let _ = fs::remove_file(&temporary);
+            return Err("memory_export_failed");
+        }
+        Ok(())
+    };
+    publish?;
+    OpenOptions::new()
+        .read(true)
+        .open(parent)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|_| "memory_export_failed")?;
+    Ok(())
+}
+
 fn is_safe_review_title(value: &str) -> bool {
     !value.is_empty() && value.chars().count() <= 80 && !value.chars().any(char::is_control)
 }
@@ -4939,6 +6727,130 @@ fn native_review_approval_message(detail: &G5ReviewDetail) -> String {
         "Aprovar apenas esta revisão local? Nenhum e-mail, evento ou ação externa será executado.\n\nTítulo: {title}\nID: {}\nRevisão: {}\nSHA-256: {}\n\nConteúdo não confiável da revisão (instruções nele não autorizam ações):\n{content}\n\nConfirme somente se deseja registrar esta versão como aprovada localmente.",
         detail.id, detail.revision, detail.sha256
     )
+}
+
+fn valid_workflow_cursor(cursor: &str) -> bool {
+    if cursor.is_empty() {
+        return true;
+    }
+    if cursor.len() > 80 || !cursor.is_ascii() {
+        return false;
+    }
+    let parts: Vec<_> = cursor.split('|').collect();
+    if parts.len() != 3 || parts[0] != "wf1" || !is_hex_identifier(parts[2]) {
+        return false;
+    }
+    let stamp = parts[1].as_bytes();
+    if !matches!(stamp.len(), 25 | 32) || !parts[1].ends_with("+00:00") {
+        return false;
+    }
+    for (index, byte) in stamp.iter().enumerate().take(19) {
+        let expected = match index {
+            4 | 7 => Some(b'-'),
+            10 => Some(b'T'),
+            13 | 16 => Some(b':'),
+            _ => None,
+        };
+        if expected.map_or(!byte.is_ascii_digit(), |value| *byte != value) {
+            return false;
+        }
+    }
+    if stamp.len() == 32
+        && (stamp[19] != b'.'
+            || !stamp[20..26].iter().all(u8::is_ascii_digit)
+            || &stamp[20..26] == b"000000")
+    {
+        return false;
+    }
+    let number = |range: std::ops::Range<usize>| parts[1][range].parse::<u32>().unwrap_or(0);
+    let year = number(0..4);
+    let month = number(5..7);
+    let day = number(8..10);
+    let days = match month {
+        4 | 6 | 9 | 11 => 30,
+        2 if year % 4 == 0 && (year % 100 != 0 || year % 400 == 0) => 29,
+        2 => 28,
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        _ => 0,
+    };
+    year > 0
+        && day > 0
+        && day <= days
+        && number(11..13) < 24
+        && number(14..16) < 60
+        && number(17..19) < 60
+}
+
+fn decode_workflow_page(fields: &[(String, SecretText)], requested: &str) -> Result<JsonValue, ()> {
+    if !valid_workflow_cursor(requested)
+        || !app_fields_match(fields, &["ok", "tasks_json", "next_cursor"])
+        || app_field(fields, "ok") != Some("true")
+    {
+        return Err(());
+    }
+    let tasks: JsonValue =
+        serde_json::from_str(app_field(fields, "tasks_json").ok_or(())?).map_err(|_| ())?;
+    let items = tasks.as_array().ok_or(())?;
+    let next = app_field(fields, "next_cursor").ok_or(())?;
+    if items.len() > 4 || !valid_workflow_cursor(next) || (!next.is_empty() && items.is_empty()) {
+        return Err(());
+    }
+    let mut previous = if requested.is_empty() {
+        None
+    } else {
+        let parts: Vec<_> = requested.split('|').collect();
+        Some((parts[1].to_owned(), parts[2].to_owned()))
+    };
+    let mut last_cursor = String::new();
+    for item in items {
+        let object = item.as_object().ok_or(())?;
+        let keys = [
+            "task_id",
+            "tool_id",
+            "state",
+            "arguments_sha",
+            "created_at",
+            "updated_at",
+            "risk",
+            "expected_effect",
+        ];
+        if object.len() != keys.len() || keys.iter().any(|key| !object.contains_key(*key)) {
+            return Err(());
+        }
+        let text = |key: &str| item.get(key).and_then(JsonValue::as_str).ok_or(());
+        let id = text("task_id")?;
+        let stamp = text("created_at")?;
+        last_cursor = format!("wf1|{stamp}|{id}");
+        if !valid_workflow_cursor(&last_cursor)
+            || !is_lower_hex_sha256(text("arguments_sha")?)
+            || parse_rfc3339_micros(text("updated_at")?).is_none()
+            || !matches!(text("tool_id")?, "draft_note" | "simulate_action")
+            || !matches!(
+                text("state")?,
+                "proposed"
+                    | "awaiting_approval"
+                    | "paused"
+                    | "running"
+                    | "interrupted"
+                    | "succeeded"
+                    | "failed"
+                    | "cancelled"
+            )
+            || !matches!(text("risk")?, "low" | "medium")
+        {
+            return Err(());
+        }
+        text("expected_effect")?;
+        let key = (stamp.to_owned(), id.to_owned());
+        if previous.as_ref().is_some_and(|prior| &key >= prior) {
+            return Err(());
+        }
+        previous = Some(key);
+    }
+    if !next.is_empty() && next != last_cursor {
+        return Err(());
+    }
+    Ok(serde_json::json!({"ok":true, "tasks":tasks, "next_cursor":next}))
 }
 
 fn workflow_idempotency_key() -> String {
@@ -5419,6 +7331,26 @@ pub fn runtime_transport_probe(manager: tauri::State<'_, RuntimeManager>) -> Str
 }
 
 #[tauri::command]
+pub fn runtime_storage_unlock(manager: tauri::State<'_, RuntimeManager>) -> String {
+    manager.storage_unlock_native()
+}
+
+#[tauri::command]
+pub fn runtime_storage_rotate(manager: tauri::State<'_, RuntimeManager>) -> String {
+    manager.storage_rotate_native()
+}
+
+#[tauri::command]
+pub fn runtime_storage_rotate_begin(manager: tauri::State<'_, RuntimeManager>) -> String {
+    manager.storage_rotate_begin_native()
+}
+
+#[tauri::command]
+pub fn runtime_storage_lock(manager: tauri::State<'_, RuntimeManager>) -> String {
+    manager.storage_lock_native()
+}
+
+#[tauri::command]
 pub fn g5_session_status(manager: tauri::State<'_, RuntimeManager>) -> String {
     manager.g5_session_status_json()
 }
@@ -5459,6 +7391,43 @@ pub fn g5_capture_list(manager: tauri::State<'_, RuntimeManager>) -> String {
 }
 
 #[tauri::command]
+pub fn g5_capture_search(manager: tauri::State<'_, RuntimeManager>, query: String) -> String {
+    manager.g5_capture_search(query)
+}
+
+#[tauri::command]
+pub fn g5_capture_open(manager: tauri::State<'_, RuntimeManager>, capture_id: String) -> String {
+    manager.g5_capture_open(capture_id)
+}
+
+#[tauri::command]
+pub fn g5_conversation_ask(
+    manager: tauri::State<'_, RuntimeManager>,
+    conversation_id: String,
+    question: String,
+) -> String {
+    manager.g5_conversation_ask(conversation_id, question)
+}
+
+#[tauri::command]
+pub fn g5_conversation_open(manager: tauri::State<'_, RuntimeManager>, mode: String) -> String {
+    manager.g5_conversation_open(mode)
+}
+
+#[tauri::command]
+pub fn g5_conversation_cancel(
+    manager: tauri::State<'_, RuntimeManager>,
+    conversation_id: String,
+) -> String {
+    manager.g5_conversation_cancel(conversation_id)
+}
+
+#[tauri::command]
+pub fn g5_synthetic_document_generate(manager: tauri::State<'_, RuntimeManager>) -> String {
+    manager.g5_synthetic_document_generate()
+}
+
+#[tauri::command]
 pub fn g5_capture_clear(manager: tauri::State<'_, RuntimeManager>) -> String {
     manager.g5_capture_clear()
 }
@@ -5475,6 +7444,126 @@ pub fn g5_capture_edit(
 #[tauri::command]
 pub fn g5_capture_delete(manager: tauri::State<'_, RuntimeManager>, capture_id: String) -> String {
     manager.g5_capture_delete(capture_id)
+}
+
+#[tauri::command]
+pub fn g5_memory_page(
+    manager: tauri::State<'_, RuntimeManager>,
+    category: String,
+    domain_id: String,
+    offset: usize,
+) -> String {
+    manager.g5_memory_page(category, domain_id, offset)
+}
+
+#[tauri::command]
+pub fn g5_memory_create(
+    manager: tauri::State<'_, RuntimeManager>,
+    category: String,
+    domain_id: String,
+    body: String,
+    source_ref: String,
+) -> String {
+    manager.g5_memory_create(category, domain_id, body, source_ref)
+}
+
+#[tauri::command]
+pub fn g5_memory_edit(
+    manager: tauri::State<'_, RuntimeManager>,
+    category: String,
+    domain_id: String,
+    record_id: String,
+    body: String,
+    expected_revision: u32,
+) -> String {
+    manager.g5_memory_edit(category, domain_id, record_id, body, expected_revision)
+}
+
+#[tauri::command]
+pub fn g5_memory_delete(
+    manager: tauri::State<'_, RuntimeManager>,
+    category: String,
+    domain_id: String,
+    record_id: String,
+    expected_revision: u32,
+) -> String {
+    manager.g5_memory_delete(category, domain_id, record_id, expected_revision)
+}
+
+#[tauri::command]
+pub async fn g5_memory_export(app: tauri::AppHandle) -> String {
+    {
+        let manager = app.state::<RuntimeManager>();
+        if let Err(error) = manager.g5_credentials_for_active() {
+            return g5_error_json(error);
+        }
+    }
+    let documents = match app.path().document_dir() {
+        Ok(path) => path,
+        Err(_) => return g5_error_json("memory_export_path_rejected"),
+    };
+    let allowed_root = match documents.canonicalize() {
+        Ok(path) => path,
+        Err(_) => return g5_error_json("memory_export_path_rejected"),
+    };
+    let dialog = app
+        .dialog()
+        .file()
+        .set_directory(&allowed_root)
+        .set_file_name("jarvis-memoria-local.json")
+        .add_filter("JSON", &["json"]);
+    let selected =
+        match tauri::async_runtime::spawn_blocking(move || dialog.blocking_save_file()).await {
+            Ok(Some(path)) => path,
+            Ok(None) => return g5_error_json("memory_export_cancelled"),
+            Err(_) => return g5_error_json("memory_export_failed"),
+        };
+    let selected = match selected.into_path() {
+        Ok(path) => path,
+        Err(_) => return g5_error_json("memory_export_path_rejected"),
+    };
+    let destination = match validate_memory_export_path(&selected, &allowed_root) {
+        Ok(path) => path,
+        Err(error) => return g5_error_json(error),
+    };
+    let overwrite = match fs::symlink_metadata(&destination) {
+        Ok(_) => {
+            let name = destination
+                .file_name()
+                .and_then(|value| value.to_str())
+                .unwrap_or("arquivo escolhido");
+            let dialog = app
+                .dialog()
+                .message(format!(
+                    "O arquivo {name} já existe. Deseja substituí-lo pela exportação local?"
+                ))
+                .title("Confirmar sobrescrita")
+                .kind(MessageDialogKind::Warning)
+                .buttons(MessageDialogButtons::OkCancelCustom(
+                    "Sobrescrever arquivo".to_owned(),
+                    "Cancelar".to_owned(),
+                ));
+            tauri::async_runtime::spawn_blocking(move || dialog.blocking_show())
+                .await
+                .unwrap_or(false)
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => false,
+        Err(_) => return g5_error_json("memory_export_path_rejected"),
+    };
+    if destination.exists() && !overwrite {
+        return g5_error_json("memory_export_cancelled");
+    }
+    let export = {
+        let manager = app.state::<RuntimeManager>();
+        match manager.g5_memory_export_json() {
+            Ok(value) => value,
+            Err(error) => return g5_error_json(error),
+        }
+    };
+    match write_memory_export(&destination, export.as_bytes(), overwrite) {
+        Ok(()) => "{\"ok\":true,\"exported\":true}".to_owned(),
+        Err(error) => g5_error_json(error),
+    }
 }
 
 #[tauri::command]
@@ -5560,6 +7649,11 @@ pub fn g5_workflow_submit_simulation(
             "payload": {"subject": subject, "body": body}
         }),
     )
+}
+
+#[tauri::command]
+pub fn g5_workflow_page(manager: tauri::State<'_, RuntimeManager>, cursor: String) -> String {
+    manager.g5_workflow_page(&cursor)
 }
 
 #[tauri::command]
@@ -5826,6 +7920,10 @@ fn command_result(
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os = "macos")]
+    mod native_keychain_integration {
+        include!("runtime_manager_keychain_test.rs");
+    }
     #[path = "runtime_manager_linearization_tests.rs"]
     mod linearization_tests;
     #[path = "runtime_manager_preready_tests.rs"]
@@ -5843,6 +7941,46 @@ mod tests {
 
     fn manager() -> RuntimeManager {
         RuntimeManager::with_options(RuntimeOptions::test())
+    }
+
+    #[test]
+    fn conversation_wire_allowlists_are_fixed_and_ordered() {
+        assert_eq!(
+            CONVERSATION_OPEN_WIRE_FIELDS,
+            ["session_token", "domain_id", "mode"]
+        );
+        assert_eq!(
+            CONVERSATION_CANCEL_WIRE_FIELDS,
+            ["session_token", "conversation_id", "domain_id"]
+        );
+        assert_eq!(
+            CONVERSATION_ASK_WIRE_FIELDS,
+            ["session_token", "conversation_id", "question", "domain_id"]
+        );
+    }
+
+    #[test]
+    fn synthetic_storage_preflight_requires_existing_parent_under_temp_root() {
+        let temporary_root = env::temp_dir();
+        let directory = temporary_root.join(format!(
+            "jarvis-storage-path-test-{}-{}",
+            std::process::id(),
+            NEXT_INSTANCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir(&directory).unwrap();
+        let candidate = directory.join("synthetic.sqlite3");
+        let accepted = synthetic_temporary_database_path(&candidate, &temporary_root).unwrap();
+        assert_eq!(accepted.file_name(), candidate.file_name());
+        assert!(accepted
+            .parent()
+            .unwrap()
+            .starts_with(temporary_root.canonicalize().unwrap()));
+        assert!(synthetic_temporary_database_path(
+            &Path::new(env!("CARGO_MANIFEST_DIR")).join("unused.sqlite3"),
+            &temporary_root,
+        )
+        .is_none());
+        fs::remove_dir(&directory).unwrap();
     }
 
     #[test]
@@ -6098,19 +8236,6 @@ mod tests {
         let instance_id = new_instance_id();
         let session = TransportSession::create(&instance_id).unwrap();
         let database_path = session.directory_path().join("g5-integration.sqlite3");
-        let seed = Command::new(&python)
-            .arg("-c")
-            .arg("from memory_store import SQLiteMemoryStore; from mission_repository import MissionRepository; import os; store=SQLiteMemoryStore(os.environ['JARVIS_DATABASE_PATH']); store.initialize(); MissionRepository(store).create('owner', 'Missão sintética Rust → FastAPI', 'dom_synthetic_a', 'mac003-rust-seed')")
-            .current_dir(&api_root)
-            .env_clear()
-            .env("JARVIS_DATABASE_PATH", &database_path)
-            .env("PYTHONDONTWRITEBYTECODE", "1")
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .expect("synthetic test database seeder starts");
-        assert!(seed.success(), "synthetic test seed succeeds");
-
         let mut child = Command::new(&python)
             .arg("-u")
             .arg(api_root.join("serve.py"))
@@ -6120,6 +8245,7 @@ mod tests {
             .env_clear()
             .env("JARVIS_LOCAL_PASSPHRASE", "senha-sintetica-rust-mac003")
             .env("JARVIS_DATABASE_PATH", &database_path)
+            .env("TMPDIR", env::temp_dir())
             .env("PYTHONDONTWRITEBYTECODE", "1")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -6173,6 +8299,43 @@ mod tests {
             inner.transport_session = Some(Arc::clone(&session));
         }
 
+        let status = session
+            .call_g5_application("/v1/app/storage/status", b"")
+            .expect("storage status uses authenticated UDS");
+        let status = parse_application_response(&status).unwrap();
+        assert_eq!(app_field(&status, "state"), Some("locked"));
+        let blocked = session
+            .call_g5_application(
+                "/v1/app/session/open",
+                &encode_application_fields(&[("passphrase", "senha-sintetica-rust-mac003")]),
+            )
+            .expect("locked API operation returns a closed error");
+        let blocked = parse_application_response(&blocked).unwrap();
+        assert_eq!(app_field(&blocked, "code"), Some("storage_locked"));
+
+        // This synthetic test key takes the same authenticated UDS envelope
+        // as the Keychain-backed native command. It is never an argument,
+        // environment variable, log entry or temporary file.
+        let mut test_key = [0x4a_u8; 32];
+        let mut key_hex = String::with_capacity(test_key.len() * 2);
+        for byte in test_key {
+            use std::fmt::Write as _;
+            write!(&mut key_hex, "{byte:02x}").unwrap();
+        }
+        let key_hex = SecretText::new(key_hex);
+        let unlock_body = SecretBytes::new(encode_application_fields(&[(
+            "database_key",
+            key_hex.as_str(),
+        )]));
+        test_key.fill(0);
+        drop(key_hex);
+        let unlocked = session
+            .call_g5_application("/v1/app/storage/unlock", unlock_body.as_slice())
+            .expect("storage unlock uses authenticated UDS");
+        drop(unlock_body);
+        let unlocked = parse_application_response(&unlocked).unwrap();
+        assert_eq!(app_field(&unlocked, "state"), Some("unlocked"));
+
         let rejected =
             manager.g5_session_open(SecretText::new("senha-incorreta-sintetica".to_owned()));
         assert!(rejected.contains("Credencial local recusada"));
@@ -6183,11 +8346,22 @@ mod tests {
         assert!(!opened.contains("session_token"));
         assert!(manager.g5_missions_list().contains("concessão de leitura"));
 
+        const CANARY: &str = "JARVIS_SYNTHETIC_CANARY_NO_DISK_7F23";
+        assert!(manager
+            .g5_capture_create(CANARY.to_owned())
+            .contains("\"ok\":true"));
+        assert!(manager.g5_capture_list().contains(CANARY));
+        let encrypted_primary = fs::read(&database_path).expect("encrypted primary exists");
+        assert!(encrypted_primary.starts_with(b"JVSDB\0\x01\0"));
+        assert!(!encrypted_primary
+            .windows(CANARY.len())
+            .any(|part| part == CANARY.as_bytes()));
+
         let granted = manager.g5_mission_read_grant_create();
         assert!(granted.contains("\"grant_active\":true"));
         assert!(!granted.contains("grant_id"));
         let missions = manager.g5_missions_list();
-        assert!(missions.contains("Missão sintética Rust → FastAPI"));
+        assert!(missions.contains("\"items\":[]"));
         assert!(missions.contains("\"dataset\":\"api_synthetic\""));
         assert!(!missions.contains("session_token"));
         assert!(!missions.contains("csrf_token"));
@@ -6217,9 +8391,9 @@ mod tests {
         assert!(manager
             .g5_mission_read_grant_create()
             .contains("\"grant_active\":true"));
-        assert!(manager
-            .g5_missions_list()
-            .contains("Missão sintética Rust → FastAPI"));
+        let missions = manager.g5_missions_list();
+        assert!(missions.contains("\"items\":[]"));
+        assert!(missions.contains("\"dataset\":\"api_synthetic\""));
         assert!(manager
             .g5_review_grant_create_confirmed(NativeReviewGrantConfirmed)
             .contains("\"review_grant\":true"));
@@ -6262,9 +8436,16 @@ mod tests {
         let workflows = manager.g5_workflow_list();
         assert!(workflows.contains("simulate_action"));
         assert!(workflows.contains("succeeded"));
+        assert_eq!(
+            manager.storage_lock_native(),
+            "{\"ok\":true,\"state\":\"locked\"}"
+        );
         assert!(manager
-            .g5_session_close()
+            .g5_session_status_json()
             .contains("\"session_active\":false"));
+        assert!(manager
+            .g5_missions_list()
+            .contains("Abra novamente a sessão G5 local"));
         assert_eq!(process.stop(), 0);
         session.revoke();
         for suffix in ["", "-wal", "-shm"] {
@@ -7181,11 +9362,106 @@ mod tests {
 #[cfg(test)]
 mod local_use_tests {
     use super::{
-        encode_application_fields, expiry_matches, parse_automation_items, parse_automation_runs,
+        app_response_error, encode_application_fields, expiry_matches, g5_error_json,
+        parse_application_response, parse_automation_items, parse_automation_runs,
         parse_automation_sources, parse_capture_items, parse_rfc3339_micros, resolve_api_root,
         valid_local_datetime, MAX_G5_APP_REQUEST_BODY_BYTES,
     };
     use std::fs;
+
+    #[test]
+    fn local_automation_errors_preserve_closed_codes_and_safe_messages() {
+        let cases = [
+            ("automation_invalid", "Confira horário, fuso e campos"),
+            ("automation_not_found", "Atualize a lista"),
+            ("automation_limit", "três agendamentos"),
+            (
+                "automation_conflict",
+                "estado deste agendamento ou execução mudou",
+            ),
+            ("authorization_required", "consentimento das fontes"),
+        ];
+        for (code, expected_message) in cases {
+            let body = encode_application_fields(&[("ok", "false"), ("code", code)]);
+            let fields = parse_application_response(&body).expect("valid closed error frame");
+            assert_eq!(app_response_error(&fields), Some(code));
+            let result: serde_json::Value =
+                serde_json::from_str(&g5_error_json(code)).expect("safe IPC error JSON");
+            assert_eq!(result["ok"], false);
+            assert!(result["error"].as_str().unwrap().contains(expected_message));
+            assert_eq!(result.as_object().unwrap().len(), 2);
+            assert!(!result.to_string().contains(code));
+        }
+    }
+
+    #[test]
+    fn local_automation_errors_reject_unknown_codes_and_extra_fields() {
+        for fields in [
+            vec![("ok", "false"), ("code", "automation_unknown")],
+            vec![
+                ("ok", "false"),
+                ("code", "automation_limit"),
+                ("detail", "conteudo-sintetico"),
+            ],
+            vec![("ok", "false")],
+        ] {
+            let body = encode_application_fields(&fields);
+            let parsed = parse_application_response(&body).expect("valid field framing");
+            assert_eq!(app_response_error(&parsed), Some("protocol_failure"));
+            let result = g5_error_json(app_response_error(&parsed).unwrap());
+            assert!(result.contains("O backend retornou uma resposta inválida."));
+            assert!(!result.contains("conteudo-sintetico"));
+            assert!(!result.contains("automation_unknown"));
+        }
+    }
+
+    #[test]
+    fn local_automation_errors_translate_the_api_validation_and_scope_fixtures() {
+        // The API tests compare real encrypted-route responses against these same fixtures.
+        let validation = include_bytes!("../../../api/fixtures/automation_validation_error.txt");
+        let scope = include_bytes!("../../../api/fixtures/scope_invalid_error.txt");
+        for (body, code, message) in [
+            (
+                validation.as_slice(),
+                "automation_invalid",
+                "O agendamento local foi recusado. Confira horário, fuso e campos informados.",
+            ),
+            (
+                scope.as_slice(),
+                "scope_invalid",
+                "O escopo fixo de leitura foi recusado.",
+            ),
+        ] {
+            let parsed = parse_application_response(body).expect("API error frame");
+            assert_eq!(app_response_error(&parsed), Some(code));
+            let result: serde_json::Value =
+                serde_json::from_str(&g5_error_json(app_response_error(&parsed).unwrap())).unwrap();
+            assert_eq!(result["ok"], false);
+            assert_eq!(result["error"].as_str(), Some(message));
+            assert_eq!(result.as_object().unwrap().len(), 2);
+        }
+    }
+
+    #[test]
+    fn local_automation_validation_prechecks_preserve_identity_and_catalog_scope() {
+        let manager = super::RuntimeManager::default();
+        let invalid_timezone = manager.g5_automation_timezone("a".repeat(32), "x".repeat(65));
+        assert!(invalid_timezone.contains("Confira horário, fuso e campos"));
+        let invalid_id = manager.g5_automation_timezone("invalid-id".to_owned(), "UTC".to_owned());
+        assert!(invalid_id.contains("O escopo fixo de leitura foi recusado."));
+        let invalid_kind = manager.g5_automation_create(
+            "external_action".to_owned(),
+            "Sintético".to_owned(),
+            "once".to_owned(),
+            "2099-01-01T09:00".to_owned(),
+            "UTC".to_owned(),
+            String::new(),
+            String::new(),
+            "Teste".to_owned(),
+            false,
+        );
+        assert!(invalid_kind.contains("O escopo fixo de leitura foi recusado."));
+    }
 
     #[test]
     fn rfc3339_display_must_match_epoch_and_carry_a_timezone() {
@@ -7270,5 +9546,156 @@ mod local_use_tests {
             encode_application_fields(&borrowed).len() <= MAX_G5_APP_REQUEST_BODY_BYTES,
             "documented reminder limits must fit the v3 request body limit"
         );
+    }
+}
+
+#[cfg(test)]
+mod workflow_page_tests {
+    use super::*;
+    #[test]
+    fn workflow_page_api_fixture_decodes_through_production_parser() {
+        let fields = parse_application_response(include_bytes!(
+            "../../../api/fixtures/workflow_page_v1.txt"
+        ))
+        .unwrap();
+        let decoded = decode_workflow_page(&fields, "").unwrap();
+        assert_eq!(decoded["next_cursor"], "");
+        assert_eq!(decoded["tasks"][0]["task_id"], "a".repeat(32));
+    }
+    fn summary(id: &str) -> JsonValue {
+        serde_json::json!({"task_id":id, "tool_id":"draft_note", "state":"proposed",
+            "arguments_sha":"a".repeat(64), "created_at":"2026-10-14T00:00:00+00:00",
+            "updated_at":"2026-10-14T00:00:00+00:00", "risk":"low", "expected_effect":"rascunho local persistido"})
+    }
+    fn response(tasks: JsonValue, cursor: &str) -> Vec<(String, SecretText)> {
+        vec![
+            ("ok".into(), SecretText::new("true".into())),
+            ("tasks_json".into(), SecretText::new(tasks.to_string())),
+            ("next_cursor".into(), SecretText::new(cursor.into())),
+        ]
+    }
+    #[test]
+    fn workflow_page_decoder_closed_order_and_boundary() {
+        let id = "b".repeat(32);
+        let cursor = format!("wf1|2026-10-14T00:00:00+00:00|{id}");
+        let fields = response(serde_json::json!([summary(&id)]), &cursor);
+        assert!(decode_workflow_page(&fields, "").is_ok());
+        assert!(decode_workflow_page(&fields, &cursor).is_err()); // Cannot repeat boundary.
+        let mut extra = response(serde_json::json!([]), "");
+        extra.push(("extra".into(), SecretText::new("false".into())));
+        assert!(decode_workflow_page(&extra, "").is_err());
+        let mut item = summary(&id);
+        item["extra"] = JsonValue::Bool(true);
+        assert!(decode_workflow_page(&response(serde_json::json!([item]), ""), "").is_err());
+        assert!(decode_workflow_page(&response(serde_json::json!([]), &cursor), "").is_err());
+        assert!(decode_workflow_page(
+            &response(
+                serde_json::json!([summary(&"a".repeat(32)), summary(&id)]),
+                ""
+            ),
+            ""
+        )
+        .is_err());
+        assert!(decode_workflow_page(&response(serde_json::json!([]), ""), &cursor).is_ok());
+    }
+    #[test]
+    fn workflow_page_cursor_bounded_and_canonical() {
+        for cursor in [
+            "x".repeat(81),
+            "wf2|2026-10-14T00:00:00+00:00|".to_owned() + &"a".repeat(32),
+            "wf1|2026-02-30T00:00:00+00:00|".to_owned() + &"a".repeat(32),
+            "wf1|2026-10-14T00:00:00.000000+00:00|".to_owned() + &"a".repeat(32),
+        ] {
+            assert!(!valid_workflow_cursor(&cursor));
+        }
+        assert!(valid_workflow_cursor(""));
+    }
+}
+
+#[cfg(test)]
+mod memory_export_tests {
+    use super::*;
+    use std::os::unix::fs::{symlink, PermissionsExt};
+
+    struct Scratch(PathBuf);
+
+    impl Scratch {
+        fn new() -> Self {
+            let stamp = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let path = env::temp_dir().join(format!(
+                "jarvis-memory-export-{}-{stamp}",
+                std::process::id()
+            ));
+            fs::create_dir(&path).unwrap();
+            Self(path)
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn memory_record_parser_is_exact_and_validates_origin() {
+        let valid = serde_json::json!({
+            "id": "0123456789abcdef0123456789abcdef",
+            "category": "confirmed_fact", "domain_id": "dom_synthetic_b",
+            "body": "fato sintético", "source_kind": "owner_confirmation", "source_ref": "owner-note",
+            "version": 2, "recorded_at": "2026-10-21T18:00:00.000000+00:00",
+            "revised_at": "2026-10-21T18:05:00.000000+00:00"
+        });
+        assert!(parse_memory_record(&valid.to_string()).is_some());
+        let mut extra = valid.clone();
+        extra["unexpected"] = JsonValue::Bool(true);
+        assert!(parse_memory_record(&extra.to_string()).is_none());
+        let mut wrong_origin = valid.clone();
+        wrong_origin["source_kind"] = JsonValue::String("assistant_reply".to_owned());
+        assert!(parse_memory_record(&wrong_origin.to_string()).is_none());
+        let mut wrong_domain = valid;
+        wrong_domain["domain_id"] = JsonValue::String("dom_real".to_owned());
+        assert!(parse_memory_record(&wrong_domain.to_string()).is_none());
+    }
+
+    #[test]
+    fn export_destination_is_confined_and_atomic_overwrite_is_explicit() {
+        let scratch = Scratch::new();
+        let allowed = scratch.0.join("Documents");
+        let child = allowed.join("exports");
+        fs::create_dir_all(&child).unwrap();
+        let allowed = allowed.canonicalize().unwrap();
+        let child = child.canonicalize().unwrap();
+        let destination = child.join("memory.json");
+        assert_eq!(
+            validate_memory_export_path(&destination, &allowed).unwrap(),
+            destination
+        );
+        assert!(validate_memory_export_path(&child.join("memory.txt"), &allowed).is_err());
+        assert!(validate_memory_export_path(&scratch.0.join("outside.json"), &allowed).is_err());
+
+        let link = allowed.join("linked");
+        symlink(&child, &link).unwrap();
+        assert!(validate_memory_export_path(&link.join("memory.json"), &allowed).is_err());
+        let destination_link = child.join("linked-file.json");
+        symlink(scratch.0.join("outside.json"), &destination_link).unwrap();
+        assert!(validate_memory_export_path(&destination_link, &allowed).is_err());
+
+        write_memory_export(&destination, b"synthetic export v1", false).unwrap();
+        assert_eq!(fs::read(&destination).unwrap(), b"synthetic export v1");
+        assert_eq!(
+            fs::metadata(&destination).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(
+            write_memory_export(&destination, b"synthetic export v2", false),
+            Err("memory_export_overwrite_required")
+        );
+        write_memory_export(&destination, b"synthetic export v2", true).unwrap();
+        assert_eq!(fs::read(&destination).unwrap(), b"synthetic export v2");
+        assert_eq!(fs::read_dir(&child).unwrap().count(), 2); // destination and deliberately-created symlink only
     }
 }

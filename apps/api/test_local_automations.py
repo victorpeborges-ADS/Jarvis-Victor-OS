@@ -32,8 +32,8 @@ def instant(value: str) -> datetime:
 
 
 @pytest.fixture
-def store(tmp_path):
-    result = SQLiteMemoryStore(tmp_path / "private" / "memory.sqlite3")
+def store(tmp_path, encrypted_store_factory):
+    result = encrypted_store_factory(tmp_path / "private" / "memory.sqlite3")
     result.initialize()
     return result
 
@@ -181,10 +181,10 @@ def test_repeated_ticks_and_concurrent_workers_create_one_idempotent_run(store):
     assert runs[0]["attempts"] == 1
 
 
-def test_restart_marks_due_run_missed_and_recovery_requires_explicit_control(store):
+def test_restart_marks_due_run_missed_and_recovery_requires_explicit_control(store, encrypted_store_factory):
     automation = make_reminder(store)
     due = instant(automation["next_run_at_utc"])
-    reopened_store = SQLiteMemoryStore(store.path)
+    reopened_store = encrypted_store_factory(store.path)
     reopened_store.initialize()
     scheduler = LocalAutomationScheduler(reopened_store)
     assert scheduler.startup_reconcile(due.replace(hour=9)) == 1
@@ -280,7 +280,7 @@ def test_quiet_hours_run_delayed_beyond_grace_is_missed(store):
     assert run["attempts"] == 0
 
 
-def test_quiet_hours_defer_until_end_then_run_once(store):
+def test_quiet_hours_defer_until_end_then_run_once(store, encrypted_store_factory):
     automation = make_reminder(
         store,
         recurrence="daily",
@@ -295,7 +295,7 @@ def test_quiet_hours_defer_until_end_then_run_once(store):
     run = list_runs(store, "owner", automation["id"])[0]
     assert run["status"] == "deferred"
     assert run["attempts"] == 0
-    reopened_store = SQLiteMemoryStore(store.path)
+    reopened_store = encrypted_store_factory(store.path)
     reopened_store.initialize()
     restarted_scheduler = LocalAutomationScheduler(reopened_store)
     assert restarted_scheduler.startup_reconcile(instant("2026-10-13T02:00:00Z")) == 0
@@ -384,7 +384,7 @@ def test_restart_preserves_retry_wait_until_its_scheduled_retry(store):
     assert calls == 2
 
 
-def test_restart_does_not_complete_one_time_schedule_before_retry_due(store):
+def test_restart_does_not_complete_one_time_schedule_before_retry_due(store, encrypted_store_factory):
     automation = make_reminder(
         store, recurrence="once", local_schedule="2026-10-12T08:00",
     )
@@ -401,7 +401,7 @@ def test_restart_does_not_complete_one_time_schedule_before_retry_due(store):
     assert get_automation(store, "owner", automation["id"])["state"] == "active"
 
     retry_at = due + timedelta(seconds=15)
-    reopened_store = SQLiteMemoryStore(store.path)
+    reopened_store = encrypted_store_factory(store.path)
     reopened_store.initialize()
     restarted_scheduler = LocalAutomationScheduler(reopened_store)
     assert restarted_scheduler.startup_reconcile(due + timedelta(seconds=5)) == 0
@@ -465,19 +465,48 @@ def test_pause_resume_delete_and_validation_are_persistent(store):
         update_timezone(store, "owner", automation["id"], "Not/AZone", now)
 
 
-def test_new_migration_upgrades_previous_database_and_starts_empty(tmp_path):
+def test_create_run_pause_resume_delete_keeps_local_history_without_external_effect(store):
+    created = make_reminder(store)
+    due = instant(created["next_run_at_utc"])
+    scheduler = LocalAutomationScheduler(store, clock=lambda: due)
+    assert scheduler.run_due(due) == 1
+    history = list_runs(store, "owner", created["id"])
+    assert len(history) == 1 and history[0]["status"] == "succeeded"
+    paused = control_automation(
+        store, owner="owner", automation_id=created["id"], action="pause", now=due
+    )
+    assert paused["state"] == "paused" and paused["next_run_at_utc"] is None
+    resumed = control_automation(
+        store, owner="owner", automation_id=created["id"], action="resume", now=due
+    )
+    assert resumed["state"] == "active" and resumed["next_run_at_utc"] is not None
+    deleted = control_automation(
+        store, owner="owner", automation_id=created["id"], action="delete", now=due + timedelta(minutes=1)
+    )
+    assert deleted["state"] == "deleted"
+    retained = list_runs(store, "owner", created["id"])
+    assert len(retained) == 1 and retained[0]["status"] == "succeeded"
+    assert retained[0]["id"] == history[0]["id"]
+    with store.transaction() as connection:
+        assert connection.execute("SELECT COUNT(*) FROM synthetic_effect_ledger").fetchone()[0] == 0
+        assert connection.execute("SELECT COUNT(*) FROM synthetic_effect_outbox").fetchone()[0] == 0
+
+
+def test_new_migration_upgrades_previous_database_and_starts_empty(tmp_path, encrypted_store_factory):
     older = tmp_path / "older-migrations"
     older.mkdir()
     for migration in MIGRATIONS_DIR.glob("[0-9][0-9][0-9][0-9]_*.sql"):
         if migration.name != "0020_local_automations.sql":
             copyfile(migration, older / migration.name)
     path = tmp_path / "private" / "memory.sqlite3"
-    SQLiteMemoryStore(path, migrations_dir=older).initialize()
-    upgraded = SQLiteMemoryStore(path)
+    encrypted_store_factory(path, migrations_dir=older).initialize()
+    upgraded = encrypted_store_factory(path)
     upgraded.initialize()
     with upgraded.transaction() as connection:
         assert connection.execute("SELECT COUNT(*) FROM local_automations").fetchone()[0] == 0
         assert connection.execute("SELECT COUNT(*) FROM local_automation_runs").fetchone()[0] == 0
         assert connection.execute(
             "SELECT version FROM schema_migrations ORDER BY version DESC LIMIT 1"
-        ).fetchone()[0] == "0020_local_automations"
+        ).fetchone()[0] == "0027_memory_capture_revisions"
+        assert connection.execute("SELECT COUNT(*) FROM synthetic_effect_outbox").fetchone()[0] == 0
+        assert connection.execute("SELECT COUNT(*) FROM synthetic_effect_ledger").fetchone()[0] == 0

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from api_test_support import sqlite_rows
+
 import sqlite3
 import json
 
@@ -37,7 +39,7 @@ def test_selected_knowledge_detached_as_skill_derived_is_quarantined_everywhere(
     )
     assert selected_response.status_code == 201, selected_response.text
     source = selected_response.json()
-    with sqlite3.connect(client.database_path) as connection:
+    with sqlite_rows(client.app.state.memory_store) as connection:
         selected_knowledge_id = connection.execute(
             "SELECT knowledge_id FROM selected_synthetic_sources WHERE id=?", (source["id"],)
         ).fetchone()[0]
@@ -45,7 +47,7 @@ def test_selected_knowledge_detached_as_skill_derived_is_quarantined_everywhere(
     assert selected_before["kind"] == "selected_original"
     assert selected_before["content_withheld"] is False
 
-    with sqlite3.connect(client.database_path) as connection:
+    with sqlite_rows(client.app.state.memory_store) as connection:
         connection.execute(
             "UPDATE selected_synthetic_sources SET knowledge_id=? WHERE id=?",
             (valid_derived["id"], source["id"]),
@@ -144,7 +146,7 @@ def _create_source(client, csrf: str, mission_id: str, fixture_id: str, key: str
     )
     assert response.status_code == 201, response.text
     source = response.json()
-    with sqlite3.connect(client.database_path) as connection:
+    with sqlite_rows(client.app.state.memory_store) as connection:
         knowledge_id = connection.execute(
             "SELECT knowledge_id FROM selected_synthetic_sources WHERE id=?", (source["id"],)
         ).fetchone()[0]
@@ -257,6 +259,24 @@ def test_unproven_knowledge_tampering_matrix_fails_closed(client, case):
             client, csrf, mission["id"], "resumo-de-demonstracao", f"r61-matrix-b-{case}"
         )
         source_ids.append((second_source, second_selected_id))
+    if case == "decision_ledger_from_other_knowledge":
+        second_source, second_id = source_ids[1]
+        review = client.get(f"/real/reviews/{second_source['review_id']}", headers={"origin": ORIGIN}).json()
+        review_decision = client.post(
+            f"/real/reviews/{second_source['review_id']}/decide",
+            headers=_headers(csrf),
+            json={"decision": "approved", "expected_revision": review["revision"],
+                  "expected_artifact_sha256": review["artifact_sha256"],
+                  "idempotency_key": "r61-matrix-review-for-ledger"},
+        )
+        assert review_decision.status_code == 200, review_decision.text
+        second_item = _item(client, second_id)
+        accepted = client.post(
+            f"/real/knowledge/{second_id}/decide", headers=_headers(csrf),
+            json={"decision": "approved", "expected_content_sha256": second_item["content_sha256"],
+                  "idempotency_key": "r61-matrix-source-ledger"},
+        )
+        assert accepted.status_code == 200, accepted.text
 
     target_id = selected_id if case in {
         "selected_to_skill_without_review_and_bytes",
@@ -265,7 +285,7 @@ def test_unproven_knowledge_tampering_matrix_fails_closed(client, case):
         "source_relinked_to_derived_knowledge",
         "two_valid_sources_crossed",
     } else derived["id"]
-    with sqlite3.connect(client.database_path) as connection:
+    with sqlite_rows(client.app.state.memory_store) as connection:
         connection.row_factory = sqlite3.Row
         if case == "selected_to_skill_without_review_and_bytes":
             connection.execute(
@@ -340,23 +360,6 @@ def test_unproven_knowledge_tampering_matrix_fails_closed(client, case):
             connection.execute("PRAGMA ignore_check_constraints=ON")
             connection.execute("UPDATE mission_knowledge SET state='approved', kind='unrecognized_origin' WHERE id=?", (derived["id"],))
         elif case == "decision_ledger_from_other_knowledge":
-            second_source, second_id = source_ids[1]
-            review = client.get(f"/real/reviews/{second_source['review_id']}", headers={"origin": ORIGIN}).json()
-            review_decision = client.post(
-                f"/real/reviews/{second_source['review_id']}/decide",
-                headers=_headers(csrf),
-                json={"decision": "approved", "expected_revision": review["revision"],
-                      "expected_artifact_sha256": review["artifact_sha256"],
-                      "idempotency_key": "r61-matrix-review-for-ledger"},
-            )
-            assert review_decision.status_code == 200, review_decision.text
-            second_item = _item(client, second_id)
-            accepted = client.post(
-                f"/real/knowledge/{second_id}/decide", headers=_headers(csrf),
-                json={"decision": "approved", "expected_content_sha256": second_item["content_sha256"],
-                      "idempotency_key": "r61-matrix-source-ledger"},
-            )
-            assert accepted.status_code == 200, accepted.text
             ledger = connection.execute("SELECT * FROM mission_knowledge_decisions WHERE knowledge_id=?", (second_id,)).fetchone()
             columns = [key for key in ledger.keys()]
             values = dict(ledger)

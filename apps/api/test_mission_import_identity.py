@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from api_test_support import sqlite_rows
+
 import copy
 import sqlite3
 from concurrent.futures import ThreadPoolExecutor
@@ -42,6 +44,9 @@ def _import(client: TestClient, csrf: str, documents: list[dict], key: str):
 
 
 def _count(database, query: str, parameters: tuple = ()) -> int:
+    if hasattr(database, "_connect"):
+        with sqlite_rows(database) as connection:
+            return connection.execute(query, parameters).fetchone()[0]
     with sqlite3.connect(database) as connection:
         return connection.execute(query, parameters).fetchone()[0]
 
@@ -68,8 +73,8 @@ def test_duplicate_ids_inside_import_batch_return_422_without_writes(client, dup
     assert response.status_code == 422
     assert response.json() == {"detail": "lote de importação contém identificadores repetidos"}
     assert all(document["id"] not in response.text for document in documents)
-    assert _count(client.database_path, "SELECT COUNT(*) FROM mission_idempotency WHERE idempotency_key LIKE 'batch-duplicate-%'") == 0
-    assert _count(client.database_path, "SELECT COUNT(*) FROM missions") == 1
+    assert _count(client.app.state.memory_store, "SELECT COUNT(*) FROM mission_idempotency WHERE idempotency_key LIKE 'batch-duplicate-%'") == 0
+    assert _count(client.app.state.memory_store, "SELECT COUNT(*) FROM missions") == 1
 
 
 def test_repeated_event_id_inside_document_is_reported_in_quarantine(client):
@@ -84,21 +89,21 @@ def test_repeated_event_id_inside_document_is_reported_in_quarantine(client):
     assert response.status_code == 200
     assert response.json()["accepted"] == []
     assert response.json()["quarantined"] == [{"index": 0, "reason": "ID de evento repetido no documento"}]
-    assert _count(client.database_path, "SELECT COUNT(*) FROM missions") == 1
-    assert _count(client.database_path, "SELECT COUNT(*) FROM mission_idempotency WHERE idempotency_key='duplicate-event-doc-01'") == 0
+    assert _count(client.app.state.memory_store, "SELECT COUNT(*) FROM missions") == 1
+    assert _count(client.app.state.memory_store, "SELECT COUNT(*) FROM mission_idempotency WHERE idempotency_key='duplicate-event-doc-01'") == 0
 
 
 def test_successive_exact_import_is_noop_but_changed_mission_body_conflicts(client):
     csrf = login(client)
     mission_grants(client, csrf)
     source = create(client, csrf, "exact repeat source")["mission"]
-    before_events = _count(client.database_path, "SELECT COUNT(*) FROM mission_events")
+    before_events = _count(client.app.state.memory_store, "SELECT COUNT(*) FROM mission_events")
 
     repeated = _import(client, csrf, [source], "successive-repeat-001")
     assert repeated.status_code == 200, repeated.text
     assert repeated.json()["accepted"] == []
     assert repeated.json()["quarantined"] == []
-    assert _count(client.database_path, "SELECT COUNT(*) FROM mission_events") == before_events
+    assert _count(client.app.state.memory_store, "SELECT COUNT(*) FROM mission_events") == before_events
 
     changed = copy.deepcopy(source)
     changed["title"] = "conteúdo alterado depois da primeira importação"
@@ -106,7 +111,7 @@ def test_successive_exact_import_is_noop_but_changed_mission_body_conflicts(clie
     assert conflict.status_code == 409
     assert conflict.json() == {"detail": "conflito de identidade na importação"}
     assert source["id"] not in conflict.text
-    assert _count(client.database_path, "SELECT COUNT(*) FROM mission_idempotency WHERE idempotency_key='successive-change-001'") == 0
+    assert _count(client.app.state.memory_store, "SELECT COUNT(*) FROM mission_idempotency WHERE idempotency_key='successive-change-001'") == 0
     reread = client.get(f"/real/missions/{source['id']}", headers={"origin": ORIGIN})
     assert reread.status_code == 200
     assert reread.json()["mission"]["title"] == source["title"]
@@ -129,8 +134,8 @@ def test_event_id_already_owned_by_another_mission_conflicts_without_leaking_ids
     assert event_id not in response.text
     assert imported["id"] not in response.text
     assert source["id"] not in response.text
-    assert _count(client.database_path, "SELECT COUNT(*) FROM missions WHERE id=?", (imported["id"],)) == 0
-    assert _count(client.database_path, "SELECT COUNT(*) FROM mission_idempotency WHERE idempotency_key LIKE 'persisted-event-conflict-%'") == 0
+    assert _count(client.app.state.memory_store, "SELECT COUNT(*) FROM missions WHERE id=?", (imported["id"],)) == 0
+    assert _count(client.app.state.memory_store, "SELECT COUNT(*) FROM mission_idempotency WHERE idempotency_key LIKE 'persisted-event-conflict-%'") == 0
 
 
 def test_event_collision_from_another_principal_is_generic_409(client):
@@ -155,7 +160,7 @@ def test_event_collision_from_another_principal_is_generic_409(client):
     assert response.json() == {"detail": "conflito de identidade na importação"}
     assert source["id"] not in response.text
     assert source["events"][0]["id"] not in response.text
-    assert _count(client.database_path, "SELECT COUNT(*) FROM missions WHERE id=?", (imported["id"],)) == 0
+    assert _count(client.app.state.memory_store, "SELECT COUNT(*) FROM missions WHERE id=?", (imported["id"],)) == 0
 
 
 def test_import_internal_key_can_match_a_user_create_key_without_collision(client):
@@ -184,11 +189,11 @@ def test_import_internal_key_can_match_a_user_create_key_without_collision(clien
     assert imported_response.status_code == 200, imported_response.text
     assert imported_response.json()["accepted"] == [imported["id"]]
     assert _count(
-        client.database_path,
+        client.app.state.memory_store,
         "SELECT COUNT(*) FROM missions WHERE id IN (?, ?)",
         (prior_create.json()["mission"]["id"], imported["id"]),
     ) == 2
-    with sqlite3.connect(client.database_path) as connection:
+    with sqlite_rows(client.app.state.memory_store) as connection:
         assert connection.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
 
 
@@ -236,7 +241,7 @@ def test_create_and_import_share_textual_key_without_cross_operation_replay(clie
     assert changed_import.status_code == 409
     assert shared_key not in changed_create.text + changed_import.text
 
-    with sqlite3.connect(client.database_path) as connection:
+    with sqlite_rows(client.app.state.memory_store) as connection:
         operations = connection.execute(
             "SELECT operation FROM mission_idempotency WHERE owner='owner' AND idempotency_key=? "
             "ORDER BY operation",
@@ -267,11 +272,11 @@ def test_concurrent_same_create_key_has_one_record_and_one_replay(client):
     assert sorted(body["replayed"] for body in bodies) == [False, True]
     assert len({body["mission"]["id"] for body in bodies}) == 1
     assert _count(
-        client.database_path,
+        client.app.state.memory_store,
         "SELECT COUNT(*) FROM mission_idempotency WHERE owner='owner' AND operation='mission.create' AND idempotency_key=?",
         (key,),
     ) == 1
-    assert _count(client.database_path, "SELECT COUNT(*) FROM missions") == 1
+    assert _count(client.app.state.memory_store, "SELECT COUNT(*) FROM missions") == 1
 
 
 def test_concurrent_create_and_import_can_share_a_textual_key(client):
@@ -307,12 +312,12 @@ def test_concurrent_create_and_import_can_share_a_textual_key(client):
     assert imported_response.status_code == 200, imported_response.text
     assert imported_response.json()["accepted"] == [imported["id"]]
     assert _count(
-        client.database_path,
+        client.app.state.memory_store,
         "SELECT COUNT(*) FROM mission_idempotency WHERE owner='owner' AND idempotency_key=? "
         "AND operation IN ('mission.create', 'mission.import')",
         (key,),
     ) == 2
-    with sqlite3.connect(client.database_path) as connection:
+    with sqlite_rows(client.app.state.memory_store) as connection:
         assert connection.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
 
 
@@ -330,13 +335,15 @@ def test_unknown_database_idempotency_constraint_is_not_reclassified_as_conflict
             )
 
     assert _count(
-        client.database_path,
+        client.app.state.memory_store,
         "SELECT COUNT(*) FROM mission_idempotency WHERE owner='owner' AND idempotency_key=?",
         ("unknown-operation-key-r2",),
     ) == 0
 
 
-def test_unresolved_legacy_key_fails_closed_and_remains_owner_scoped(tmp_path, monkeypatch):
+def test_unresolved_legacy_key_fails_closed_and_remains_owner_scoped(
+    tmp_path, monkeypatch, encrypted_store_factory,
+):
     old_migrations = tmp_path / "old-migrations"
     old_migrations.mkdir()
     for migration in sorted(MIGRATIONS_DIR.glob("[0-9][0-9][0-9][0-9]_*.sql")):
@@ -345,10 +352,11 @@ def test_unresolved_legacy_key_fails_closed_and_remains_owner_scoped(tmp_path, m
         copyfile(migration, old_migrations / migration.name)
 
     database_path = tmp_path / "legacy" / "memory.sqlite3"
-    SQLiteMemoryStore(database_path, migrations_dir=old_migrations).initialize()
+    old_store = encrypted_store_factory(database_path, migrations_dir=old_migrations)
+    old_store.initialize()
     key = "legacy-key-owner-scoped-r2"
     legacy_row = ("owner", key, "mission_legacy_record_001", "b" * 64, None)
-    with sqlite3.connect(database_path) as connection:
+    with sqlite_rows(old_store) as connection:
         connection.execute(
             "INSERT INTO mission_idempotency(owner, idempotency_key, mission_id, body_sha256, result_json) "
             "VALUES (?, ?, ?, ?, ?)",
@@ -357,8 +365,10 @@ def test_unresolved_legacy_key_fails_closed_and_remains_owner_scoped(tmp_path, m
 
     monkeypatch.setenv("JARVIS_LOCAL_PASSPHRASE", PASSPHRASE)
     app = create_app(LocalServerConfig(), database_path=database_path)
+    app.state.memory_store.unlock(encrypted_store_factory.storage_key)
     with TestClient(app, base_url="http://127.0.0.1", client=("127.0.0.1", 50999)) as migrated:
         migrated.database_path = database_path
+        migrated.storage_key = encrypted_store_factory.storage_key
         csrf = login(migrated)
         mission_grants(migrated, csrf)
         create_conflict = migrated.post(
@@ -379,7 +389,7 @@ def test_unresolved_legacy_key_fails_closed_and_remains_owner_scoped(tmp_path, m
         assert import_conflict.status_code == 409
         assert import_conflict.json() == {"detail": "chave de idempotência legada exige reconciliação"}
         assert document["id"] not in import_conflict.text
-        assert _count(database_path, "SELECT COUNT(*) FROM missions WHERE id=?", (document["id"],)) == 0
+        assert _count(migrated.app.state.memory_store, "SELECT COUNT(*) FROM missions WHERE id=?", (document["id"],)) == 0
 
         other = TestClient(app, base_url="http://127.0.0.1", client=("127.0.0.1", 51002))
         other.cookies.set("jarvis_session", "owner-r2-legacy-session")
@@ -392,14 +402,14 @@ def test_unresolved_legacy_key_fails_closed_and_remains_owner_scoped(tmp_path, m
         other_create = create(other, "csrf-owner-r2-legacy", "same key in other principal", key)
         assert other_create["mission"]["title"] == "same key in other principal"
 
-    with sqlite3.connect(database_path) as connection:
-        migrated_row = connection.execute(
-            "SELECT operation, owner, idempotency_key, mission_id, body_sha256, result_json "
-            "FROM mission_idempotency WHERE owner=? AND idempotency_key=?",
-            (legacy_row[0], legacy_row[1]),
-        ).fetchone()
-        assert migrated_row == ("legacy_unresolved", *legacy_row)
-        assert connection.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+        with sqlite_rows(migrated.app.state.memory_store) as connection:
+            migrated_row = connection.execute(
+                "SELECT operation, owner, idempotency_key, mission_id, body_sha256, result_json "
+                "FROM mission_idempotency WHERE owner=? AND idempotency_key=?",
+                (legacy_row[0], legacy_row[1]),
+            ).fetchone()
+            assert migrated_row == ("legacy_unresolved", *legacy_row)
+            assert connection.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
 
 
 def test_import_response_lost_after_commit_replays_after_restart(client, monkeypatch):
@@ -421,22 +431,27 @@ def test_import_response_lost_after_commit_replays_after_restart(client, monkeyp
         with pytest.raises(httpx.ReadTimeout):
             _import(client, csrf, [imported], key)
 
-    assert _count(client.database_path, "SELECT COUNT(*) FROM missions WHERE id=?", (imported["id"],)) == 1
-    assert _count(client.database_path, "SELECT COUNT(*) FROM mission_idempotency WHERE owner='owner' AND idempotency_key=?", (key,)) == 1
-    events_before_restart = _count(client.database_path, "SELECT COUNT(*) FROM mission_events")
+    assert _count(client.app.state.memory_store, "SELECT COUNT(*) FROM missions WHERE id=?", (imported["id"],)) == 1
+    assert _count(client.app.state.memory_store, "SELECT COUNT(*) FROM mission_idempotency WHERE owner='owner' AND idempotency_key=?", (key,)) == 1
+    events_before_restart = _count(client.app.state.memory_store, "SELECT COUNT(*) FROM mission_events")
 
     database = client.database_path
+    client.__exit__(None, None, None)  # release writer before the restarted runtime
     reset_state()
     restarted_app = create_app(LocalServerConfig(), database_path=database)
+    restarted_app.state.memory_store.unlock(client.storage_key)
     with TestClient(restarted_app, base_url="http://127.0.0.1", client=("127.0.0.1", 50998)) as restarted:
         restarted_csrf = login(restarted)
         mission_grants(restarted, restarted_csrf)
         replay = _import(restarted, restarted_csrf, [imported], key)
+        events_after_restart = _count(
+            restarted.app.state.memory_store, "SELECT COUNT(*) FROM mission_events"
+        )
 
     assert replay.status_code == 200, replay.text
     assert replay.json()["replayed"] is True
     assert replay.json()["accepted"] == [imported["id"]]
-    assert _count(database, "SELECT COUNT(*) FROM mission_events") == events_before_restart
+    assert events_after_restart == events_before_restart
 
 
 def test_concurrent_imports_sharing_event_id_have_one_winner_and_one_409(client):
@@ -459,8 +474,8 @@ def test_concurrent_imports_sharing_event_id_have_one_winner_and_one_409(client)
     assert sorted(response.status_code for response in responses) == [200, 409]
     conflict = next(response for response in responses if response.status_code == 409)
     assert conflict.json() == {"detail": "conflito de identidade na importação"}
-    assert _count(client.database_path, "SELECT COUNT(*) FROM mission_events WHERE id='event_concurrent_shared_01'") == 1
-    assert _count(client.database_path, "SELECT COUNT(*) FROM missions WHERE id IN (?, ?)", tuple(doc["id"] for doc in documents)) == 1
+    assert _count(client.app.state.memory_store, "SELECT COUNT(*) FROM mission_events WHERE id='event_concurrent_shared_01'") == 1
+    assert _count(client.app.state.memory_store, "SELECT COUNT(*) FROM missions WHERE id IN (?, ?)", tuple(doc["id"] for doc in documents)) == 1
 
 
 def test_concurrent_same_import_key_is_replayed_once(client):
@@ -481,5 +496,5 @@ def test_concurrent_same_import_key_is_replayed_once(client):
     assert [response.status_code for response in responses] == [200, 200]
     assert sorted(response.json()["replayed"] for response in responses) == [False, True]
     assert all(response.json()["accepted"] == [imported["id"]] for response in responses)
-    assert _count(client.database_path, "SELECT COUNT(*) FROM missions WHERE id=?", (imported["id"],)) == 1
-    assert _count(client.database_path, "SELECT COUNT(*) FROM mission_events WHERE id='event_concurrent_replay_01'") == 1
+    assert _count(client.app.state.memory_store, "SELECT COUNT(*) FROM missions WHERE id=?", (imported["id"],)) == 1
+    assert _count(client.app.state.memory_store, "SELECT COUNT(*) FROM mission_events WHERE id='event_concurrent_replay_01'") == 1

@@ -1,0 +1,15 @@
+{
+  "fixture_id": "timeout",
+  "connector": "github",
+  "source_claimed_at": "2026-10-17T11:50:00Z",
+  "revoked": false,
+  "elapsed_ms": 1001,
+  "items": [
+    {
+      "kind": "github",
+      "external_id": "gh-timeout",
+      "repository": "synthetic/notes",
+      "path": "docs/marcador-timeout.md"
+    }
+  ]
+}

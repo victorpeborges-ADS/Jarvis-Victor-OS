@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from api_test_support import sqlite_rows
+
 import copy
 import json
 import sqlite3
@@ -49,7 +51,7 @@ def _approved_source(client, csrf):
 
 
 def _tamper_source(client, source, mission_id, kind):
-    with sqlite3.connect(client.database_path) as connection:
+    with sqlite_rows(client.app.state.memory_store) as connection:
         if kind == "unknown_fixture_id":
             connection.execute("UPDATE selected_synthetic_sources SET fixture_id='fixture-legitimo-esperado' WHERE id=?", (source["id"],))
         elif kind == "canonical_bytes":
@@ -146,7 +148,7 @@ def test_owner_and_mission_mismatch_never_reconstruct_source_proof(client):
     csrf = login(client)
     mission_all_grants(client, csrf)
     mission_id, source, review, _ = _approved_source(client, csrf)
-    with sqlite3.connect(client.database_path) as connection:
+    with sqlite_rows(client.app.state.memory_store) as connection:
         connection.row_factory = sqlite3.Row
         connection.execute("UPDATE selected_synthetic_sources SET owner='owner_b' WHERE id=?", (source["id"],))
         assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
@@ -155,7 +157,7 @@ def test_owner_and_mission_mismatch_never_reconstruct_source_proof(client):
     assert client.get(f"/real/missions/{mission_id}/sources", headers={"origin": ORIGIN}).json()["items"] == []
     parent = client.get(f"/real/missions/{mission_id}", headers={"origin": ORIGIN}).json()["mission"]
     assert next(artifact for artifact in parent["artifacts"] if artifact["id"] == review["artifact_id"])["content"] == ""
-    with sqlite3.connect(client.database_path) as connection:
+    with sqlite_rows(client.app.state.memory_store) as connection:
         assert connection.execute("SELECT COUNT(*) FROM selected_synthetic_sources WHERE id=?", (source["id"],)).fetchone()[0] == 1
 
 
@@ -169,7 +171,7 @@ def test_mission_mismatch_with_valid_foreign_key_is_quarantined_on_both_missions
     })
     assert other.status_code == 201, other.text
     other_id = other.json()["mission"]["id"]
-    with sqlite3.connect(client.database_path) as connection:
+    with sqlite_rows(client.app.state.memory_store) as connection:
         connection.execute("UPDATE selected_synthetic_sources SET mission_id=? WHERE id=?", (other_id, source["id"]))
         assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
     other_sources = client.get(f"/real/missions/{other_id}/sources", headers={"origin": ORIGIN}).json()["items"]
@@ -195,14 +197,20 @@ def test_read_and_reconcile_are_serialized_without_deadlock_and_restore_stays_qu
     assert response.status_code == 200
     assert response.json()["items"][0]["classification"] == "synthetic_verified"
 
-    with sqlite3.connect(client.database_path) as connection:
+    with sqlite_rows(client.app.state.memory_store) as connection:
         connection.execute("UPDATE selected_synthetic_sources SET fixture_id='fixture-inexistente' WHERE id=?", (source["id"],))
-    archive = create_backup(client.database_path, tmp_path / "backups", "senha-sintetica-r5-backup")
-    restored = restore_backup(archive, tmp_path / "restore", "senha-sintetica-r5-backup")
-    restored_store = SQLiteMemoryStore(restored)
+    archive = create_backup(
+        client.database_path, tmp_path / "backups", "senha-sintetica-r5-backup",
+        storage_key=client.storage_key,
+    )
+    restored = restore_backup(
+        archive, tmp_path / "restore", "senha-sintetica-r5-backup",
+        storage_key=client.storage_key, confirm_legacy_resurrection=True,
+    )
+    restored_store = SQLiteMemoryStore(restored, storage_key=client.storage_key)
     restored_store.initialize()
     reconcile_legacy_selected_sources(restored_store)
-    with restored_store.transaction() as connection:
+    with sqlite_rows(restored_store, row_factory=sqlite3.Row) as connection:
         row = connection.execute("SELECT * FROM selected_synthetic_sources WHERE id=?", (source["id"],)).fetchone()
         assert row is not None
         assert row["classification"] == "unverified"
@@ -260,7 +268,7 @@ def test_read_and_reconcile_lock_orders_complete_without_deadlock(client, monkey
     assert response.status_code == 200
     assert response.json()["items"][0]["classification"] == "synthetic_verified"
     assert reconciled == 0
-    with sqlite3.connect(client.database_path) as connection:
+    with sqlite_rows(client.app.state.memory_store) as connection:
         assert connection.execute("SELECT state FROM selected_synthetic_sources WHERE id=?", (source["id"],)).fetchone()[0] == "selected"
 
 
@@ -268,11 +276,14 @@ def test_restart_reconciles_invalid_persisted_source_before_authorized_reads(cli
     csrf = login(client)
     mission_all_grants(client, csrf)
     mission_id, source, _, _ = _approved_source(client, csrf)
-    with sqlite3.connect(client.database_path) as connection:
+    with sqlite_rows(client.app.state.memory_store) as connection:
         connection.execute("UPDATE selected_synthetic_sources SET fixture_id='unknown-after-backup' WHERE id=?", (source["id"],))
+    client.__exit__(None, None, None)  # drain the first runtime before restart
     reset_state()
     monkeypatch.setenv("JARVIS_LOCAL_PASSPHRASE", "senha-sintetica-de-missao")
     restarted = create_app(LocalServerConfig(), database_path=client.database_path)
+    restarted.state.memory_store.unlock(client.storage_key)
+    reconcile_legacy_selected_sources(restarted.state.memory_store)
     with TestClient(restarted, base_url="http://127.0.0.1", client=("127.0.0.1", 50992)) as after_restart:
         restarted_csrf = login(after_restart)
         mission_all_grants(after_restart, restarted_csrf)
@@ -280,7 +291,7 @@ def test_restart_reconciles_invalid_persisted_source_before_authorized_reads(cli
         assert len(reread) == 1
         assert reread[0]["classification"] == "unverified"
         assert reread[0]["selection_state"] == "quarantined"
-        with sqlite3.connect(client.database_path) as connection:
+        with sqlite_rows(restarted.state.memory_store) as connection:
             row = connection.execute("SELECT classification, state FROM selected_synthetic_sources WHERE id=?", (source["id"],)).fetchone()
         assert row == ("unverified", "quarantined")
 
@@ -315,7 +326,7 @@ def test_imported_decision_claims_are_quarantined_without_ledger_or_context(clie
     assert client.post(f"/real/missions/{imported['id']}/transition", headers=_headers(csrf), json={
         "action": "run_next", "expected_revision": 1, "idempotency_key": f"r5-no-conclude-{claim}",
     }).status_code == 404
-    with sqlite3.connect(client.database_path) as connection:
+    with sqlite_rows(client.app.state.memory_store) as connection:
         assert connection.execute("SELECT COUNT(*) FROM missions WHERE id=?", (imported["id"],)).fetchone()[0] == 0
         assert connection.execute("SELECT COUNT(*) FROM mission_review_decisions WHERE mission_id=?", (imported["id"],)).fetchone()[0] == 0
 
@@ -340,7 +351,7 @@ def test_pending_import_is_normalized_to_local_draft_and_replay_is_idempotent(cl
                for artifact in reread["artifacts"])
     review_list = client.get(f"/real/missions/{imported['id']}/reviews", headers={"origin": ORIGIN}).json()["items"]
     assert review_list and all(item["state"] == "pending" for item in review_list)
-    with sqlite3.connect(client.database_path) as connection:
+    with sqlite_rows(client.app.state.memory_store) as connection:
         assert connection.execute("SELECT COUNT(*) FROM mission_review_decisions WHERE mission_id=?", (imported["id"],)).fetchone()[0] == 0
 
 
@@ -365,7 +376,7 @@ def test_local_ledger_approval_survives_contradictory_import_claim(client):
     preserved = client.get(f"/real/reviews/{review_id}", headers={"origin": ORIGIN}).json()
     assert preserved["state"] == "approved"
     assert preserved["history"][0]["decision"] == "approved"
-    with sqlite3.connect(client.database_path) as connection:
+    with sqlite_rows(client.app.state.memory_store) as connection:
         assert connection.execute("SELECT COUNT(*) FROM mission_review_decisions WHERE review_id=?", (review_id,)).fetchone()[0] == 1
 
 
@@ -383,7 +394,7 @@ def test_concurrent_identical_pending_imports_create_one_record_and_no_decisions
         results = [future.result(timeout=5) for future in futures]
     assert [result.status_code for result in results] == [200, 200]
     assert sorted(result.json()["replayed"] for result in results) == [False, True]
-    with sqlite3.connect(client.database_path) as connection:
+    with sqlite_rows(client.app.state.memory_store) as connection:
         assert connection.execute("SELECT COUNT(*) FROM missions WHERE id=?", (imported["id"],)).fetchone()[0] == 1
         assert connection.execute("SELECT COUNT(*) FROM mission_review_decisions WHERE mission_id=?", (imported["id"],)).fetchone()[0] == 0
 
@@ -410,5 +421,5 @@ def test_other_principal_cannot_import_review_authority(client):
     assert response.status_code == 200
     assert response.json()["accepted"] == []
     assert response.json()["quarantined"]
-    with sqlite3.connect(client.database_path) as connection:
+    with sqlite_rows(client.app.state.memory_store) as connection:
         assert connection.execute("SELECT COUNT(*) FROM missions WHERE owner='owner_b'").fetchone()[0] == 0

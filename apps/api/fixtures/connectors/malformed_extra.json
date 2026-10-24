@@ -1,0 +1,7 @@
+{
+  "fixture_id": "malformed_extra",
+  "connector": "gmail",
+  "source_claimed_at": "2026-10-17T11:50:00Z",
+  "injected": true,
+  "items": []
+}

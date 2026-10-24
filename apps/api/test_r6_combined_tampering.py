@@ -8,6 +8,8 @@ boundary at the end of this module.
 
 from __future__ import annotations
 
+from api_test_support import sqlite_rows
+
 import json
 import hashlib
 import sqlite3
@@ -119,6 +121,7 @@ def test_combined_source_tampering_fails_closed_across_surfaces(client, case):
 
     other_mission_id = None
     other_source = None
+    integrity_prevented_orphan = False
     if case in {
         "owner_and_valid_mission", "mission_and_artifact_ref", "knowledge_review_link",
         "snapshot_from_second_source", "crossed_mission_source", "mixed_valid_sources",
@@ -130,7 +133,7 @@ def test_combined_source_tampering_fails_closed_across_surfaces(client, case):
             client, csrf, other_mission_id, "resumo-de-demonstracao", case,
         )
 
-    with sqlite3.connect(client.database_path) as connection:
+    with sqlite_rows(client.app.state.memory_store) as connection:
         if case == "owner_and_artifact_ref":
             _edit_artifact_ref(connection, mission_id, initial_review["artifact_id"], "missing-r6-source")
             connection.execute("UPDATE selected_synthetic_sources SET owner='owner_b' WHERE id=?", (source["id"],))
@@ -151,8 +154,9 @@ def test_combined_source_tampering_fails_closed_across_surfaces(client, case):
             connection.execute("UPDATE mission_knowledge SET source_review_id=? WHERE id=?",
                                (other_source["review_id"] if other_source else "rev_other", knowledge["id"]))
         elif case == "knowledge_kind_and_links_detached":
-            connection.execute("UPDATE mission_knowledge SET kind='skill_derived', source_review_id='review-r6-other' WHERE id=?",
+            connection.execute("UPDATE mission_knowledge SET kind='skill_derived', source_review_id=NULL WHERE id=?",
                                (knowledge["id"],))
+            connection.execute("PRAGMA foreign_keys=OFF")
             connection.execute("UPDATE selected_synthetic_sources SET knowledge_id='knowledge-r6-orphan' WHERE id=?",
                                (source["id"],))
         elif case == "review_artifact_and_snapshot":
@@ -193,12 +197,17 @@ def test_combined_source_tampering_fails_closed_across_surfaces(client, case):
         elif case == "mixed_valid_sources":
             _edit_artifact_ref(connection, mission_id, initial_review["artifact_id"], other_source["id"])
         elif case == "orphan_source_review":
+            connection.execute("PRAGMA foreign_keys=OFF")
             connection.execute("UPDATE selected_synthetic_sources SET review_id='review-r6-orphan' WHERE id=?",
                                (source["id"],))
         elif case == "orphan_knowledge":
-            connection.execute("DELETE FROM mission_knowledge WHERE id=?", (knowledge["id"],))
+            with pytest.raises(sqlite3.IntegrityError, match="append only"):
+                connection.execute("DELETE FROM mission_knowledge WHERE id=?", (knowledge["id"],))
+            integrity_prevented_orphan = True
         elif case == "orphan_review":
-            connection.execute("DELETE FROM mission_artifact_reviews WHERE id=?", (source["review_id"],))
+            with pytest.raises(sqlite3.IntegrityError, match="append only"):
+                connection.execute("DELETE FROM mission_artifact_reviews WHERE id=?", (source["review_id"],))
+            integrity_prevented_orphan = True
         elif case == "orphan_snapshot":
             connection.execute("UPDATE mission_artifact_reviews SET artifact_snapshot_json=NULL WHERE id=?",
                                (source["review_id"],))
@@ -208,6 +217,23 @@ def test_combined_source_tampering_fails_closed_across_surfaces(client, case):
             _insert_extra_ledger(connection, source, mission_id=other_mission_id)
         else:
             raise AssertionError(case)
+
+    if integrity_prevented_orphan:
+        # The append-only decision ledgers reject these deletes before an
+        # orphan can be created. Verify both the rows and their approved state
+        # remain intact; the fail-closed probes below cover malformed links
+        # that can exist with foreign keys disabled during synthetic tampering.
+        with sqlite_rows(client.app.state.memory_store) as connection:
+            assert connection.execute("SELECT 1 FROM mission_knowledge WHERE id=?", (knowledge["id"],)).fetchone()
+            assert connection.execute("SELECT 1 FROM mission_artifact_reviews WHERE id=?", (source["review_id"],)).fetchone()
+        review_response = client.get(f"/real/reviews/{source['review_id']}", headers={"origin": ORIGIN})
+        assert review_response.status_code == 200
+        assert review_response.json()["state"] == "approved"
+        knowledge_response = client.get("/real/knowledge", headers={"origin": ORIGIN})
+        preserved = next(item for item in knowledge_response.json()["items"] if item["id"] == knowledge["id"])
+        assert preserved["state"] == "approved"
+        assert preserved["content"] == fixture["content"]
+        return
 
     mission_response = client.get(f"/real/missions/{mission_id}", headers={"origin": ORIGIN})
     assert mission_response.status_code == 200, mission_response.text
@@ -299,7 +325,7 @@ def test_coherent_sqlite_admin_fabrication_is_documented_outside_g5_authenticity
     mission_all_grants(client, csrf)
     _, review_id = create_and_run_step(client, csrf, "R6 limite do escritor SQLite")
     decided_at = "2026-09-30T12:00:00+00:00"
-    with sqlite3.connect(client.database_path) as connection:
+    with sqlite_rows(client.app.state.memory_store) as connection:
         connection.row_factory = sqlite3.Row
         review = connection.execute("SELECT * FROM mission_artifact_reviews WHERE id=?", (review_id,)).fetchone()
         snapshot = review["artifact_snapshot_json"]

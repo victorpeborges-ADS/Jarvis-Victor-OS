@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { createG5Ipc, executeRuntimeCommand, grantIsDisplayedActive, parseG5CommandResult, parseG5SessionSnapshot, parseLocalRuntimeConfig, parseTransportSnapshot } from "../src/runtimeCommand.ts";
+import { readFileSync } from "node:fs";
+import { CONVERSATION_ASK_WIRE_FIELDS, CONVERSATION_CANCEL_WIRE_FIELDS, CONVERSATION_OPEN_WIRE_FIELDS, ConversationRequestGate, createG5Ipc, executeRuntimeCommand, grantIsDisplayedActive, parseWorkflowPageResult, parseG5CommandResult, parseG5SessionSnapshot, parseLocalRuntimeConfig, parseTransportSnapshot, STORAGE_ROTATE_FINALIZE_WIRE_FIELDS, STORAGE_ROTATE_RETIRE_WIRE_FIELDS, STORAGE_ROTATE_WIRE_FIELDS, SYNTHETIC_DOCUMENT_WIRE_FIELDS } from "../src/runtimeCommand.ts";
 
 test("concessão exibida segue o instante do servidor, não o rótulo", () => {
   const future = Date.now() * 1000 + 60_000_000;
@@ -174,6 +175,241 @@ test("captura diária usa somente comandos IPC tipados para CRUD", async () => {
   ]);
 });
 
+test("memória usa IPC fechado, origem validada e exportação sem caminho da WebView", async () => {
+  const calls = [];
+  const record = {
+    id: "0123456789abcdef0123456789abcdef", category: "confirmed_fact", domain_id: "dom_synthetic_b",
+    body: "fato sintético confirmado", source_kind: "owner_confirmation", source_ref: "owner-note",
+    version: 1, recorded_at: "2026-10-21T18:00:00+00:00", revised_at: "2026-10-21T18:00:00+00:00",
+  };
+  const ipc = createG5Ipc(async (command, args) => {
+    calls.push({ command, args });
+    if (command === "g5_memory_page") return JSON.stringify({ ok: true, has_item: true, record });
+    if (command === "g5_memory_delete") return JSON.stringify({ ok: true, deleted: true });
+    if (command === "g5_memory_export") return JSON.stringify({ ok: true, exported: true });
+    if (command === "g5_memory_edit") return JSON.stringify({ ok: true, record: { ...record, body: "fato corrigido", version: 2, revised_at: "2026-10-21T18:05:00+00:00" } });
+    return JSON.stringify({ ok: true, record });
+  });
+  const page = await ipc.memoryPage("confirmed_fact", "dom_synthetic_b", 0);
+  await ipc.memoryCreate("confirmed_fact", "dom_synthetic_b", record.body, record.source_ref);
+  await ipc.memoryEdit("confirmed_fact", "dom_synthetic_b", record.id, "fato corrigido", 1);
+  await ipc.memoryDelete("confirmed_fact", "dom_synthetic_b", record.id, 2);
+  const exported = await ipc.memoryExport();
+  assert.equal(page.memory_record.source_ref, "owner-note");
+  assert.equal(exported.exported, true);
+  assert.deepEqual(calls, [
+    { command: "g5_memory_page", args: { category: "confirmed_fact", domainId: "dom_synthetic_b", offset: 0 } },
+    { command: "g5_memory_create", args: { category: "confirmed_fact", domainId: "dom_synthetic_b", body: record.body, sourceRef: "owner-note" } },
+    { command: "g5_memory_edit", args: { category: "confirmed_fact", domainId: "dom_synthetic_b", recordId: record.id, body: "fato corrigido", expectedRevision: 1 } },
+    { command: "g5_memory_delete", args: { category: "confirmed_fact", domainId: "dom_synthetic_b", recordId: record.id, expectedRevision: 2 } },
+    { command: "g5_memory_export", args: undefined },
+  ]);
+  assert.throws(() => parseG5CommandResult(JSON.stringify({ ok: true, has_item: true, record: { ...record, extra: "campo" } })));
+  assert.throws(() => parseG5CommandResult(JSON.stringify({ ok: true, has_item: true, record: { ...record, domain_id: "dom_real" } })));
+  assert.throws(() => parseG5CommandResult(JSON.stringify({ ok: true, exported: true, path: "/arbitrario" })));
+  assert.throws(() => parseG5CommandResult(JSON.stringify({ ok: true, has_item: false, record })));
+});
+
+test("memória recusa categoria, domínio e revisão inválidos antes do IPC", async () => {
+  const calls = [];
+  const ipc = createG5Ipc(async (command) => { calls.push(command); return "{}"; });
+  const id = "0123456789abcdef0123456789abcdef";
+  await assert.rejects(() => ipc.memoryPage("unknown", "dom_synthetic_a", 0));
+  await assert.rejects(() => ipc.memoryPage("confirmed_fact", "dom_invalid", 0));
+  await assert.rejects(() => ipc.memoryCreate("confirmed_fact", "dom_invalid", "sintético", "origin"));
+  await assert.rejects(() => ipc.memoryEdit("confirmed_fact", "dom_synthetic_a", id, "sintético", 0));
+  await assert.rejects(() => ipc.memoryDelete("confirmed_fact", "dom_synthetic_a", id, -1));
+  assert.deepEqual(calls, []);
+});
+
+test("handlers de exclusão e sessão invalidam as cópias de memória na tela", () => {
+  // Structural regression only. This does not replace an interactive smoke test.
+  const app = readFileSync(new URL("../src/App.tsx", import.meta.url), "utf8");
+  const deletion = app.slice(app.indexOf("async function deleteMemory("), app.indexOf("async function exportMemory("));
+  for (const setter of ["setMemoryRecords", "setCaptures", "setSearchHits", "setOpenedOrigin", "setMemoryBody"]) {
+    assert.ok(deletion.includes(setter), setter);
+  }
+  const captureDeletion = app.slice(app.indexOf("async function removeCapture("), app.indexOf("async function searchIdeas("));
+  assert.ok(captureDeletion.includes("setMemoryRecords"));
+  assert.ok(captureDeletion.includes("setMemorySelectedId"));
+  const bulkDeletion = app.slice(app.indexOf("async function clearCaptures("), app.indexOf("async function refreshAutomationData("));
+  assert.ok(bulkDeletion.includes('item.category !== "explicit_capture"'));
+  const sessionInvalidation = app.slice(app.indexOf('if (next.snapshot.state !== "READY"'), app.indexOf("} else if (!grantIsDisplayedActive"));
+  for (const setter of ["setMemoryRecords([])", "setSearchHits(null)", "setOpenedOrigin(null)", 'setMemoryBody("")']) {
+    assert.ok(sessionInvalidation.includes(setter), setter);
+  }
+});
+
+test("busca e abertura de captura usam comandos IPC tipados", async () => {
+  const calls = [];
+  const ipc = createG5Ipc(async (command, args) => {
+    calls.push({ command, args });
+    if (command === "g5_capture_search") {
+      return JSON.stringify({ ok: true, captures: [] });
+    }
+    return JSON.stringify({
+      ok: true,
+      origin: {
+        id: "0123456789abcdef0123456789abcdef",
+        text: "reunião sintética",
+        created_at: "2026-10-17T15:00:00+00:00",
+        domain_id: "dom_synthetic_a",
+        category: "explicit_capture",
+      },
+    });
+  });
+  const found = await ipc.searchCaptures("reuniao");
+  const opened = await ipc.openCapture("0123456789abcdef0123456789abcdef");
+  assert.deepEqual(found.captures, []);
+  assert.equal(found.omitted, undefined);
+  assert.equal(opened.origin.domain_id, "dom_synthetic_a");
+  assert.equal(opened.origin.category, "explicit_capture");
+  assert.equal(opened.origin.text, "reunião sintética");
+  assert.deepEqual(calls, [
+    { command: "g5_capture_search", args: { query: "reuniao" } },
+    { command: "g5_capture_open", args: { capture_id: "0123456789abcdef0123456789abcdef" } },
+  ]);
+});
+
+test("conversa grounded usa IPC fechado e descarta resposta de conversa anterior", async () => {
+  const calls = [];
+  const conversationId = "0123456789abcdef0123456789abcdef";
+  const factId = "abcdef0123456789abcdef0123456789";
+  const ipc = createG5Ipc(async (command, args) => {
+    calls.push({ command, args });
+    if (args?.question === "estoque confirmado") {
+      return JSON.stringify({ ok: true, grounded_read: {
+        status: "evidence", reason: "", provider_id: "fake-deterministic", cost: "unmeasured",
+        text: "estoque", omitted: 0,
+        sources: [{ id: factId, kind: "confirmed_fact", domain_id: "dom_synthetic_a", snippet: "estoque" }],
+      } });
+    }
+    return JSON.stringify({ ok: true, grounded_read: {
+      status: "evidence", reason: "", provider_id: "fake-deterministic", cost: "unmeasured",
+      text: "prazo", omitted: 0,
+      sources: [{ id: conversationId, kind: "capture", domain_id: "dom_synthetic_a", snippet: "prazo" }],
+    } });
+  });
+  const result = await ipc.groundedRead(conversationId, "qual prazo");
+  assert.equal(result.grounded_read.status, "evidence");
+  assert.equal(result.grounded_read.sources[0].id, conversationId);
+  const fact = await ipc.groundedRead(conversationId, "estoque confirmado");
+  assert.equal(fact.grounded_read.status, "evidence");
+  assert.equal(fact.grounded_read.text, "estoque");
+  assert.deepEqual(fact.grounded_read.sources, [{
+    id: factId, kind: "confirmed_fact", domain_id: "dom_synthetic_a", snippet: "estoque",
+  }]);
+  assert.deepEqual(calls, [
+    { command: "g5_conversation_ask", args: { conversation_id: conversationId, question: "qual prazo" } },
+    { command: "g5_conversation_ask", args: { conversation_id: conversationId, question: "estoque confirmado" } },
+  ]);
+  const refused = {
+    status: "evidence", reason: "", provider_id: "fake-deterministic", cost: "unmeasured",
+    text: "estoque", omitted: 0,
+    sources: [{ id: factId, kind: "confirmed_fact", domain_id: "dom_synthetic_a", snippet: "estoque" }],
+  };
+  assert.throws(() => parseG5CommandResult(JSON.stringify({ ok: true, grounded_read: { ...refused, unknown: true } })));
+  assert.throws(() => parseG5CommandResult(JSON.stringify({ ok: true, grounded_read: {
+    ...refused, sources: [{ ...refused.sources[0], kind: "tool" }],
+  } })));
+  assert.throws(() => parseG5CommandResult(JSON.stringify({ ok: true, grounded_read: {
+    ...refused, sources: [{ ...refused.sources[0], domain_id: "dom_synthetic_b" }],
+  } })));
+  assert.throws(() => parseG5CommandResult(JSON.stringify({ ok: true, grounded_read: {
+    ...refused, sources: [{ ...refused.sources[0], tool: "read_secret" }],
+  } })));
+  const gate = new ConversationRequestGate();
+  const old = gate.begin("conversa-antiga");
+  const current = gate.begin("conversa-atual");
+  assert.equal(gate.isCurrent(old, "conversa-atual"), false);
+  assert.equal(gate.isCurrent(current, "conversa-atual"), true);
+  gate.invalidate();
+  assert.equal(gate.isCurrent(current, "conversa-atual"), false);
+});
+
+test("abertura, cancelamento e pergunta preservam allowlists de fio em ordem fixa", async () => {
+  assert.deepEqual(CONVERSATION_ASK_WIRE_FIELDS, ["session_token", "conversation_id", "question", "domain_id"]);
+  assert.deepEqual(CONVERSATION_OPEN_WIRE_FIELDS, ["session_token", "domain_id", "mode"]);
+  assert.deepEqual(CONVERSATION_CANCEL_WIRE_FIELDS, ["session_token", "conversation_id", "domain_id"]);
+  const calls = [];
+  const id = "0123456789abcdef0123456789abcdef";
+  const ipc = createG5Ipc(async (command, args) => {
+    calls.push({ command, args });
+    return command === "g5_conversation_open"
+      ? JSON.stringify({ ok: true, id, expires_at: "2099-01-01T00:00:00+00:00" })
+      : JSON.stringify({ ok: true, cancelled: true });
+  });
+  const opened = await ipc.openConversation("resume");
+  const cancelled = await ipc.cancelConversation(id);
+  assert.equal(opened.id, id);
+  assert.equal(opened.expires_at, "2099-01-01T00:00:00+00:00");
+  assert.equal(cancelled.cancelled, true);
+  assert.deepEqual(calls, [
+    { command: "g5_conversation_open", args: { mode: "resume" } },
+    { command: "g5_conversation_cancel", args: { conversation_id: id } },
+  ]);
+  assert.throws(() => parseG5CommandResult(JSON.stringify({ ok: true, id, expires_at: "2099-01-01T00:00:00Z", extra: true })));
+  await assert.rejects(ipc.groundedRead("conversa-a", "qual prazo"));
+});
+
+test("geração de documento sintético usa comando IPC fechado e valida artefato e origem", async () => {
+  assert.deepEqual(SYNTHETIC_DOCUMENT_WIRE_FIELDS, ["session_token", "csrf_token"]);
+  assert.deepEqual(STORAGE_ROTATE_WIRE_FIELDS, ["database_key", "generation", "operation_id", "intent"]);
+  assert.deepEqual(STORAGE_ROTATE_RETIRE_WIRE_FIELDS, ["from_account"]);
+  assert.deepEqual(STORAGE_ROTATE_FINALIZE_WIRE_FIELDS, ["database_key", "operation_id"]);
+  assert.equal(STORAGE_ROTATE_WIRE_FIELDS.includes("extra"), false);
+  const calls = [];
+  const artifact = {
+    id: "doc_0123456789abcdef", schema_version: 1, kind: "synthetic_document",
+    title: "Resumo sintético de exemplo",
+    sections: [{ index: 1, heading: "Conteúdo de teste",
+      paragraphs: ["Este documento contém somente texto sintético local."], source_id: "src_exemplo_sintetico" }],
+    origin: { skill_id: "generate-synthetic-document", skill_version: "1.0.0",
+      manifest_sha256: "a".repeat(64), license_name: "nao-declarada-no-arquivo-local" },
+    permission: { capability: "generate_synthetic_document", scope: "synthetic", principal: "owner" },
+  };
+  const ipc = createG5Ipc(async (command, args) => {
+    calls.push([command, args]);
+    return JSON.stringify({ ok: true, artifact, artifact_sha256: "a".repeat(64) });
+  });
+  const result = await ipc.generateSyntheticDocument();
+  assert.equal(result.artifact.id, artifact.id);
+  assert.equal(result.artifact_sha256, "a".repeat(64));
+  assert.deepEqual(calls, [["g5_synthetic_document_generate", undefined]]);
+  assert.throws(() => parseG5CommandResult(JSON.stringify({ ok: true, artifact: { ...artifact, unknown: true } })));
+  assert.throws(() => parseG5CommandResult(JSON.stringify({ ok: true, artifact: {
+    ...artifact, permission: { ...artifact.permission, scope: "external" },
+  } })));
+  assert.throws(() => parseG5CommandResult(JSON.stringify({ ok: true, artifact, extra: true })));
+});
+
+test("captura rejeita campo ou código desconhecido e informa omissão", () => {
+  const capture = { id: "0123456789abcdef0123456789abcdef", text: "ideia", created_at: "2026-10-17T18:00:00+00:00" };
+  const full = [capture, { ...capture, id: "1123456789abcdef0123456789abcdef" }, { ...capture, id: "2123456789abcdef0123456789abcdef" }];
+  const parsed = parseG5CommandResult(JSON.stringify({ ok: true, captures: full, omitted: 2 }));
+  assert.equal(parsed.omitted, 2);
+  assert.equal(parsed.captures.length, 3);
+  assert.throws(() => parseG5CommandResult(JSON.stringify({ ok: true, captures: [capture], omitted: 2, items: [capture] })));
+  assert.throws(() => parseG5CommandResult(JSON.stringify({ ok: true, captures: [{ ...capture, token: "segredo" }] })));
+  assert.throws(() => parseG5CommandResult(JSON.stringify({
+    ok: true,
+    origin: { ...capture, domain_id: "dom_synthetic_a", code: "capture_rejected" },
+  })));
+  assert.throws(() => parseG5CommandResult(JSON.stringify({
+    ok: true,
+    origin: { ...capture, domain_id: "dom_synthetic_b", category: "explicit_capture" },
+  })));
+  assert.throws(() => parseG5CommandResult(JSON.stringify({
+    ok: true,
+    origin: { ...capture, domain_id: "dom_synthetic_a", category: "inferred_fact" },
+  })));
+  assert.throws(() => parseG5CommandResult(JSON.stringify({
+    ok: true,
+    items: [capture],
+  })));
+  assert.throws(() => parseG5CommandResult(JSON.stringify({ ok: true, captures: [capture], omitted: 1 })));
+});
+
 test("parser G5 aceita detalhe tipado e recusa controles antes da UI", () => {
   const detail = {
     id: "review_12345678",
@@ -304,4 +540,46 @@ test("automações locais usam somente IPC tipado e descartam campos inesperados
     kind: "reminder", title: "Lembrete", recurrence: "daily", localSchedule: "09:00",
     timezone: "UTC", quietStart: "", quietEnd: "", message: "Revisar", confirmLocalSources: false,
   });
+});
+
+
+test("histórico paginado usa somente comando tipado e cursor limitado", async () => {
+  const calls = [];
+  const ipc = createG5Ipc(async (command, args) => {
+    calls.push([command, args]);
+    return JSON.stringify({ ok: true, tasks: [], next_cursor: "" });
+  });
+  assert.deepEqual(await ipc.workflowPage(), { ok: true, tasks: [], next_cursor: "" });
+  assert.deepEqual(calls, [["g5_workflow_page", { cursor: "" }]]);
+  await assert.rejects(ipc.workflowPage("x".repeat(81)));
+  await assert.rejects(ipc.workflowPage(`wf1|2026-02-30T00:00:00+00:00|${"a".repeat(32)}`));
+  assert.equal(calls.length, 1);
+});
+
+test("página recusa extras, ordem invertida, cursor divergente e mantém fim explícito", () => {
+  const task = (id) => ({ task_id: id.repeat(32), tool_id: "draft_note", state: "proposed",
+    arguments_sha: "a".repeat(64), created_at: "2026-10-14T00:00:00+00:00",
+    updated_at: "2026-10-14T00:00:00+00:00", risk: "low", expected_effect: "rascunho local persistido" });
+  const cursor = `wf1|2026-10-14T00:00:00+00:00|${"b".repeat(32)}`;
+  const response = (tasks, next_cursor = "", extra = {}) => JSON.stringify({ ok: true, tasks, next_cursor, ...extra });
+  assert.equal(parseWorkflowPageResult(response([task("b")], cursor)).next_cursor, cursor);
+  assert.throws(() => parseWorkflowPageResult(response([task("b")], cursor), cursor));
+  assert.throws(() => parseWorkflowPageResult(response([task("a"), task("b")])));
+  assert.throws(() => parseWorkflowPageResult(response([{ ...task("b"), extra: true }])));
+  assert.throws(() => parseWorkflowPageResult(response([], cursor)));
+  assert.throws(() => parseWorkflowPageResult(response([], "", { extra: true })));
+  assert.throws(() => parseWorkflowPageResult(response([task("a")], cursor)));
+  assert.deepEqual(parseWorkflowPageResult(response([]), cursor), { ok: true, tasks: [], next_cursor: "" });
+});
+
+
+test("fixture real da API mantém o contrato consumido pela interface", () => {
+  const wire = readFileSync(new URL("../../api/fixtures/workflow_page_v1.txt", import.meta.url), "utf8");
+  const fields = Object.fromEntries(wire.trimEnd().split("\n").map((line) => {
+    const index = line.indexOf("="); return [line.slice(0, index), decodeURIComponent(line.slice(index + 1))];
+  }));
+  const page = parseWorkflowPageResult(JSON.stringify({ ok: fields.ok === "true", tasks: JSON.parse(fields.tasks_json), next_cursor: fields.next_cursor }));
+  assert.equal(page.ok, true);
+  assert.equal(page.tasks[0].task_id, "a".repeat(32));
+  assert.equal(page.next_cursor, "");
 });

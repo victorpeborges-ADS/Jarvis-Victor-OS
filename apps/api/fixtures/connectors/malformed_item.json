@@ -1,0 +1,12 @@
+{
+  "fixture_id": "malformed_item",
+  "connector": "gmail",
+  "source_claimed_at": "2026-10-17T11:50:00Z",
+  "items": [
+    {
+      "kind": "gmail",
+      "external_id": "m-bad",
+      "snippet": "sem assunto"
+    }
+  ]
+}

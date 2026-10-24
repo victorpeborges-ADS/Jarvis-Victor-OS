@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import fcntl
 import json
 import logging
 import os
@@ -10,6 +11,8 @@ import platform
 import secrets
 import sqlite3
 import stat
+import threading
+import tempfile
 from contextlib import closing, contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -18,6 +21,17 @@ from typing import Iterator, Sequence
 from pydantic import BaseModel, ValidationError
 
 from domain_registry import CANONICAL_CONNECTORS, CANONICAL_DOMAIN_IDS, CANONICAL_RESOURCES
+import database_leases as leases
+from sealed_database import (
+    PlaintextDatabaseRefused,
+    SealedDatabaseError,
+    configure_memory_connection,
+    inspect_pending_snapshots,
+    load_connection,
+    read_encrypted_snapshot,
+    validate_key,
+    write_encrypted_snapshot,
+)
 from memory_models import (
     AuditRecord, CalendarSyncCheckpoint, EntityRecord, EventRecord, ReadScope,
     RelationRecord, SourceRecord, StrictRecord,
@@ -203,6 +217,27 @@ def _safe_database_path(path: Path) -> Path:
     raise ValueError("o banco local deve ficar fora do repositório")
 
 
+def is_synthetic_temporary_database(path: Path | str) -> bool:
+    """Require an explicit database override rooted under the OS temp directory.
+
+    This gate keeps the new storage bootstrap from touching the normal daily
+    database while the encrypted synthetic profile is the only supported one.
+    """
+    override = os.environ.get("JARVIS_DATABASE_PATH")
+    if not override:
+        return False
+    try:
+        candidate = _safe_database_path(Path(path))
+        configured = _safe_database_path(Path(override))
+        if candidate != configured:
+            return False
+        temporary_root = Path(tempfile.gettempdir()).resolve()
+        candidate.parent.resolve().relative_to(temporary_root)
+    except (OSError, ValueError):
+        return False
+    return True
+
+
 def _aware_iso(value: datetime | None) -> str | None:
     return value.isoformat() if value is not None else None
 
@@ -213,23 +248,260 @@ def _validated(model_type: type[BaseModel], value):
     return model_type.model_validate(value)
 
 
-class SQLiteMemoryStore:
-    """Small repository with transactional writes and grant-scoped read methods."""
+class _LeasedConnection(sqlite3.Connection):
+    _lease = None
+    _store = None
+    _operation_lock = None
+    _saved_changes = 0
 
-    def __init__(self, path: Path | str | None = None, *, migrations_dir: Path | None = None) -> None:
+    def commit(self):
+        super().commit()
+        if self._store is not None:
+            self._store._persist_connection(self)
+
+    def close(self):
+        try:
+            if self._store is not None and not self.in_transaction and self.total_changes > self._saved_changes:
+                self._store._persist_connection(self)
+        finally:
+            try:
+                super().close()
+            finally:
+                store = self._store
+                if store is not None and store._active_connection is self:
+                    store._active_connection = None
+                if self._lease is not None:
+                    lease, self._lease = self._lease, None
+                    lease.__exit__(None, None, None)
+                if self._operation_lock is not None:
+                    operation_lock, self._operation_lock = self._operation_lock, None
+                    operation_lock.release()
+
+
+class SQLiteMemoryStore:
+    """SQLite in RAM with an encrypted, atomic snapshot as the only disk image."""
+
+    def __init__(
+        self,
+        path: Path | str | None = None,
+        *,
+        migrations_dir: Path | None = None,
+        storage_key: bytes | bytearray | None = None,
+    ) -> None:
         self.path = _safe_database_path(Path(path)) if path is not None else default_database_path()
         self.migrations_dir = migrations_dir or MIGRATIONS_DIR
         self._initialized = False
+        self._database_identity = None
+        self._state_lock = threading.RLock()
+        self._operation_lock = threading.RLock()
+        self._active_connection: _LeasedConnection | None = None
+        self._runtime_active = False
+        self._key: bytearray | None = None
+        if storage_key is not None:
+            validate_key(storage_key)
+            self._key = bytearray(storage_key)
+
+    @property
+    def is_unlocked(self) -> bool:
+        return self._initialized and self._key is not None
+
+    def unlock(self, storage_key: bytes | bytearray) -> None:
+        validate_key(storage_key)
+        with self._state_lock:
+            if self._key is not None and self._initialized:
+                raise MemoryStoreError("memória local já desbloqueada")
+            self._key = bytearray(storage_key)
+        try:
+            self._prepare_private_path()
+            if is_synthetic_temporary_database(self.path):
+                from storage_key_rotation import journal_path, select_account
+
+                marker = journal_path(self.path)
+                if marker.exists() or marker.is_symlink():
+                    select_account(self.path, bytes(self._key))
+            if self._runtime_active:
+                from restore_activation import assert_ready
+                assert_ready(self.path)
+                self._initialize_locked()
+            else:
+                with leases.lock(self.path, exclusive=True), leases.lock(self.path, writer=True):
+                    from restore_activation import recover_locked
+                    recover_locked(self.path, bytes(self._key))
+                    self._initialize_locked()
+        except BaseException:
+            self.lock()
+            raise
+
+    def lock(self) -> None:
+        with self._state_lock:
+            self._initialized = False
+            connection = self._active_connection
+            key = self._key
+        if connection is not None:
+            try:
+                connection.interrupt()
+            except sqlite3.Error:
+                pass
+        # Wait for an admitted operation to finish and close before zeroing the
+        # key. No new operation passes _connect after _initialized is cleared.
+        with self._operation_lock:
+            with self._state_lock:
+                if self._key is not None:
+                    self._key[:] = b"\x00" * len(self._key)
+                self._key = None
+                self._active_connection = None
+                self._database_identity = None
+
+    def rotate_storage_key(
+        self, new_key: bytes | bytearray, generation: str, operation_id: str, intent: str,
+    ):
+        """Rotate one synthetic generation. The caller retires the old account later."""
+        validate_key(new_key)
+        if not is_synthetic_temporary_database(self.path):
+            raise MemoryStoreError("rotação exige perfil sintético temporário")
+        from storage_key_rotation import SuppliedKeys, rotate_generation, select_account
+
+        with self._state_lock:
+            if self._key is None or not self._initialized:
+                raise MemoryStoreError("memória local bloqueada")
+            connection = self._active_connection
+            if connection is not None:
+                try:
+                    in_transaction = connection.in_transaction
+                    dirty = connection.total_changes > connection._saved_changes
+                except sqlite3.ProgrammingError:
+                    self._active_connection = None
+                else:
+                    if in_transaction:
+                        raise MemoryStoreError("rotação recusada com transação aberta")
+                    if dirty:
+                        self._persist_connection(connection)
+            current = bytes(self._key)
+            try:
+                account = select_account(self.path, current, bytes(new_key))
+                result = rotate_generation(
+                    self.path,
+                    old_key=current,
+                    new_key=bytes(new_key),
+                    generation=generation,
+                    operation_id=operation_id,
+                    intent=intent,
+                    keychain=SuppliedKeys({account: current, generation: bytes(new_key)}),
+                    leases_held=self._runtime_active,
+                    retire=False,
+                )
+            except BaseException:
+                self.lock()
+                raise
+            if result.key_changed:
+                self._key[:] = b"\x00" * len(self._key)
+                self._key = bytearray(new_key)
+                info = self.path.stat()
+                self._database_identity = (info.st_dev, info.st_ino)
+            return result
+
+    def finalize_storage_key(self, operation_id: str):
+        """Drop the recovery role after the supervisor has removed the old account."""
+        if self._key is None or not self._initialized:
+            raise MemoryStoreError("memória local bloqueada")
+        if not is_synthetic_temporary_database(self.path):
+            raise MemoryStoreError("rotação exige perfil sintético temporário")
+        from storage_key_rotation import SuppliedKeys, finalize_rotation, select_account
+
+        current = bytes(self._key)
+        account = select_account(self.path, current)
+        try:
+            return finalize_rotation(
+                self.path,
+                current_key=current,
+                operation_id=operation_id,
+                keychain=SuppliedKeys({account: current}),
+                leases_held=self._runtime_active,
+            )
+        except BaseException:
+            self.lock()
+            raise
+
+    def mark_storage_key_retired(self, from_account: str) -> None:
+        if self._key is None or not self._initialized:
+            raise MemoryStoreError("memória local bloqueada")
+        if not is_synthetic_temporary_database(self.path):
+            raise MemoryStoreError("rotação exige perfil sintético temporário")
+        from storage_key_rotation import mark_rotation_retired
+
+        mark_rotation_retired(
+            self.path,
+            current_key=bytes(self._key),
+            from_account=from_account,
+            leases_held=self._runtime_active,
+        )
+
+    def _persist_connection(self, connection: _LeasedConnection) -> None:
+        with self._state_lock:
+            key = self._key
+            if key is None:
+                raise MemoryStoreError("memória local bloqueada")
+            snapshot = connection.serialize()
+            write_encrypted_snapshot(self.path, snapshot, key, replace=self.path.exists())
+            info = self.path.stat()
+            self._database_identity = (info.st_dev, info.st_ino)
+            connection._saved_changes = connection.total_changes
 
     def initialize(self) -> None:
+        if self._key is None:
+            raise MemoryStoreError("chave de armazenamento necessária")
         self._prepare_private_path()
+        # Same order as activation and recover_activation. Exclusive maintenance
+        # alone does not cover a cooperative writer lease, and recovery can
+        # replace the database file.
+        with leases.lock(self.path, exclusive=True), leases.lock(self.path, writer=True):
+            # Recover activation before migrations; the explicit in-memory key
+            # authenticates sealed rollback and candidate images.
+            from restore_activation import recover_locked
+
+            recover_locked(self.path, bytes(self._key))
+            self._initialize_locked()
+
+    @contextmanager
+    def runtime(self):
+        """Acquire the runtime lease without opening the database; startup stays locked."""
+        if not is_synthetic_temporary_database(self.path):
+            # Normal launch remains inert until a supported synthetic profile
+            # is explicitly configured. In particular, do not create leases or
+            # directories beside the daily database on startup.
+            yield
+            return
+        self._prepare_private_path()
+        with leases.lock(self.path, exclusive=True) as maintenance, leases.lock(self.path, writer=True):
+            self._runtime_active = True
+            fcntl.flock(maintenance, fcntl.LOCK_SH | fcntl.LOCK_NB)
+            try:
+                yield
+            finally:
+                self.lock()
+                self._runtime_active = False
+
+    def _initialize_locked(self) -> None:
+        self._initialized = False
+        if self._key is None:
+            raise MemoryStoreError("chave de armazenamento necessária")
+        for suffix in ("-wal", "-shm", "-journal"):
+            residual = Path(f"{self.path}{suffix}")
+            if residual.exists() or residual.is_symlink():
+                raise MemoryStoreError("arquivo SQLite auxiliar residual; manutenção necessária")
+        # Snapshot publication is atomic. A crash may leave a ciphertext-only
+        # .pending file; authenticate complete residues but never replay or
+        # unlink them because the primary path is the committed generation.
+        inspect_pending_snapshots(self.path, self._key)
+        born = not self.path.exists()
+        if born and leases.enrolled(self.path):
+            raise MemoryStoreError("banco registrado ausente; manutenção necessária")
         connection: sqlite3.Connection | None = None
         try:
-            connection = self._connect()
-            mode = connection.execute("PRAGMA journal_mode=WAL").fetchone()[0]
-            if str(mode).lower() != "wal":
-                raise MemoryStoreError("não foi possível habilitar WAL")
-            connection.execute("PRAGMA synchronous=FULL")
+            connection = self._connect_unleased(factory=_LeasedConnection)
+            mode = connection.execute("PRAGMA journal_mode").fetchone()[0]
+            if str(mode).lower() != "memory":
+                raise MemoryStoreError("SQLite não permaneceu exclusivamente em memória")
             self._apply_migrations(connection)
             self._validate_schema(connection)
             check = connection.execute("PRAGMA quick_check").fetchone()[0]
@@ -237,11 +509,21 @@ class SQLiteMemoryStore:
                 raise DatabaseCorruptError("banco local corrompido")
             if connection.execute("PRAGMA foreign_key_check").fetchone() is not None:
                 raise DatabaseCorruptError("integridade referencial do banco inválida")
+        except (PlaintextDatabaseRefused, SealedDatabaseError):
+            raise
         except sqlite3.DatabaseError as exc:
             raise DatabaseCorruptError("não foi possível abrir o banco local") from exc
         finally:
             if connection is not None:
                 connection.close()
+        if not self.path.exists():
+            # An empty schema is not allowed to become a persistent SQLite file.
+            # This branch is only reachable if the migration set had no writes.
+            raise MigrationError("migrações não produziram snapshot cifrado")
+        info = self.path.stat()
+        self._database_identity = (info.st_dev, info.st_ino)
+        if born:
+            leases.mark_birth(self.path)
         self._initialized = True
 
     def _prepare_private_path(self) -> None:
@@ -257,22 +539,56 @@ class SQLiteMemoryStore:
         if not parent_existed:
             os.chmod(self.path.parent, 0o700)
         if self.path.exists():
-            file_stat = self.path.stat()
+            file_stat = self.path.lstat()
             if not stat.S_ISREG(file_stat.st_mode):
                 raise ValueError("o caminho do banco precisa ser um arquivo regular")
             if file_stat.st_uid != os.getuid():
                 raise PermissionError("arquivo do banco pertence a outro usuário")
-            os.chmod(self.path, 0o600)
+            if stat.S_IMODE(file_stat.st_mode) & 0o077 or file_stat.st_nlink != 1:
+                raise PermissionError("arquivo do banco precisa ser privado e não compartilhado")
 
     def _connect(self) -> sqlite3.Connection:
-        connection = sqlite3.connect(self.path, timeout=5.0, isolation_level=None)
-        connection.row_factory = sqlite3.Row
-        connection.execute("PRAGMA foreign_keys=ON")
-        connection.execute("PRAGMA busy_timeout=5000")
-        connection.execute("PRAGMA synchronous=FULL")
-        if self.path.exists():
-            os.chmod(self.path, 0o600)
-        return connection
+        self._require_initialized()
+        self._operation_lock.acquire()
+        lease = leases.lock(self.path)
+        lease_entered = False
+        try:
+            lease.__enter__()
+            lease_entered = True
+            from restore_activation import assert_ready
+            assert_ready(self.path)
+            info = self.path.stat()
+            if self._database_identity != (info.st_dev, info.st_ino):
+                raise MemoryStoreError("geração do banco mudou; reinicie o store")
+            connection = self._connect_unleased(factory=_LeasedConnection)
+            connection._lease = lease
+            connection._store = self
+            connection._operation_lock = self._operation_lock
+            self._active_connection = connection
+            return connection
+        except BaseException:
+            if lease_entered:
+                lease.__exit__(None, None, None)
+            self._operation_lock.release()
+            raise
+
+    def _connect_unleased(self, *, factory=sqlite3.Connection) -> sqlite3.Connection:
+        if self._key is None:
+            raise MemoryStoreError("memória local bloqueada")
+        connection = sqlite3.connect(":memory:", timeout=5.0, isolation_level=None, factory=factory)
+        try:
+            connection.row_factory = sqlite3.Row
+            configure_memory_connection(connection)
+            if self.path.exists():
+                image = read_encrypted_snapshot(self.path, self._key)
+                load_connection(connection, image)
+                configure_memory_connection(connection)
+            if isinstance(connection, _LeasedConnection):
+                connection._store = self
+            return connection
+        except BaseException:
+            connection.close()
+            raise
 
     def _apply_migrations(self, connection: sqlite3.Connection) -> None:
         files = sorted(self.migrations_dir.glob("[0-9][0-9][0-9][0-9]_*.sql"))
@@ -441,7 +757,7 @@ class SQLiteMemoryStore:
             raise MigrationError("migração contém uma instrução SQL incompleta")
 
     def _require_initialized(self) -> None:
-        if not self._initialized:
+        if not self._initialized or self._key is None:
             raise MemoryStoreError("banco local ainda não foi inicializado")
 
     @staticmethod

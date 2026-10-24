@@ -1,0 +1,14 @@
+{
+  "fixture_id": "mcp_missing_schema",
+  "connector": "mcp",
+  "source_claimed_at": "2026-10-17T11:56:00Z",
+  "items": [
+    {
+      "kind": "mcp",
+      "external_id": "mcp-noschema",
+      "tool_name": "fixture.echo",
+      "read_only_annotation": true,
+      "description": "sem versao"
+    }
+  ]
+}

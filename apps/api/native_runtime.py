@@ -18,7 +18,7 @@ from fastapi.responses import PlainTextResponse
 
 PROTOCOL_VERSION = "3"
 RUNTIME_KIND = "jarvis-synthetic"
-BUILD_ID = "g6-mac-002-2-encrypted-uds-v3"
+BUILD_ID = "g6-mac-002-3-locked-storage-v3"
 INIT_PREFIX = b"JARVIS_TRANSPORT_INIT "
 INIT_MAX_BYTES = 1024
 APP_REQUEST_MAX_BYTES = 1024
@@ -37,6 +37,12 @@ ENVELOPE_ROUTE = "/v3/secure"
 ENVELOPE_RESPONSE_MAX_BYTES = APP_RESPONSE_MAX_BYTES + ENVELOPE_NONCE_BYTES + ENVELOPE_TAG_BYTES + 7
 APP_PATHS = frozenset(
     {
+        ("POST", "/v1/app/storage/status"),
+        ("POST", "/v1/app/storage/unlock"),
+        ("POST", "/v1/app/storage/rotate"),
+        ("POST", "/v1/app/storage/rotate-retire"),
+        ("POST", "/v1/app/storage/rotate-finalize"),
+        ("POST", "/v1/app/storage/lock"),
         ("POST", "/v1/app/session/open"),
         ("POST", "/v1/app/session/close"),
         ("POST", "/v1/app/grants/mission-read"),
@@ -46,7 +52,17 @@ APP_PATHS = frozenset(
         ("POST", "/v1/app/captures/edit"),
         ("POST", "/v1/app/captures/delete"),
         ("POST", "/v1/app/captures/list"),
+        ("POST", "/v1/app/captures/search"),
+        ("POST", "/v1/app/captures/open"),
         ("POST", "/v1/app/captures/clear"),
+        ("POST", "/v1/app/memory/page"),
+        ("POST", "/v1/app/memory/create"),
+        ("POST", "/v1/app/memory/edit"),
+        ("POST", "/v1/app/memory/delete"),
+        ("POST", "/v1/app/conversation/ask"),
+        ("POST", "/v1/app/conversation/open"),
+        ("POST", "/v1/app/conversation/cancel"),
+        ("POST", "/v1/app/artifacts/synthetic-document"),
         ("POST", "/v1/app/connectors/status"),
         ("POST", "/v1/app/grants/mission-review"),
         ("POST", "/v1/app/grants/mission-review/revoke"),
@@ -56,6 +72,7 @@ APP_PATHS = frozenset(
         ("POST", "/v1/app/reviews/approve"),
         ("POST", "/v1/app/workflows/submit"),
         ("POST", "/v1/app/workflows/list"),
+        ("POST", "/v1/app/workflows/page"),
         ("POST", "/v1/app/workflows/detail"),
         ("POST", "/v1/app/workflows/approve"),
         ("POST", "/v1/app/workflows/execute"),
@@ -91,11 +108,13 @@ class NativeRuntimeIdentity:
     acknowledged: Event = field(default_factory=Event, repr=False)
     replay_lock: Lock = field(default_factory=Lock, repr=False)
     last_request_sequence: int = field(default=0, repr=False)
+    request_sequence_window: int = field(default=0, repr=False)
 
     def clear(self) -> None:
         self.secret[:] = b"\x00" * len(self.secret)
         with self.replay_lock:
             self.last_request_sequence = 0
+            self.request_sequence_window = 0
 
 
 def read_child_init(record: bytearray, expected_instance_id: str) -> NativeRuntimeIdentity:
@@ -251,9 +270,21 @@ class ReplayError(ValueError):
 def _reserve_request_sequence(identity: NativeRuntimeIdentity, nonce: bytes) -> None:
     sequence = int.from_bytes(nonce[:ENVELOPE_SEQUENCE_BYTES], "big")
     with identity.replay_lock:
-        if sequence <= identity.last_request_sequence:
+        high = identity.last_request_sequence
+        if sequence > high:
+            delta = sequence - high
+            identity.request_sequence_window = (
+                1 if delta >= 64 else ((identity.request_sequence_window << delta) | 1) & ((1 << 64) - 1)
+            )
+            identity.last_request_sequence = sequence
+            return
+        distance = high - sequence
+        if distance >= 64:
             raise ReplayError
-        identity.last_request_sequence = sequence
+        bit = 1 << distance
+        if identity.request_sequence_window & bit:
+            raise ReplayError
+        identity.request_sequence_window |= bit
 
 
 def _accept_request_nonce(identity: NativeRuntimeIdentity, nonce: bytes) -> bool:

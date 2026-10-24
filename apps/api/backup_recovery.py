@@ -24,7 +24,17 @@ from typing import Any
 from cryptography.exceptions import InvalidTag
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives.kdf.argon2 import Argon2id
-from memory_store import MIGRATIONS_DIR, REPOSITORY_ROOT, SQLiteMemoryStore
+from memory_store import MIGRATIONS_DIR, REPOSITORY_ROOT, MemoryStoreError, SQLiteMemoryStore
+import database_leases as leases
+from sealed_database import (
+    KeychainUnavailable,
+    PlaintextDatabaseRefused,
+    SealedDatabaseError,
+    read_encrypted_snapshot,
+    validate_image,
+    validate_key,
+    write_encrypted_snapshot,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -62,6 +72,10 @@ class BackupCollisionError(BackupError):
 
 class RestoreDestinationError(BackupError):
     pass
+
+
+class LegacyDeletionConfirmationRequired(BackupError):
+    """An older snapshot has no deletion ledger and may resurrect removed rows."""
 
 
 def default_backup_directory(database_path: Path | str) -> Path:
@@ -373,7 +387,7 @@ def _validate_snapshot(connection: sqlite3.Connection, validator_path: Path) -> 
         validator._validate_schema(connection)
     except BackupError:
         raise
-    except (sqlite3.DatabaseError, OSError, ValueError) as exc:
+    except (sqlite3.DatabaseError, OSError, ValueError, MemoryStoreError) as exc:
         raise BackupError("integridade ou esquema do banco restaurado inválido") from exc
 
 
@@ -388,6 +402,13 @@ def _snapshot_database(database_path: Path) -> bytes:
         source.backup(snapshot, pages=128, sleep=0.01)
         _validate_snapshot(snapshot, database_path)
         image = snapshot.serialize()
+        # SQLite backup from a WAL source preserves WAL format bytes even in
+        # an in-memory destination. deserialize() cannot open that detached
+        # WAL image. The backup API has already folded committed WAL pages into
+        # this standalone image; normalize only its journal format markers.
+        # The source and its WAL are never changed by this read-only snapshot.
+        if image.startswith(b"SQLite format 3\x00") and image[18:20] == b"\x02\x02":
+            image = image[:18] + b"\x01\x01" + image[20:]
         if not isinstance(image, bytes) or not image or len(image) > MAX_DATABASE_BYTES:
             raise BackupError("snapshot SQLite excede o limite permitido")
         return image
@@ -454,17 +475,27 @@ def create_backup(
     passphrase: str,
     *,
     filename: str | None = None,
+    storage_key: bytes | bytearray | memoryview | None = None,
 ) -> Path:
-    """Create an authenticated encrypted snapshot without writing to the source."""
+    """Create a passphrase-encrypted archive from the encrypted primary snapshot."""
     temporary_path: Path | None = None
     temporary_fd: int | None = None
     try:
         _password_bytes(passphrase)
+        if storage_key is None:
+            raise KeychainUnavailable("chave do Keychain necessária para backup")
+        validate_key(storage_key)
         source_path = _verify_source_files(database_path)
         destination_directory = _ensure_private_directory(backup_directory)
         if destination_directory == source_path.parent:
             raise BackupError("diretório de backup deve ser separado do banco")
-        snapshot = _snapshot_database(source_path)
+        with leases.lock(source_path):
+            from restore_activation import assert_ready
+            assert_ready(source_path)
+            if any(Path(f"{source_path}{suffix}").exists() for suffix in ("-wal", "-shm", "-journal")):
+                raise BackupError("resíduo SQLite inesperado no banco em memória")
+            snapshot = read_encrypted_snapshot(source_path, storage_key)
+            _validate_snapshot_image(snapshot)
         archive = _seal_snapshot(snapshot, passphrase)
         final_name = filename or _new_backup_filename()
         if (
@@ -496,6 +527,8 @@ def create_backup(
             raise BackupError("não foi possível publicar o backup com segurança") from exc
         return final_path
     except BackupError:
+        raise
+    except SealedDatabaseError:
         raise
     except Exception as exc:
         logger.error("encrypted backup creation failed")
@@ -544,28 +577,92 @@ def _read_backup_file(path: Path | str) -> tuple[Path, bytes]:
 def _validate_snapshot_image(image: bytes) -> bytes:
     if not image or len(image) > MAX_DATABASE_BYTES:
         raise BackupFormatError("conteúdo SQLite do backup inválido")
-    # A serialized SQLite image may retain WAL mode in its header. SQLite's
-    # deserialize() cannot reliably open that image as an in-memory database;
-    # validate it as a private temporary file after authentication instead.
-    validation_directory = _private_temporary_directory(".jarvis-validate-")
-    validation_file = validation_directory / "memory.sqlite3"
     try:
-        _write_private_database(validation_file, image)
-        _validate_database_file(validation_file)
-        with validation_file.open("rb") as database_file:
-            verified_image = database_file.read(MAX_DATABASE_BYTES + 1)
-        if not verified_image or len(verified_image) > MAX_DATABASE_BYTES:
-            raise BackupFormatError("conteúdo SQLite do backup inválido")
-        return verified_image
+        validate_image(image)
+        return image
+    except BackupError:
+        raise
+    except (SealedDatabaseError, sqlite3.DatabaseError, OSError, ValueError, MemoryError) as exc:
+        raise BackupFormatError("conteúdo SQLite do backup inválido") from exc
+
+
+def validate_activation_image(image: bytes) -> bytes:
+    """Validate the exact current schema in memory before legacy activation."""
+    verified = _validate_snapshot_image(image)
+    connection = sqlite3.connect(":memory:", isolation_level=None)
+    try:
+        connection.deserialize(verified)
+        from sealed_database import configure_memory_connection
+        configure_memory_connection(connection)
+        _validate_snapshot(connection, Path("/tmp/jarvis-memory-activation-schema-validator"))
+        return verified
     except BackupError:
         raise
     except (sqlite3.DatabaseError, OSError, ValueError, MemoryError) as exc:
         raise BackupFormatError("conteúdo SQLite do backup inválido") from exc
     finally:
+        connection.close()
+
+
+def _prepare_restore_image(image: bytes, *, confirm_legacy_resurrection: bool, current_image: bytes | None = None) -> bytes:
+    """Upgrade and replay tombstones in memory before publishing an encrypted DB."""
+    connection = sqlite3.connect(":memory:", isolation_level=None)
+    try:
+        connection.deserialize(image)
+        from sealed_database import configure_memory_connection
+        configure_memory_connection(connection)
+        migrations = _expected_migration_checksums(MIGRATIONS_DIR)
+        applied = connection.execute(
+            "SELECT version, checksum FROM schema_migrations ORDER BY version"
+        ).fetchall()
+        if len(applied) > len(migrations) or applied != migrations[:len(applied)]:
+            raise BackupFormatError("histórico de migrações do backup não reconhecido")
+        has_ledger = connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='memory_deletion_tombstones'"
+        ).fetchone() is not None
+        has_deletion_records = has_ledger and connection.execute(
+            "SELECT 1 FROM memory_deletion_tombstones LIMIT 1"
+        ).fetchone() is not None
+        if not has_deletion_records and not confirm_legacy_resurrection:
+            raise LegacyDeletionConfirmationRequired(
+                "backup sem exclusões registradas; itens apagados depois dele podem voltar"
+            )
+        if len(applied) != len(migrations):
+            migrator = SQLiteMemoryStore(Path("/tmp/jarvis-memory-restore-schema-validator"))
+            connection.row_factory = sqlite3.Row
+            try:
+                migrator._apply_migrations(connection)
+            except MemoryStoreError as exc:
+                raise BackupFormatError("migrações do backup incompatíveis") from exc
+            finally:
+                connection.row_factory = None
+        from memory_deletions import MemoryRevisionConflict, apply_deletion_tombstones, reconcile_deletion_tombstones
         try:
-            shutil.rmtree(validation_directory)
-        except OSError:
-            logger.warning("private validation snapshot cleanup failed")
+            if current_image is not None:
+                validate_activation_image(current_image)
+                current = sqlite3.connect(":memory:", isolation_level=None)
+                try:
+                    current.deserialize(current_image)
+                    configure_memory_connection(current)
+                    reconcile_deletion_tombstones(connection, current)
+                finally:
+                    current.close()
+            else:
+                reconcile_deletion_tombstones(connection, connection)
+            apply_deletion_tombstones(connection, reject_newer_revision=True)
+        except MemoryRevisionConflict as exc:
+            raise BackupFormatError("conflito entre exclusão e revisão do backup") from exc
+        _validate_snapshot(connection, Path("/tmp/jarvis-memory-restore-schema-validator"))
+        upgraded = connection.serialize()
+        if not isinstance(upgraded, bytes) or not upgraded or len(upgraded) > MAX_DATABASE_BYTES:
+            raise BackupFormatError("conteúdo SQLite do backup inválido")
+        return upgraded
+    except (sqlite3.DatabaseError, ValueError, MemoryError) as exc:
+        if isinstance(exc, BackupError):
+            raise
+        raise BackupFormatError("conteúdo SQLite do backup inválido") from exc
+    finally:
+        connection.close()
 
 
 def _write_private_database(path: Path, image: bytes) -> None:
@@ -622,15 +719,15 @@ def restore_backup(
     passphrase: str,
     *,
     destination_name: str | None = None,
+    storage_key: bytes | bytearray | memoryview | None = None,
+    confirm_legacy_resurrection: bool = False,
 ) -> Path:
-    """Authenticate, validate, and publish a new isolated database directory."""
-    staging_directory: Path | None = None
-    destination_directory: Path | None = None
-    destination_created = False
-    restore_completed = False
-    published_database: Path | None = None
+    """Authenticate and publish an encrypted primary database without a clear staging file."""
     try:
         _password_bytes(passphrase)
+        if storage_key is None:
+            raise KeychainUnavailable("chave do Keychain necessária para restauração")
+        validate_key(storage_key)
         _, archive = _read_backup_file(backup_path)
         plaintext = _open_archive(archive, passphrase)
         name = destination_name or _new_restore_directory_name()
@@ -647,52 +744,26 @@ def restore_backup(
         if destination_directory.exists() or destination_directory.is_symlink():
             raise RestoreDestinationError("o destino de restauração já existe")
         verified_image = _validate_snapshot_image(plaintext)
+        verified_image = _prepare_restore_image(
+            verified_image, confirm_legacy_resurrection=confirm_legacy_resurrection,
+        )
 
         root = _ensure_private_directory(root)
         if destination_directory.exists() or destination_directory.is_symlink():
             raise RestoreDestinationError("o destino de restauração já existe")
-        staging_directory = Path(tempfile.mkdtemp(prefix=".jarvis-restore-incomplete-", dir=root))
-        os.chmod(staging_directory, 0o700)
-        staging_file = staging_directory / "memory.sqlite3.partial"
-        _write_private_database(staging_file, verified_image)
-        _validate_database_file(staging_file)
-
         try:
             destination_directory.mkdir(mode=0o700)
         except FileExistsError as exc:
             raise RestoreDestinationError("o destino de restauração já existe") from exc
-        destination_created = True
         _directory_stat(destination_directory, private=True)
         published_database = destination_directory / "memory.sqlite3"
-        os.link(staging_file, published_database, follow_symlinks=False)
-        _fsync_directory(destination_directory)
+        write_encrypted_snapshot(published_database, verified_image, storage_key, replace=False)
         _fsync_directory(root)
-        _remove_private_sqlite_sidecars(staging_file)
-        staging_file.unlink()
-        _fsync_directory(staging_directory)
-        staging_directory.rmdir()
-        staging_directory = None
-        _fsync_directory(root)
-        restore_completed = True
         return published_database
     except BackupError:
+        raise
+    except SealedDatabaseError:
         raise
     except Exception as exc:
         logger.error("isolated backup restore failed")
         raise BackupError("não foi possível restaurar o backup isolado") from exc
-    finally:
-        if staging_directory is not None:
-            try:
-                shutil.rmtree(staging_directory)
-            except OSError:
-                logger.warning("private restore staging cleanup failed")
-        if destination_created and not restore_completed and destination_directory is not None:
-            if published_database is not None:
-                try:
-                    published_database.unlink(missing_ok=True)
-                except OSError:
-                    logger.warning("private restored database cleanup failed")
-            try:
-                destination_directory.rmdir()
-            except OSError:
-                logger.warning("private restore directory cleanup failed")

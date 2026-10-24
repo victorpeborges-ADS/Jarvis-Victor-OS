@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import json
 import os
 import select
 import shutil
@@ -15,17 +16,21 @@ from urllib.parse import quote, unquote
 import pytest
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 
-from memory_store import SQLiteMemoryStore
-from mission_repository import MissionRepository
 
 PASSPHRASE = "senha-sintetica-processo-mac003"
 SERVE = Path(__file__).with_name("serve.py")
 PROTOCOL_VERSION = "3"
 RUNTIME_KIND = "jarvis-synthetic"
-BUILD_ID = "g6-mac-002-2-encrypted-uds-v3"
+BUILD_ID = "g6-mac-002-3-locked-storage-v3"
 ENVELOPE_ROUTE = "/v3/secure"
 ENVELOPE_VERSION = 3
 APP_PATHS = {
+    "/v1/app/storage/status",
+    "/v1/app/storage/unlock",
+    "/v1/app/storage/rotate",
+    "/v1/app/storage/rotate-retire",
+    "/v1/app/storage/rotate-finalize",
+    "/v1/app/storage/lock",
     "/v1/app/session/open",
     "/v1/app/session/close",
     "/v1/app/grants/mission-read",
@@ -35,7 +40,17 @@ APP_PATHS = {
     "/v1/app/captures/edit",
     "/v1/app/captures/delete",
     "/v1/app/captures/list",
+    "/v1/app/captures/search",
+    "/v1/app/captures/open",
     "/v1/app/captures/clear",
+    "/v1/app/memory/page",
+    "/v1/app/memory/create",
+    "/v1/app/memory/edit",
+    "/v1/app/memory/delete",
+    "/v1/app/conversation/open",
+    "/v1/app/conversation/ask",
+    "/v1/app/conversation/cancel",
+    "/v1/app/artifacts/synthetic-document",
     "/v1/app/connectors/status",
     "/v1/app/grants/mission-review",
     "/v1/app/grants/mission-review/revoke",
@@ -205,6 +220,7 @@ def _start_runtime(runtime_dir: Path, database_path: Path, instance_id: str) -> 
     secret = b"m" * 32
     child_env = {
         "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+        "TMPDIR": tempfile.gettempdir(),
         "PYTHONNOUSERSITE": "1",
         "PYTHONDONTWRITEBYTECODE": "1",
         "JARVIS_LOCAL_PASSPHRASE": PASSPHRASE,
@@ -216,7 +232,7 @@ def _start_runtime(runtime_dir: Path, database_path: Path, instance_id: str) -> 
         env=child_env,
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
-        stderr=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
     )
     assert process.stdin is not None and process.stdout is not None
     init = (
@@ -227,7 +243,14 @@ def _start_runtime(runtime_dir: Path, database_path: Path, instance_id: str) -> 
     process.stdin.flush()
     ready, _, _ = select.select([process.stdout], [], [], 12)
     assert ready, "FastAPI did not reach supervised readiness"
-    assert process.stdout.readline() == f"JARVIS_RUNTIME_READY {instance_id}\n".encode("ascii")
+    ready_line = process.stdout.readline()
+    diagnostic = b""
+    if ready_line != f"JARVIS_RUNTIME_READY {instance_id}\n".encode("ascii") and process.poll() is not None:
+        diagnostic = process.stderr.read(16_384) if process.stderr is not None else b""
+    assert ready_line == f"JARVIS_RUNTIME_READY {instance_id}\n".encode("ascii"), (
+        f"FastAPI exited before readiness (exit={process.poll()}, ready_line={ready_line!r}, "
+        f"stderr={diagnostic.decode('utf-8', 'replace')[-1200:]!r})"
+    )
     process.stdin.write(f"JARVIS_RUNTIME_ACK {instance_id}\n".encode("ascii"))
     process.stdin.flush()
     return process, secret
@@ -242,16 +265,10 @@ def _stop(process: subprocess.Popen, instance_id: str) -> int:
 
 
 @pytest.mark.skipif(not hasattr(socket, "AF_UNIX"), reason="requires Unix domain sockets")
-def test_supervised_fastapi_g5_vertical_flow_and_stop(tmp_path):
+def test_supervised_fastapi_transport_keeps_storage_locked_without_key(tmp_path):
     runtime_storage = tempfile.TemporaryDirectory(prefix="jv-mac003-", dir="/tmp")
     runtime_dir = Path(runtime_storage.name) / "generation-1"
     database_path = tmp_path / "private" / "memory.sqlite3"
-    seed_store = SQLiteMemoryStore(database_path)
-    seed_store.initialize()
-    seeded, _ = MissionRepository(seed_store).create(
-        "owner", "Missão sintética via FastAPI", "dom_synthetic_a", "mac003-process-seed"
-    )
-
     process, secret = _start_runtime(runtime_dir, database_path, "native-process-generation-1")
     try:
         status, health = _request(runtime_dir, "GET", "/v1/health")
@@ -267,7 +284,6 @@ def test_supervised_fastapi_g5_vertical_flow_and_stop(tmp_path):
 
         nonce = "ab" * 32
         status, proof = _request(runtime_dir, "POST", "/v1/instance-proof", nonce.encode("ascii"))
-        proof_fields = _fields(proof)
         message = (
             "jarvis-local-transport-proof-v3\n"
             f"{PROTOCOL_VERSION}\n{RUNTIME_KIND}\n"
@@ -277,10 +293,9 @@ def test_supervised_fastapi_g5_vertical_flow_and_stop(tmp_path):
         ).encode("ascii")
         assert status == 200
         assert hmac.compare_digest(
-            proof_fields["proof"], hmac.new(secret, message, hashlib.sha256).hexdigest()
+            _fields(proof)["proof"], hmac.new(secret, message, hashlib.sha256).hexdigest()
         )
 
-        # Plain same-UID clients cannot invoke application routes without the generation capability.
         direct_status, _ = _request(
             runtime_dir,
             "POST",
@@ -298,115 +313,27 @@ def test_supervised_fastapi_g5_vertical_flow_and_stop(tmp_path):
         )
         assert wrong_status == 401
 
-        replay_client = _AuthenticatedRuntimeClient(
+        client = _AuthenticatedRuntimeClient(
             runtime_dir, secret, "native-process-generation-1"
         )
-        replay_envelope = replay_client.make_envelope(
+        replay_envelope = client.make_envelope(
             "POST",
-            "/v1/app/session/open",
-            _body(passphrase="passphrase-sintetica-incorreta"),
+            "/v1/app/storage/status",
+            b"",
         )
-        first_status, first_envelope = replay_client.exchange_envelope(replay_envelope)
+        first_status, first_envelope = client.exchange_envelope(replay_envelope)
         assert first_status == 200
-        replay_client.decode_response(first_status, first_envelope)
-        replay_status, _ = replay_client.exchange_envelope(replay_envelope)
+        client.decode_response(first_status, first_envelope)
+        replay_status, _ = client.exchange_envelope(replay_envelope)
         assert replay_status == 409
 
-        client = replay_client
-
-        status, opened = client.request(
-            "POST",
-            "/v1/app/session/open",
-            _body(passphrase=PASSPHRASE),
-        )
-        assert status == 200
-        session = _fields(opened)
-        assert session["ok"] == "true" and session["principal"] == "owner"
-        assert PASSPHRASE not in opened.decode("ascii")
-
-        status, empty_automations = client.request(
-            "POST", "/v1/app/automations/list",
-            _body(session_token=session["session_token"]),
-        )
-        assert status == 200
-        assert _fields(empty_automations) == {"ok": "true", "items": "", "count": "0"}
-
-        status, created = client.request(
-            "POST", "/v1/app/automations/create",
-            _body(
-                session_token=session["session_token"], csrf_token=session["csrf_token"],
-                kind="reminder", title="Lembrete de processo", recurrence="once",
-                local_schedule="2099-01-01T09:00", timezone="UTC",
-                quiet_start="", quiet_end="", message="Rascunho local sintético",
-                sources_confirmed="none",
-            ),
-        )
-        created_fields = _fields(created)
-        assert status == 200 and created_fields["ok"] == "true"
-        assert created_fields["workflow_version"] == "reminder.v1"
-        status, listed_automations = client.request(
-            "POST", "/v1/app/automations/list",
-            _body(session_token=session["session_token"]),
-        )
-        listed_fields = _fields(listed_automations)
-        assert status == 200 and listed_fields["count"] == "1"
-        assert created_fields["id"] in listed_fields["items"]
-
-        status, denied = client.request(
-            "POST",
-            "/v1/app/missions/list",
-            _body(session_token=session["session_token"], domain_id="dom_synthetic_a"),
-        )
-        assert status == 200 and _fields(denied) == {"ok": "false", "code": "grant_required"}
-
-        status, grant_response = client.request(
-            "POST",
-            "/v1/app/grants/mission-read",
-            _body(
-                session_token=session["session_token"],
-                csrf_token=session["csrf_token"],
-                domain_id="dom_synthetic_a",
-            ),
-        )
-        grant = _fields(grant_response)
-        assert status == 200 and grant["ok"] == "true"
-        assert grant["domain_id"] == "dom_synthetic_a"
-
-        status, read_response = client.request(
-            "POST",
-            "/v1/app/missions/list",
-            _body(session_token=session["session_token"], domain_id="dom_synthetic_a"),
-        )
-        mission = _fields(read_response)
-        assert status == 200
-        assert mission == {
-            "ok": "true",
-            "dataset": "api_synthetic",
-            "count": "1",
-            "mission_id": seeded["mission"]["id"],
-            "title": "Missão sintética via FastAPI",
-            "domain_id": "dom_synthetic_a",
-            "status": "planned",
-            "revision": "1",
+        status, storage_status = client.request("POST", "/v1/app/storage/status")
+        assert status == 200 and _fields(storage_status) == {"ok": "true", "state": "locked"}
+        status, missing_unlock = client.request("POST", "/v1/app/storage/unlock")
+        assert status == 200 and _fields(missing_unlock) == {
+            "ok": "false", "code": "storage_unlock_failed"
         }
-
-        status, revoked = client.request(
-            "POST",
-            "/v1/app/grants/mission-read/revoke",
-            _body(
-                session_token=session["session_token"],
-                csrf_token=session["csrf_token"],
-                grant_id=grant["grant_id"],
-            ),
-        )
-        assert status == 200 and _fields(revoked) == {"ok": "true", "revoked": "true"}
-
-        status, closed = client.request(
-            "POST",
-            "/v1/app/session/close",
-            _body(session_token=session["session_token"], csrf_token=session["csrf_token"]),
-        )
-        assert status == 200 and _fields(closed) == {"ok": "true", "closed": "true"}
+        assert not database_path.exists()
 
         if shutil.which("lsof"):
             listeners = subprocess.run(
@@ -419,6 +346,41 @@ def test_supervised_fastapi_g5_vertical_flow_and_stop(tmp_path):
     finally:
         assert _stop(process, "native-process-generation-1") == 0
         assert process.poll() is not None
+        runtime_storage.cleanup()
+
+
+@pytest.mark.skipif(not hasattr(socket, "AF_UNIX"), reason="requires Unix domain sockets")
+def test_runtime_restart_stays_locked_without_a_transferred_key(tmp_path):
+    runtime_storage = tempfile.TemporaryDirectory(prefix="jv-sealed-create-", dir="/tmp")
+    root = Path(runtime_storage.name)
+    database_path = tmp_path / "private" / "fresh.sqlite3"
+
+    process, secret = _start_runtime(root / "generation-create", database_path, "native-create-generation")
+    try:
+        client = _AuthenticatedRuntimeClient(
+            root / "generation-create", secret, "native-create-generation"
+        )
+        assert not database_path.exists()
+        status, state = client.request("POST", "/v1/app/storage/status")
+        assert status == 200 and _fields(state)["state"] == "locked"
+        status, missing_key = client.request("POST", "/v1/app/storage/unlock")
+        assert status == 200 and _fields(missing_key)["code"] == "storage_unlock_failed"
+        assert not database_path.exists()
+    finally:
+        assert _stop(process, "native-create-generation") == 0
+
+    restarted, restart_secret = _start_runtime(root / "generation-restart", database_path, "native-create-restart")
+    try:
+        client = _AuthenticatedRuntimeClient(
+            root / "generation-restart", restart_secret, "native-create-restart"
+        )
+        status, state = client.request("POST", "/v1/app/storage/status")
+        assert status == 200 and _fields(state)["state"] == "locked"
+        status, missing_key = client.request("POST", "/v1/app/storage/unlock")
+        assert status == 200 and _fields(missing_key)["code"] == "storage_unlock_failed"
+        assert not database_path.exists()
+    finally:
+        assert _stop(restarted, "native-create-restart") == 0
         runtime_storage.cleanup()
 
 

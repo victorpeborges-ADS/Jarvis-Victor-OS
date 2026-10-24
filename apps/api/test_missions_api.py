@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from api_test_support import sqlite_rows
+
 import sqlite3
 from datetime import datetime, timedelta, timezone
 
@@ -10,6 +12,7 @@ from backup_recovery import create_backup, restore_backup
 from local_security import Grant, put_grant_for_tests, put_session_for_tests, reset_state
 from mission_repository import MissionRejected
 from main import create_app
+from memory_store import SQLiteMemoryStore
 from server_config import LocalServerConfig
 
 PASSPHRASE = "senha-sintetica-de-missao"
@@ -17,12 +20,14 @@ ORIGIN = "http://127.0.0.1:3000"
 
 
 @pytest.fixture
-def client(tmp_path, monkeypatch):
+def client(tmp_path, monkeypatch, encrypted_store_factory):
     reset_state()
     monkeypatch.setenv("JARVIS_LOCAL_PASSPHRASE", PASSPHRASE)
     app = create_app(LocalServerConfig(), database_path=tmp_path / "private" / "memory.sqlite3")
+    app.state.memory_store.unlock(encrypted_store_factory.storage_key)
     with TestClient(app, base_url="http://127.0.0.1", client=("127.0.0.1", 50993)) as test_client:
         test_client.database_path = app.state.memory_store.path
+        test_client.storage_key = encrypted_store_factory.storage_key
         yield test_client
     reset_state()
 
@@ -130,9 +135,11 @@ def test_owner_isolation_idempotency_conflict_and_restart(client, tmp_path, monk
     assert hidden.status_code == 404
 
     database = client.database_path
+    client.__exit__(None, None, None)  # restart is sequential under the writer lease
     reset_state()
     monkeypatch.setenv("JARVIS_LOCAL_PASSPHRASE", PASSPHRASE)
     restarted = create_app(LocalServerConfig(), database_path=database)
+    restarted.state.memory_store.unlock(client.storage_key)
     with TestClient(restarted, base_url="http://127.0.0.1", client=("127.0.0.1", 50995)) as again:
         again_csrf = login(again)
         mission_grants(again, again_csrf)
@@ -157,7 +164,7 @@ def test_create_and_transition_use_distinct_idempotency_operations(client):
     assert cancelled.json()["mission"]["status"] == "cancelled"
     assert replay.status_code == 200, replay.text
     assert replay.json()["revision"] == cancelled.json()["revision"]
-    with sqlite3.connect(client.database_path) as connection:
+    with sqlite_rows(client.app.state.memory_store) as connection:
         operations = connection.execute(
             "SELECT operation FROM mission_idempotency WHERE owner='owner' AND idempotency_key=? "
             "ORDER BY operation",
@@ -190,7 +197,7 @@ def test_revision_conflict_rollback_and_deterministic_skill(client, monkeypatch)
     assert body["mission"]["artifacts"][0]["review_state"] == "draft"
     assert "não como instrução" in body["mission"]["artifacts"][0]["content"]
     assert "ignore previous instructions" in body["mission"]["artifacts"][0]["content"]
-    with sqlite3.connect(client.database_path) as connection:
+    with sqlite_rows(client.app.state.memory_store) as connection:
         knowledge = connection.execute("SELECT state FROM mission_knowledge").fetchone()
     assert knowledge[0] == "staged"
     revision = 2
@@ -252,9 +259,17 @@ def test_repeated_import_does_not_duplicate_and_backup_restores(client, tmp_path
     assert listed.status_code == 200
     assert len(listed.json()["items"]) == 1
 
-    archive = create_backup(client.database_path, tmp_path / "backups", "synthetic-only-backup-passphrase", filename="jarvis-backup-v1-missions.jvb")
-    restored = restore_backup(archive, tmp_path / "restore", "synthetic-only-backup-passphrase")
-    with sqlite3.connect(restored) as connection:
+    archive = create_backup(
+        client.database_path, tmp_path / "backups", "synthetic-only-backup-passphrase",
+        filename="jarvis-backup-v1-missions.jvb", storage_key=client.storage_key,
+    )
+    restored = restore_backup(
+        archive, tmp_path / "restore", "synthetic-only-backup-passphrase",
+        storage_key=client.storage_key, confirm_legacy_resurrection=True,
+    )
+    restored_store = SQLiteMemoryStore(restored, storage_key=client.storage_key)
+    restored_store.initialize()
+    with sqlite_rows(restored_store) as connection:
         assert connection.execute("SELECT COUNT(*) FROM missions").fetchone()[0] == 1
         assert connection.execute("SELECT COUNT(*) FROM mission_events").fetchone()[0] >= 1
         assert connection.execute("SELECT id FROM mission_knowledge").fetchone() is None
@@ -270,7 +285,7 @@ def test_corrupt_mission_document_is_stable_and_not_deleted(client):
     mission_grants(client, csrf)
     created = create(client, csrf, "segredo que nao pode vazar")
     mission_id = created["mission"]["id"]
-    with sqlite3.connect(client.database_path) as connection:
+    with sqlite_rows(client.app.state.memory_store) as connection:
         connection.execute("UPDATE missions SET document_json=? WHERE id=?", ("{", mission_id))
     broken = client.get(f"/real/missions/{mission_id}", headers={"origin": ORIGIN})
     assert broken.status_code == 409
@@ -280,7 +295,7 @@ def test_corrupt_mission_document_is_stable_and_not_deleted(client):
     assert listed.status_code == 200
     assert listed.json()["items"] == []
     assert listed.json()["corrupt"] == [{"id": mission_id, "domain_id": "dom_synthetic_a", "integrity": "corrupt"}]
-    with sqlite3.connect(client.database_path) as connection:
+    with sqlite_rows(client.app.state.memory_store) as connection:
         assert connection.execute("SELECT document_json FROM missions WHERE id=?", (mission_id,)).fetchone()[0] == "{"
 
 

@@ -1,0 +1,15 @@
+{
+  "fixture_id": "revoked",
+  "connector": "gmail",
+  "source_claimed_at": "2026-10-17T11:50:00Z",
+  "revoked": true,
+  "elapsed_ms": 0,
+  "items": [
+    {
+      "kind": "gmail",
+      "external_id": "m-revogada",
+      "subject": "Mensagem revogada",
+      "snippet": "Este texto não pode aparecer como atual."
+    }
+  ]
+}

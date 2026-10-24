@@ -1,8 +1,7 @@
 import json
 import sqlite3
 import stat
-import subprocess
-import sys
+from contextlib import contextmanager
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
@@ -32,6 +31,7 @@ from memory_store import (
     _normalize_schema_sql,
     default_database_path,
 )
+from sealed_database import MAGIC, SealedDatabaseError
 from mission_repository import _sha
 from source_admission import canonical_review_state, reconcile_legacy_selected_sources
 from source_catalog import fixture_for
@@ -78,10 +78,23 @@ def make_event(
     )
 
 
-def initialized_store(tmp_path, *, migration_dir=None) -> SQLiteMemoryStore:
-    store = SQLiteMemoryStore(tmp_path / "private" / "memory.sqlite3", migrations_dir=migration_dir)
+def initialized_store(tmp_path, encrypted_store_factory, *, migration_dir=None) -> SQLiteMemoryStore:
+    store = encrypted_store_factory(
+        tmp_path / "private" / "memory.sqlite3", migrations_dir=migration_dir
+    )
     store.initialize()
     return store
+
+
+@contextmanager
+def connect_store(store: SQLiteMemoryStore):
+    """Open the authenticated in-memory image for test inspection and close it."""
+    connection = store._connect()
+    connection.row_factory = None
+    try:
+        yield connection
+    finally:
+        connection.close()
 
 
 def add_source_and_event(store: SQLiteMemoryStore, event: EventRecord | None = None) -> EventRecord:
@@ -98,14 +111,17 @@ def scope(domain_id: str = "dom_synthetic_a") -> list[ReadScope]:
     )]
 
 
-def test_empty_database_migrates_once_uses_wal_and_private_permissions(tmp_path):
-    store = initialized_store(tmp_path)
+def test_empty_database_migrates_once_stays_encrypted_and_private(tmp_path, encrypted_store_factory):
+    store = initialized_store(tmp_path, encrypted_store_factory)
     store.initialize()
     assert stat.S_IMODE(store.path.parent.stat().st_mode) == 0o700
     assert stat.S_IMODE(store.path.stat().st_mode) == 0o600
+    sealed_file = store.path.read_bytes()
+    assert sealed_file.startswith(MAGIC)
+    assert not sealed_file.startswith(b"SQLite format 3\x00")
 
-    with sqlite3.connect(store.path) as connection:
-        assert connection.execute("PRAGMA journal_mode").fetchone()[0].lower() == "wal"
+    with connect_store(store) as connection:
+        assert connection.execute("PRAGMA journal_mode").fetchone()[0].lower() == "memory"
         assert connection.execute("SELECT version FROM schema_migrations ORDER BY version").fetchall() == [
             ("0001_initial",), ("0002_audit_and_relation_domain",),
             ("0003_event_identity_and_provenance",),
@@ -124,8 +140,15 @@ def test_empty_database_migrates_once_uses_wal_and_private_permissions(tmp_path)
             ("0016_local_captures",),
             ("0019_workflow_tasks",),
             ("0020_local_automations",),
+            ("0021_effect_approval_outbox",),
+            ("0022_memory_categories",),
+            ("0023_conversation_continuity",),
+            ("0024_approved_ingestion",),
+            ("0025_prepared_effects",),
+            ("0026_memory_deletion_tombstones",),
+            ("0027_memory_capture_revisions",),
         ]
-        for table in ("sources", "events", "event_provenance", "entities", "relations", "relation_evidence", "audit_entries", "calendar_sync_states", "calendar_sync_seen_events", "missions", "mission_events", "mission_idempotency", "mission_knowledge", "mission_artifact_reviews", "mission_review_decisions", "selected_synthetic_sources", "selected_source_reconciliation", "local_captures"):
+        for table in ("sources", "events", "event_provenance", "entities", "relations", "relation_evidence", "audit_entries", "calendar_sync_states", "calendar_sync_seen_events", "missions", "mission_events", "mission_idempotency", "mission_knowledge", "mission_artifact_reviews", "mission_review_decisions", "selected_synthetic_sources", "selected_source_reconciliation", "local_captures", "confirmed_facts", "external_evidence", "inferred_proposals", "local_conversations", "synthetic_artifacts", "approved_roots", "approved_files", "learned_proposals", "prepared_effects", "attention_notices"):
             assert connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] == 0
 
 
@@ -135,17 +158,17 @@ def test_default_database_path_is_outside_repository_and_repo_path_is_rejected(t
         SQLiteMemoryStore(REPOSITORY_ROOT / "should-never-exist.sqlite3")
 
 
-def test_daily_store_is_private_and_unseeded_until_path_override(tmp_path, monkeypatch):
+def test_daily_store_is_private_and_unseeded_until_path_override(tmp_path, monkeypatch, encrypted_store_factory):
     monkeypatch.delenv("JARVIS_DATABASE_PATH", raising=False)
     monkeypatch.setenv("HOME", str(tmp_path))
     daily = default_database_path()
     assert daily == (tmp_path / "Library" / "Application Support" / "Jarvis" / "memory.sqlite3").resolve()
-    store = SQLiteMemoryStore()
+    store = encrypted_store_factory()
     store.initialize()
     assert store.path == daily
     assert stat.S_IMODE(store.path.parent.stat().st_mode) == 0o700
     assert stat.S_IMODE(store.path.stat().st_mode) == 0o600
-    with sqlite3.connect(store.path) as connection:
+    with connect_store(store) as connection:
         assert connection.execute("SELECT COUNT(*) FROM missions").fetchone()[0] == 0
         assert connection.execute("SELECT COUNT(*) FROM local_captures").fetchone()[0] == 0
     override = tmp_path / "smoke" / "synthetic.sqlite3"
@@ -154,22 +177,24 @@ def test_daily_store_is_private_and_unseeded_until_path_override(tmp_path, monke
     assert default_database_path() != daily
 
 
-def test_database_from_previous_migration_version_upgrades_without_replaying_ddl(tmp_path):
+def test_database_from_previous_migration_version_upgrades_without_replaying_ddl(tmp_path, encrypted_store_factory):
     previous_migrations = tmp_path / "previous_migrations"
     previous_migrations.mkdir()
     copyfile(MIGRATIONS_DIR / "0001_initial.sql", previous_migrations / "0001_initial.sql")
     copyfile(MIGRATIONS_DIR / "0002_audit_and_relation_domain.sql", previous_migrations / "0002_audit_and_relation_domain.sql")
     database_path = tmp_path / "private" / "memory.sqlite3"
-    SQLiteMemoryStore(database_path, migrations_dir=previous_migrations).initialize()
+    previous_store = encrypted_store_factory(database_path, migrations_dir=previous_migrations)
+    previous_store.initialize()
 
-    with sqlite3.connect(database_path) as connection:
+    with connect_store(previous_store) as connection:
         assert connection.execute("SELECT version FROM schema_migrations ORDER BY version").fetchall() == [
             ("0001_initial",), ("0002_audit_and_relation_domain",),
         ]
         assert connection.execute("SELECT COUNT(*) FROM audit_entries").fetchone()[0] == 0
 
-    SQLiteMemoryStore(database_path).initialize()
-    with sqlite3.connect(database_path) as connection:
+    store = encrypted_store_factory(database_path)
+    store.initialize()
+    with connect_store(store) as connection:
         versions = connection.execute("SELECT version FROM schema_migrations ORDER BY version").fetchall()
         columns = {row[1] for row in connection.execute("PRAGMA table_info(relations)")}
         tables = {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")}
@@ -191,12 +216,19 @@ def test_database_from_previous_migration_version_upgrades_without_replaying_ddl
             ("0016_local_captures",),
             ("0019_workflow_tasks",),
             ("0020_local_automations",),
+            ("0021_effect_approval_outbox",),
+            ("0022_memory_categories",),
+            ("0023_conversation_continuity",),
+            ("0024_approved_ingestion",),
+            ("0025_prepared_effects",),
+        ("0026_memory_deletion_tombstones",),
+        ("0027_memory_capture_revisions",),
     ]
     assert "domain_id" in columns
     assert "audit_entries" in tables
 
 
-def test_unscoped_mission_idempotency_rows_are_preserved_as_unresolved_legacy(tmp_path):
+def test_unscoped_mission_idempotency_rows_are_preserved_as_unresolved_legacy(tmp_path, encrypted_store_factory):
     previous_migrations = tmp_path / "pre-scoped-migrations"
     previous_migrations.mkdir()
     for migration in sorted(MIGRATIONS_DIR.glob("[0-9][0-9][0-9][0-9]_*.sql")):
@@ -205,7 +237,8 @@ def test_unscoped_mission_idempotency_rows_are_preserved_as_unresolved_legacy(tm
         copyfile(migration, previous_migrations / migration.name)
 
     database_path = tmp_path / "legacy" / "memory.sqlite3"
-    SQLiteMemoryStore(database_path, migrations_dir=previous_migrations).initialize()
+    legacy_version_store = encrypted_store_factory(database_path, migrations_dir=previous_migrations)
+    legacy_version_store.initialize()
     legacy_row = (
         "owner",
         "legacy-shared-key-r2",
@@ -213,15 +246,16 @@ def test_unscoped_mission_idempotency_rows_are_preserved_as_unresolved_legacy(tm
         "a" * 64,
         '{"dataset":"api_synthetic","legacy":true}',
     )
-    with sqlite3.connect(database_path) as connection:
+    with connect_store(legacy_version_store) as connection:
         connection.execute(
             "INSERT INTO mission_idempotency(owner, idempotency_key, mission_id, body_sha256, result_json) "
             "VALUES (?, ?, ?, ?, ?)",
             legacy_row,
         )
 
-    SQLiteMemoryStore(database_path).initialize()
-    with sqlite3.connect(database_path) as connection:
+    store = encrypted_store_factory(database_path)
+    store.initialize()
+    with connect_store(store) as connection:
         migrated = connection.execute(
             "SELECT operation, owner, idempotency_key, mission_id, body_sha256, result_json "
             "FROM mission_idempotency WHERE owner=? AND idempotency_key=?",
@@ -233,7 +267,7 @@ def test_unscoped_mission_idempotency_rows_are_preserved_as_unresolved_legacy(tm
 
 
 @pytest.mark.parametrize("applied_count", [1, 2, 3, 4])
-def test_each_previous_schema_version_upgrades_to_calendar_reconciliation(tmp_path, applied_count):
+def test_each_previous_schema_version_upgrades_to_calendar_reconciliation(tmp_path, applied_count, encrypted_store_factory):
     previous_migrations = tmp_path / f"previous-{applied_count}"
     previous_migrations.mkdir()
     migration_files = sorted(MIGRATIONS_DIR.glob("[0-9][0-9][0-9][0-9]_*.sql"))
@@ -241,11 +275,12 @@ def test_each_previous_schema_version_upgrades_to_calendar_reconciliation(tmp_pa
         copyfile(migration, previous_migrations / migration.name)
 
     database_path = tmp_path / f"from-{applied_count}" / "memory.sqlite3"
-    SQLiteMemoryStore(database_path, migrations_dir=previous_migrations).initialize()
-    store = SQLiteMemoryStore(database_path)
+    previous_store = encrypted_store_factory(database_path, migrations_dir=previous_migrations)
+    previous_store.initialize()
+    store = encrypted_store_factory(database_path)
     store.initialize()
     store.initialize()
-    with sqlite3.connect(database_path) as connection:
+    with connect_store(store) as connection:
         versions = connection.execute(
             "SELECT version FROM schema_migrations ORDER BY version"
         ).fetchall()
@@ -256,10 +291,10 @@ def test_each_previous_schema_version_upgrades_to_calendar_reconciliation(tmp_pa
     assert seen_table is not None
 
 
-def test_existing_shared_directory_is_rejected_without_changing_its_permissions(tmp_path):
+def test_existing_shared_directory_is_rejected_without_changing_its_permissions(tmp_path, encrypted_store_factory):
     shared = tmp_path / "shared"
     shared.mkdir(mode=0o755)
-    store = SQLiteMemoryStore(shared / "memory.sqlite3")
+    store = encrypted_store_factory(shared / "memory.sqlite3")
     with pytest.raises(PermissionError, match="permissões privadas"):
         store.initialize()
     assert stat.S_IMODE(shared.stat().st_mode) == 0o755
@@ -275,7 +310,7 @@ def test_database_path_symlink_is_rejected_even_when_target_is_missing(tmp_path)
         SQLiteMemoryStore(link)
 
 
-def test_migration_failure_rolls_back_ddl_and_does_not_mark_version(tmp_path):
+def test_migration_failure_rolls_back_ddl_and_does_not_mark_version(tmp_path, encrypted_store_factory):
     migration_dir = tmp_path / "broken_migrations"
     migration_dir.mkdir()
     (migration_dir / "0001_broken.sql").write_text(
@@ -283,36 +318,33 @@ def test_migration_failure_rolls_back_ddl_and_does_not_mark_version(tmp_path):
         "CREATE TABL invalid_syntax (id INTEGER);\n",
         encoding="utf-8",
     )
-    store = SQLiteMemoryStore(tmp_path / "private" / "memory.sqlite3", migrations_dir=migration_dir)
+    store = encrypted_store_factory(tmp_path / "private" / "memory.sqlite3", migrations_dir=migration_dir)
     with pytest.raises(MigrationError, match="revertida"):
         store.initialize()
-    with sqlite3.connect(store.path) as connection:
-        names = {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")}
-        assert "partial_table" not in names
-        assert connection.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0] == 0
+    assert not store.path.exists()
 
 
-def test_corrupt_database_fails_closed(tmp_path):
-    path = tmp_path / "private" / "memory.sqlite3"
-    path.parent.mkdir(mode=0o700)
-    path.write_bytes(b"not a SQLite database")
-    store = SQLiteMemoryStore(path)
-    with pytest.raises(DatabaseCorruptError):
+def test_corrupt_database_fails_closed(tmp_path, encrypted_store_factory):
+    store = initialized_store(tmp_path, encrypted_store_factory)
+    corrupted = bytearray(store.path.read_bytes())
+    corrupted[-1] ^= 1
+    store.path.write_bytes(corrupted)
+    with pytest.raises(SealedDatabaseError):
         store.initialize()
 
 
-def test_corrupt_database_prevents_app_lifespan_from_serving(tmp_path):
-    path = tmp_path / "private" / "memory.sqlite3"
-    path.parent.mkdir(mode=0o700)
-    path.write_bytes(b"corrupted database")
-    app = create_app(LocalServerConfig(), database_path=path)
-    with pytest.raises(DatabaseCorruptError):
-        with TestClient(app):
-            pytest.fail("a API não deve servir antes de inicializar o banco")
+def test_corrupt_database_prevents_app_lifespan_from_serving(tmp_path, encrypted_store_factory):
+    store = initialized_store(tmp_path, encrypted_store_factory)
+    corrupted = bytearray(store.path.read_bytes())
+    corrupted[-1] ^= 1
+    store.path.write_bytes(corrupted)
+    app = create_app(LocalServerConfig(), database_path=store.path)
+    with pytest.raises(SealedDatabaseError):
+        app.state.memory_store.unlock(encrypted_store_factory.storage_key)
 
 
-def test_interrupted_transaction_rolls_back_and_reopened_store_keeps_committed_data(tmp_path):
-    store = initialized_store(tmp_path)
+def test_interrupted_transaction_rolls_back_and_reopened_store_keeps_committed_data(tmp_path, encrypted_store_factory):
+    store = initialized_store(tmp_path, encrypted_store_factory)
     source = make_source()
     store.save_source(source)
     event = make_event(source_id=source.id)
@@ -323,33 +355,23 @@ def test_interrupted_transaction_rolls_back_and_reopened_store_keeps_committed_d
             connection.execute("DELETE FROM events WHERE id=?", (event.id,))
             raise RuntimeError("transação interrompida")
 
-    reopened = SQLiteMemoryStore(store.path)
+    reopened = encrypted_store_factory(store.path)
     reopened.initialize()
     found = reopened.list_authorized_events(scope())
     assert [item.event.id for item in found] == [event.id]
 
 
-def test_committed_synthetic_event_survives_a_real_process_restart(tmp_path):
-    store = initialized_store(tmp_path)
+def test_committed_synthetic_event_survives_reopened_store_with_ephemeral_key(tmp_path, encrypted_store_factory):
+    store = initialized_store(tmp_path, encrypted_store_factory)
     event = add_source_and_event(store)
-    child_code = (
-        "import sys; from memory_store import SQLiteMemoryStore; from memory_models import ReadScope; "
-        "store=SQLiteMemoryStore(sys.argv[1]); store.initialize(); "
-        "scope=ReadScope(connector='calendar_sim',resource_id='calendar:synthetic-primary',domain_ids=frozenset({'dom_synthetic_a'})); "
-        "print(','.join(item.event.id for item in store.list_authorized_events([scope])))"
-    )
-    restarted = subprocess.run(
-        [sys.executable, "-c", child_code, str(store.path)],
-        cwd=Path(__file__).parent,
-        capture_output=True,
-        text=True,
-        check=True,
-    )
-    assert restarted.stdout.strip() == event.id
+    store.lock()
+    reopened = encrypted_store_factory(store.path)
+    reopened.initialize()
+    assert [item.event.id for item in reopened.list_authorized_events(scope())] == [event.id]
 
 
-def test_duplicate_external_event_is_idempotent_and_updates_one_record(tmp_path):
-    store = initialized_store(tmp_path)
+def test_duplicate_external_event_is_idempotent_and_updates_one_record(tmp_path, encrypted_store_factory):
+    store = initialized_store(tmp_path, encrypted_store_factory)
     source = make_source()
     store.save_source(source)
     first = make_event(source_id=source.id, event_id="real_evt_synthetic_event_first")
@@ -364,13 +386,13 @@ def test_duplicate_external_event_is_idempotent_and_updates_one_record(tmp_path)
     assert records[0].event.title == "Atualização sintética"
 
 
-def test_audit_trail_contains_only_allowlisted_operation_and_count(tmp_path):
-    store = initialized_store(tmp_path)
+def test_audit_trail_contains_only_allowlisted_operation_and_count(tmp_path, encrypted_store_factory):
+    store = initialized_store(tmp_path, encrypted_store_factory)
     event = add_source_and_event(store)
     assert store.list_authorized_events(scope())
     store.get_authorized_event(event.id, scope())
 
-    with sqlite3.connect(store.path) as connection:
+    with connect_store(store) as connection:
         rows = connection.execute(
             "SELECT operation, outcome, record_count, dataset FROM audit_entries ORDER BY rowid"
         ).fetchall()
@@ -383,8 +405,8 @@ def test_audit_trail_contains_only_allowlisted_operation_and_count(tmp_path):
         AuditRecord(operation="arbitrary", record_count=1)
 
 
-def test_invalid_models_and_malformed_stored_payload_fail_closed(tmp_path, caplog):
-    store = initialized_store(tmp_path)
+def test_invalid_models_and_malformed_stored_payload_fail_closed(tmp_path, caplog, encrypted_store_factory):
+    store = initialized_store(tmp_path, encrypted_store_factory)
     source = make_source()
     store.save_source(source)
     with pytest.raises(ValidationError):
@@ -405,7 +427,7 @@ def test_invalid_models_and_malformed_stored_payload_fail_closed(tmp_path, caplo
         })
 
     event = store.save_event(make_event(source_id=source.id))
-    with sqlite3.connect(store.path) as connection:
+    with connect_store(store) as connection:
         connection.execute("PRAGMA ignore_check_constraints=ON")
         connection.execute("UPDATE events SET payload_json='{' WHERE id=?", (event.id,))
         connection.commit()
@@ -415,13 +437,13 @@ def test_invalid_models_and_malformed_stored_payload_fail_closed(tmp_path, caplo
     assert event.title not in caplog.text
 
 
-def test_corrupted_unknown_domain_cannot_leak_into_another_scope(tmp_path):
-    store = initialized_store(tmp_path)
+def test_corrupted_unknown_domain_cannot_leak_into_another_scope(tmp_path, encrypted_store_factory):
+    store = initialized_store(tmp_path, encrypted_store_factory)
     source = make_source()
     store.save_source(source)
     event_a = store.save_event(make_event(source_id=source.id, event_id="real_evt_synthetic_event_a", domain_id="dom_synthetic_a"))
     event_b = store.save_event(make_event(source_id=source.id, event_id="real_evt_synthetic_event_b", domain_id="dom_synthetic_b", external_ref="synthetic-ref-b"))
-    with sqlite3.connect(store.path) as connection:
+    with connect_store(store) as connection:
         connection.execute("PRAGMA ignore_check_constraints=ON")
         connection.execute("UPDATE events SET domain_id='dom_unknown' WHERE id=?", (event_a.id,))
         connection.commit()
@@ -430,8 +452,8 @@ def test_corrupted_unknown_domain_cannot_leak_into_another_scope(tmp_path):
     assert [record.event.id for record in store.list_authorized_events(scope("dom_synthetic_b"))] == [event_b.id]
 
 
-def test_source_event_provenance_entity_and_relation_foreign_keys(tmp_path):
-    store = initialized_store(tmp_path)
+def test_source_event_provenance_entity_and_relation_foreign_keys(tmp_path, encrypted_store_factory):
+    store = initialized_store(tmp_path, encrypted_store_factory)
     source = store.save_source(make_source())
     event = store.save_event(make_event(source_id=source.id))
     first = store.save_entity(EntityRecord(id="entity_synthetic_a", entity_type="project", name="Projeto sintético", domain_id="dom_synthetic_a"))
@@ -442,7 +464,7 @@ def test_source_event_provenance_entity_and_relation_foreign_keys(tmp_path):
     )
     store.save_relation(relation)
 
-    with sqlite3.connect(store.path) as connection:
+    with connect_store(store) as connection:
         assert connection.execute("SELECT COUNT(*) FROM event_provenance WHERE event_id=?", (event.id,)).fetchone()[0] == 1
         assert connection.execute("SELECT COUNT(*) FROM relation_evidence WHERE relation_id=? AND event_id=?", (relation.id, event.id)).fetchone()[0] == 1
         assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
@@ -471,11 +493,11 @@ def test_event_id_namespace_rejects_demo_fixture_ids():
         make_event(event_id="real_evt_bad/id")
 
 
-def test_sqlite_rejects_fixture_id_even_if_model_validation_is_bypassed(tmp_path):
-    store = initialized_store(tmp_path)
+def test_sqlite_rejects_fixture_id_even_if_model_validation_is_bypassed(tmp_path, encrypted_store_factory):
+    store = initialized_store(tmp_path, encrypted_store_factory)
     source = make_source()
     store.save_source(source)
-    with sqlite3.connect(store.path) as connection, pytest.raises(sqlite3.IntegrityError):
+    with connect_store(store) as connection, pytest.raises(sqlite3.IntegrityError):
         connection.execute(
             "INSERT INTO events(id, source_id, event_type, title, sensitivity, payload_json, dataset, created_at) "
             "VALUES (?, ?, 'note', 'synthetic', 'normal', '{}', 'real', ?)",
@@ -483,31 +505,31 @@ def test_sqlite_rejects_fixture_id_even_if_model_validation_is_bypassed(tmp_path
         )
 
 
-def test_initialize_rejects_missing_audit_table_without_rebuilding_it(tmp_path):
-    store = initialized_store(tmp_path)
-    with sqlite3.connect(store.path) as connection:
+def test_initialize_rejects_missing_audit_table_without_rebuilding_it(tmp_path, encrypted_store_factory):
+    store = initialized_store(tmp_path, encrypted_store_factory)
+    with connect_store(store) as connection:
         connection.execute("DROP TABLE audit_entries")
         connection.commit()
 
     with pytest.raises(DatabaseCorruptError, match="diverge"):
-        SQLiteMemoryStore(store.path).initialize()
-    with sqlite3.connect(store.path) as connection:
+        encrypted_store_factory(store.path).initialize()
+    with connect_store(store) as connection:
         names = {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")}
     assert "audit_entries" not in names
 
 
-def test_initialize_rejects_missing_required_index(tmp_path):
-    store = initialized_store(tmp_path)
-    with sqlite3.connect(store.path) as connection:
+def test_initialize_rejects_missing_required_index(tmp_path, encrypted_store_factory):
+    store = initialized_store(tmp_path, encrypted_store_factory)
+    with connect_store(store) as connection:
         connection.execute("DROP INDEX idx_audit_entries_occurred_at")
         connection.commit()
     with pytest.raises(DatabaseCorruptError, match="diverge"):
-        SQLiteMemoryStore(store.path).initialize()
+        encrypted_store_factory(store.path).initialize()
 
 
-def test_initialize_rejects_incompatible_column_type(tmp_path):
-    store = initialized_store(tmp_path)
-    with sqlite3.connect(store.path) as connection:
+def test_initialize_rejects_incompatible_column_type(tmp_path, encrypted_store_factory):
+    store = initialized_store(tmp_path, encrypted_store_factory)
+    with connect_store(store) as connection:
         connection.execute("DROP TABLE audit_entries")
         connection.execute(
             "CREATE TABLE audit_entries (id TEXT PRIMARY KEY, operation TEXT NOT NULL, "
@@ -517,7 +539,7 @@ def test_initialize_rejects_incompatible_column_type(tmp_path):
         connection.execute("CREATE INDEX idx_audit_entries_occurred_at ON audit_entries(occurred_at)")
         connection.commit()
     with pytest.raises(DatabaseCorruptError, match="diverge"):
-        SQLiteMemoryStore(store.path).initialize()
+        encrypted_store_factory(store.path).initialize()
 
 
 def test_schema_ddl_tokenizer_normalizes_only_safe_cosmetic_changes():
@@ -539,9 +561,9 @@ def test_schema_ddl_tokenizer_normalizes_only_safe_cosmetic_changes():
     assert _normalize_schema_sql("CREATE TABLE t (id TEXT) /* unterminated") is None
 
 
-def test_initialize_rejects_case_changed_check_literals_and_does_not_repair(tmp_path):
-    store = initialized_store(tmp_path)
-    with sqlite3.connect(store.path) as connection:
+def test_initialize_rejects_case_changed_check_literals_and_does_not_repair(tmp_path, encrypted_store_factory):
+    store = initialized_store(tmp_path, encrypted_store_factory)
+    with connect_store(store) as connection:
         original = connection.execute(
             "SELECT sql FROM sqlite_master WHERE type='table' AND name='audit_entries'"
         ).fetchone()[0]
@@ -553,19 +575,19 @@ def test_initialize_rejects_case_changed_check_literals_and_does_not_repair(tmp_
         connection.execute(f"PRAGMA schema_version={schema_version + 1}")
 
     with pytest.raises(DatabaseCorruptError) as exc_info:
-        SQLiteMemoryStore(store.path).initialize()
+        encrypted_store_factory(store.path).initialize()
     assert str(exc_info.value) == "estrutura do banco local diverge das migrações aplicadas"
     assert str(store.path) not in str(exc_info.value)
-    with sqlite3.connect(store.path) as connection:
+    with connect_store(store) as connection:
         stored = connection.execute(
             "SELECT sql FROM sqlite_master WHERE type='table' AND name='audit_entries'"
         ).fetchone()[0]
     assert stored == altered
 
 
-def test_initialize_rejects_removed_check_constraint(tmp_path):
-    store = initialized_store(tmp_path)
-    with sqlite3.connect(store.path) as connection:
+def test_initialize_rejects_removed_check_constraint(tmp_path, encrypted_store_factory):
+    store = initialized_store(tmp_path, encrypted_store_factory)
+    with connect_store(store) as connection:
         connection.execute("DROP TABLE audit_entries")
         connection.execute(
             "CREATE TABLE audit_entries (id TEXT PRIMARY KEY, operation TEXT NOT NULL, "
@@ -575,22 +597,22 @@ def test_initialize_rejects_removed_check_constraint(tmp_path):
         connection.execute("CREATE INDEX idx_audit_entries_occurred_at ON audit_entries(occurred_at)")
         connection.commit()
     with pytest.raises(DatabaseCorruptError, match="diverge"):
-        SQLiteMemoryStore(store.path).initialize()
+        encrypted_store_factory(store.path).initialize()
 
 
-def test_initialize_rejects_required_index_with_wrong_definition(tmp_path):
-    store = initialized_store(tmp_path)
-    with sqlite3.connect(store.path) as connection:
+def test_initialize_rejects_required_index_with_wrong_definition(tmp_path, encrypted_store_factory):
+    store = initialized_store(tmp_path, encrypted_store_factory)
+    with connect_store(store) as connection:
         connection.execute("DROP INDEX idx_audit_entries_occurred_at")
         connection.execute("CREATE INDEX idx_audit_entries_occurred_at ON audit_entries(id)")
         connection.commit()
     with pytest.raises(DatabaseCorruptError, match="diverge"):
-        SQLiteMemoryStore(store.path).initialize()
+        encrypted_store_factory(store.path).initialize()
 
 
-def test_initialize_rejects_missing_required_column(tmp_path):
-    store = initialized_store(tmp_path)
-    with sqlite3.connect(store.path) as connection:
+def test_initialize_rejects_missing_required_column(tmp_path, encrypted_store_factory):
+    store = initialized_store(tmp_path, encrypted_store_factory)
+    with connect_store(store) as connection:
         connection.execute("DROP TABLE audit_entries")
         connection.execute(
             "CREATE TABLE audit_entries (id TEXT PRIMARY KEY, operation TEXT NOT NULL "
@@ -601,21 +623,21 @@ def test_initialize_rejects_missing_required_column(tmp_path):
         connection.execute("CREATE INDEX idx_audit_entries_occurred_at ON audit_entries(occurred_at)")
         connection.commit()
     with pytest.raises(DatabaseCorruptError, match="diverge"):
-        SQLiteMemoryStore(store.path).initialize()
+        encrypted_store_factory(store.path).initialize()
 
 
-def test_record_audit_works_after_valid_schema_initialization(tmp_path):
-    store = initialized_store(tmp_path)
+def test_record_audit_works_after_valid_schema_initialization(tmp_path, encrypted_store_factory):
+    store = initialized_store(tmp_path, encrypted_store_factory)
     store.record_audit("memory_read", 0)
-    with sqlite3.connect(store.path) as connection:
+    with connect_store(store) as connection:
         assert connection.execute(
             "SELECT operation, outcome, record_count FROM audit_entries"
         ).fetchall() == [("memory_read", "success", 0)]
 
 
-def test_initialize_accepts_safe_cosmetic_ddl_and_record_audit_still_works(tmp_path):
-    store = initialized_store(tmp_path)
-    with sqlite3.connect(store.path) as connection:
+def test_initialize_accepts_safe_cosmetic_ddl_and_record_audit_still_works(tmp_path, encrypted_store_factory):
+    store = initialized_store(tmp_path, encrypted_store_factory)
+    with connect_store(store) as connection:
         original = connection.execute(
             "SELECT sql FROM sqlite_master WHERE type='table' AND name='audit_entries'"
         ).fetchone()[0]
@@ -628,17 +650,17 @@ def test_initialize_accepts_safe_cosmetic_ddl_and_record_audit_still_works(tmp_p
         schema_version = connection.execute("PRAGMA schema_version").fetchone()[0]
         connection.execute(f"PRAGMA schema_version={schema_version + 1}")
 
-    reopened = SQLiteMemoryStore(store.path)
+    reopened = encrypted_store_factory(store.path)
     reopened.initialize()
     reopened.record_audit("memory_read", 0)
-    with sqlite3.connect(store.path) as connection:
+    with connect_store(reopened) as connection:
         assert connection.execute("SELECT operation, outcome FROM audit_entries").fetchall() == [
             ("memory_read", "success")
         ]
 
 
-def test_internal_id_collision_from_another_source_is_rejected_without_mutation(tmp_path):
-    store = initialized_store(tmp_path)
+def test_internal_id_collision_from_another_source_is_rejected_without_mutation(tmp_path, encrypted_store_factory):
+    store = initialized_store(tmp_path, encrypted_store_factory)
     source_a = make_source("src_calendar_a")
     source_b = make_source("src_calendar_b")
     store.save_source(source_a)
@@ -648,7 +670,7 @@ def test_internal_id_collision_from_another_source_is_rejected_without_mutation(
         external_ref="external-a",
     )
     store.save_event(first)
-    with sqlite3.connect(store.path) as connection:
+    with connect_store(store) as connection:
         before_audit = connection.execute("SELECT COUNT(*) FROM audit_entries").fetchone()[0]
 
     conflicting = make_event(
@@ -658,7 +680,7 @@ def test_internal_id_collision_from_another_source_is_rejected_without_mutation(
     with pytest.raises(EventIdentityConflict, match="outra identidade"):
         store.save_event(conflicting)
 
-    with sqlite3.connect(store.path) as connection:
+    with connect_store(store) as connection:
         row = connection.execute(
             "SELECT source_id, title, domain_id FROM events WHERE id=?", (first.id,)
         ).fetchone()
@@ -673,14 +695,14 @@ def test_internal_id_collision_from_another_source_is_rejected_without_mutation(
     assert store.list_authorized_events(scope("dom_synthetic_b")) == []
 
 
-def test_sqlite_triggers_keep_event_and_provenance_identity_immutable(tmp_path):
-    store = initialized_store(tmp_path)
+def test_sqlite_triggers_keep_event_and_provenance_identity_immutable(tmp_path, encrypted_store_factory):
+    store = initialized_store(tmp_path, encrypted_store_factory)
     source_a = make_source("src_calendar_a")
     source_b = make_source("src_calendar_b")
     store.save_source(source_a)
     store.save_source(source_b)
     event = store.save_event(make_event(source_id=source_a.id, event_id="real_evt_immutable_01"))
-    with sqlite3.connect(store.path) as connection:
+    with connect_store(store) as connection:
         with pytest.raises(sqlite3.IntegrityError):
             connection.execute("UPDATE events SET source_id=? WHERE id=?", (source_b.id, event.id))
         with pytest.raises(sqlite3.IntegrityError):
@@ -690,11 +712,11 @@ def test_sqlite_triggers_keep_event_and_provenance_identity_immutable(tmp_path):
             )
 
 
-def test_failed_audit_write_rolls_back_event_and_provenance(tmp_path):
-    store = initialized_store(tmp_path)
+def test_failed_audit_write_rolls_back_event_and_provenance(tmp_path, encrypted_store_factory):
+    store = initialized_store(tmp_path, encrypted_store_factory)
     source = make_source()
     store.save_source(source)
-    with sqlite3.connect(store.path) as connection:
+    with connect_store(store) as connection:
         connection.execute(
             "CREATE TRIGGER reject_event_audit BEFORE INSERT ON audit_entries "
             "WHEN NEW.operation='event_write' BEGIN SELECT RAISE(ABORT, 'injected'); END"
@@ -703,13 +725,13 @@ def test_failed_audit_write_rolls_back_event_and_provenance(tmp_path):
     event = make_event(source_id=source.id)
     with pytest.raises(sqlite3.IntegrityError):
         store.save_event(event)
-    with sqlite3.connect(store.path) as connection:
+    with connect_store(store) as connection:
         assert connection.execute("SELECT COUNT(*) FROM events WHERE id=?", (event.id,)).fetchone()[0] == 0
         assert connection.execute("SELECT COUNT(*) FROM event_provenance WHERE event_id=?", (event.id,)).fetchone()[0] == 0
 
 
-def test_concurrent_same_external_identity_remains_idempotent(tmp_path):
-    store = initialized_store(tmp_path)
+def test_concurrent_same_external_identity_remains_idempotent(tmp_path, encrypted_store_factory):
+    store = initialized_store(tmp_path, encrypted_store_factory)
     source = make_source()
     store.save_source(source)
     events = [
@@ -723,7 +745,7 @@ def test_concurrent_same_external_identity_remains_idempotent(tmp_path):
     with ThreadPoolExecutor(max_workers=4) as executor:
         saved = list(executor.map(store.save_event, events))
     assert len({event.id for event in saved}) == 1
-    with sqlite3.connect(store.path) as connection:
+    with connect_store(store) as connection:
         assert connection.execute(
             "SELECT COUNT(*) FROM events WHERE source_id=?", (source.id,)
         ).fetchone()[0] == 1
@@ -734,7 +756,7 @@ def test_concurrent_same_external_identity_remains_idempotent(tmp_path):
 
 
 @pytest.mark.parametrize("fixture_name", ["pre-g4", "g4", "g5", "r2-0013", "r3-pre-0014"])
-def test_r5_migration_state_fixtures_upgrade_preserving_local_records(tmp_path, fixture_name):
+def test_r5_migration_state_fixtures_upgrade_preserving_local_records(tmp_path, fixture_name, encrypted_store_factory):
     fixture_path = Path(__file__).parent / "fixtures" / "migration_states" / f"{fixture_name}.json"
     profile = json.loads(fixture_path.read_text(encoding="utf-8"))
     assert profile["fixture_version"] == 1
@@ -749,7 +771,8 @@ def test_r5_migration_state_fixtures_upgrade_preserving_local_records(tmp_path, 
         raise AssertionError(f"fixture refers to missing migration {profile['max_migration']}")
 
     database_path = tmp_path / fixture_name / "memory.sqlite3"
-    SQLiteMemoryStore(database_path, migrations_dir=previous_migrations).initialize()
+    store = encrypted_store_factory(database_path, migrations_dir=previous_migrations)
+    store.initialize()
     owner = "owner-r5-migration-fixture"
     mission_id = f"mission_r5_{fixture_name.replace('-', '_')}"
     review_id = f"review_r5_{fixture_name.replace('-', '_')}"
@@ -781,7 +804,7 @@ def test_r5_migration_state_fixtures_upgrade_preserving_local_records(tmp_path, 
     }
     mission_document = {"id": mission_id, "domain_id": "dom_synthetic_a", "artifacts": [artifact]}
 
-    with sqlite3.connect(database_path) as connection:
+    with connect_store(store) as connection:
         connection.execute("PRAGMA foreign_keys=ON")
         connection.execute(
             """INSERT INTO missions(id, owner, domain_id, status, revision, document_json, dataset, created_at, updated_at)
@@ -840,7 +863,7 @@ def test_r5_migration_state_fixtures_upgrade_preserving_local_records(tmp_path, 
                      f"knowledge_{fixture_name}", f"source-key_{fixture_name}", len(content.encode("utf-8")), created_at),
                 )
 
-    with sqlite3.connect(database_path) as connection:
+    with connect_store(store) as connection:
         before = {
             "missions": connection.execute("SELECT COUNT(*) FROM missions").fetchone()[0],
             "mission_events": connection.execute("SELECT COUNT(*) FROM mission_events").fetchone()[0],
@@ -853,7 +876,7 @@ def test_r5_migration_state_fixtures_upgrade_preserving_local_records(tmp_path, 
         }
     assert before == profile["expected"]
 
-    store = SQLiteMemoryStore(database_path)
+    store = encrypted_store_factory(database_path)
     store.initialize()
     assert reconcile_legacy_selected_sources(store) == 0
     with store.transaction() as connection:

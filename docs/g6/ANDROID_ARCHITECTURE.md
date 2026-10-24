@@ -56,6 +56,10 @@ Nenhuma opção abaixo é selecionada por G6.0. G6.4 precisa escolher uma arquit
 | Captura local | Rótulo local persistente, opção de apagar e sem enviar em background. |
 | Permissão negada | Preservar recursos não relacionados; oferecer explicação e abrir configurações só por ação do usuário. |
 
+## Decisão de 22/10/2026
+
+O ensaio `apps/api/mobile_sync.py` e o ADR-016 cobrem o aceite escrito da frente 10. As opções A–E desta página não foram escolhidas como serviço. O transporte declarado é `in_process` e o relay é `ausente`. O identificador `app.jarvis.mobile` não é identidade. O APK e o aparelho continuam NOT TESTED. Execução com o Mac desligado não é prometida. O `localStorage` do shell continua sendo captura fictícia, não memória do produto.
+
 ## Fora do escopo desta arquitetura
 
 OAuth, conta real, sync, remote backend, API LAN, Firebase/APNs, push, background sync, provisioning de dispositivos, APK release, armazenamento de chaves de identidade, importação automática de contatos/calendário/arquivos e dados pessoais.

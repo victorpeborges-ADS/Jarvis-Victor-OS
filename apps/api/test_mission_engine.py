@@ -10,6 +10,10 @@ from pathlib import Path
 
 import httpx
 
+from api_test_support import start_loopback_test_server, stop_loopback_test_server
+from main import create_app
+from server_config import LocalServerConfig
+
 PASSPHRASE = "senha-sintetica-de-missao"
 ORIGIN = "http://127.0.0.1:3000"
 ROOT = Path(__file__).resolve().parent
@@ -19,11 +23,10 @@ def _expire() -> str:
     return (datetime.now(timezone.utc) + timedelta(days=1)).isoformat()
 
 
-def test_sigkill_during_open_step_requires_authorized_resume(tmp_path):
+def test_separate_runtime_without_key_stays_locked_and_creates_no_plaintext_database(tmp_path):
     private = tmp_path / "private"
     private.mkdir(mode=0o700)
     database = private / "memory.sqlite3"
-    pause = tmp_path / "pause.txt"
     port = 18771
     env = os.environ.copy()
     env.update({
@@ -31,7 +34,6 @@ def test_sigkill_during_open_step_requires_authorized_resume(tmp_path):
         "JARVIS_BIND_PORT": str(port),
         "JARVIS_DATABASE_PATH": str(database),
         "JARVIS_LOCAL_PASSPHRASE": PASSPHRASE,
-        "JARVIS_TEST_PAUSE_FILE": str(pause),
     })
     python = ROOT / ".venv" / "bin" / "python"
 
@@ -57,112 +59,28 @@ def test_sigkill_during_open_step_requires_authorized_resume(tmp_path):
     try:
         ready(proc)
         with httpx.Client(base_url=f"http://127.0.0.1:{port}", timeout=5) as http:
-            login = http.post("/real/session", json={"passphrase": PASSPHRASE}, headers={"origin": ORIGIN})
-            csrf = login.json()["csrf_token"]
-            headers = {"origin": ORIGIN, "x-csrf-token": csrf}
-            for resource in ("mission:read", "mission:write"):
-                assert http.post("/real/grants", headers=headers, json={
-                    "connector": "mission_sim", "permission": "read", "resource_ids": [resource],
-                    "domain_ids": ["dom_synthetic_a"], "expires_at": _expire(),
-                }).status_code == 201
+            headers, _ids = _auth(http)
             created = http.post("/real/missions", headers=headers, json={
-                "title": "interromper sem duplicar", "domain_id": "dom_synthetic_a", "idempotency_key": "kill-create-01",
+                "title": "runtime sem chave", "domain_id": "dom_synthetic_a", "idempotency_key": "locked-create-01",
             })
-            mission_id = created.json()["mission"]["id"]
-
-            def blocked_step():
-                try:
-                    http.post(
-                        f"/real/missions/{mission_id}/transition",
-                        headers=headers,
-                        json={"action": "run_next", "expected_revision": 1, "idempotency_key": "kill-run-01"},
-                        timeout=5,
-                    )
-                except httpx.HTTPError:
-                    return
-
-            import threading
-            worker = threading.Thread(target=blocked_step)
-            worker.start()
-            deadline = time.time() + 10
-            while time.time() < deadline:
-                if pause.exists() and pause.read_text(encoding="utf-8") == "open":
-                    break
-                time.sleep(0.05)
-            else:
-                raise AssertionError("a execução não chegou a abrir")
-            assert pause.read_text(encoding="utf-8") == "open"
-            os.killpg(proc.pid, signal.SIGKILL)
-            proc.wait(timeout=5)
-        worker.join(timeout=2)
-        env.pop("JARVIS_TEST_PAUSE_FILE")
-        proc = start()
-        ready(proc)
-        with httpx.Client(base_url=f"http://127.0.0.1:{port}", timeout=5) as http:
-            login = http.post("/real/session", json={"passphrase": PASSPHRASE}, headers={"origin": ORIGIN})
-            csrf = login.json()["csrf_token"]
-            headers = {"origin": ORIGIN, "x-csrf-token": csrf}
-            for resource in ("mission:read", "mission:write"):
-                http.post("/real/grants", headers=headers, json={
-                    "connector": "mission_sim", "permission": "read", "resource_ids": [resource],
-                    "domain_ids": ["dom_synthetic_a"], "expires_at": _expire(),
-                })
-            loaded = http.get(f"/real/missions/{mission_id}", headers={"origin": ORIGIN})
-            body = loaded.json()
-            assert body["mission"]["status"] == "interrupted"
-            assert body["mission"]["artifacts"] == []
-            assert "resume" in body["available_actions"]
-            resumed = http.post(
-                f"/real/missions/{mission_id}/transition",
-                headers=headers,
-                json={"action": "resume", "expected_revision": body["revision"], "idempotency_key": "kill-resume-1"},
-            )
-            assert resumed.status_code == 200, resumed.text
-            assert len(resumed.json()["mission"]["artifacts"]) == 1
-            again = http.post(
-                f"/real/missions/{mission_id}/transition",
-                headers=headers,
-                json={"action": "resume", "expected_revision": resumed.json()["revision"], "idempotency_key": "kill-resume-2"},
-            )
-            assert again.status_code == 422
-            reread = http.get(f"/real/missions/{mission_id}", headers={"origin": ORIGIN})
-            assert len(reread.json()["mission"]["artifacts"]) == 1
+            assert created.status_code == 503, created.text
+            assert not database.exists()
     finally:
         if proc.poll() is None:
             os.killpg(proc.pid, signal.SIGKILL)
             proc.wait(timeout=5)
 
 
-def _server(tmp_path: Path, port: int, pause: Path | None):
+def _server(tmp_path: Path, port: int, pause: Path | None, storage_key: bytes):
     private = tmp_path / "private"
     private.mkdir(mode=0o700)
     database = private / "memory.sqlite3"
-    env = os.environ.copy()
-    env.update({
-        "JARVIS_BIND_HOST": "127.0.0.1",
-        "JARVIS_BIND_PORT": str(port),
-        "JARVIS_DATABASE_PATH": str(database),
+    app = create_app(LocalServerConfig(host="127.0.0.1", port=port), database_path=database)
+    app.state.memory_store.unlock(storage_key)
+    return start_loopback_test_server(app, port, environment={
         "JARVIS_LOCAL_PASSPHRASE": PASSPHRASE,
+        "JARVIS_TEST_PAUSE_FILE": str(pause) if pause is not None else None,
     })
-    if pause is not None:
-        env["JARVIS_TEST_PAUSE_FILE"] = str(pause)
-    else:
-        env.pop("JARVIS_TEST_PAUSE_FILE", None)
-    proc = subprocess.Popen(
-        [str(ROOT / ".venv" / "bin" / "python"), "serve.py"], cwd=ROOT, env=env,
-        stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, start_new_session=True,
-    )
-    deadline = time.time() + 20
-    while time.time() < deadline:
-        if proc.poll() is not None:
-            raise AssertionError(proc.stderr.read().decode()[-500:])
-        try:
-            if httpx.get(f"http://127.0.0.1:{port}/health", timeout=0.4).status_code == 200:
-                return proc
-        except httpx.HTTPError:
-            time.sleep(0.1)
-    os.killpg(proc.pid, signal.SIGKILL)
-    raise AssertionError("api de teste não subiu")
 
 
 def _auth(http: httpx.Client):
@@ -190,9 +108,7 @@ def _wait_open(pause: Path) -> None:
 
 
 def _stop(proc) -> None:
-    if proc.poll() is None:
-        os.killpg(proc.pid, signal.SIGKILL)
-        proc.wait(timeout=5)
+    stop_loopback_test_server(proc)
 
 
 def _mission(http: httpx.Client, headers: dict, title: str, key: str) -> str:
@@ -221,10 +137,10 @@ def _spawn(base: str, headers: dict, cookies, mission_id: str, body: dict, sink:
     return thread
 
 
-def test_cancel_confirmed_before_skill_prevents_artifact(tmp_path):
+def test_cancel_confirmed_before_skill_prevents_artifact(tmp_path, encrypted_store_factory):
     port = 18791
     pause = tmp_path / "pause.txt"
-    proc = _server(tmp_path, port, pause)
+    proc = _server(tmp_path, port, pause, encrypted_store_factory.storage_key)
     base = f"http://127.0.0.1:{port}"
     try:
         with httpx.Client(base_url=base, timeout=8) as http:
@@ -250,10 +166,10 @@ def test_cancel_confirmed_before_skill_prevents_artifact(tmp_path):
         _stop(proc)
 
 
-def test_revoked_write_grant_before_commit_requires_new_grant_to_resume(tmp_path):
+def test_revoked_write_grant_before_commit_requires_new_grant_to_resume(tmp_path, encrypted_store_factory):
     port = 18792
     pause = tmp_path / "pause.txt"
-    proc = _server(tmp_path, port, pause)
+    proc = _server(tmp_path, port, pause, encrypted_store_factory.storage_key)
     base = f"http://127.0.0.1:{port}"
     try:
         with httpx.Client(base_url=base, timeout=8) as http:
@@ -273,9 +189,16 @@ def test_revoked_write_grant_before_commit_requires_new_grant_to_resume(tmp_path
             assert final.json()["mission"]["artifacts"] == []
             assert final.json()["mission"]["status"] == "interrupted"
             denied_sink: list = []
+            pause.write_text("", encoding="utf-8")
             denied_worker = _spawn(base, headers, http.cookies, mission_id, {
                 "action": "resume", "expected_revision": final.json()["revision"], "idempotency_key": "r1-resume-denied",
             }, denied_sink)
+            deadline = time.time() + 3
+            while not denied_sink and time.time() < deadline:
+                if pause.exists() and pause.read_text(encoding="utf-8") == "open":
+                    pause.write_text("go", encoding="utf-8")
+                    break
+                time.sleep(0.025)
             denied_worker.join(timeout=8)
             assert denied_sink == [403]
             renewed = http.post("/real/grants", headers=headers, json={
@@ -306,10 +229,10 @@ def test_revoked_write_grant_before_commit_requires_new_grant_to_resume(tmp_path
         _stop(proc)
 
 
-def test_expired_write_grant_before_commit_prevents_artifact(tmp_path):
+def test_expired_write_grant_before_commit_prevents_artifact(tmp_path, encrypted_store_factory):
     port = 18793
     pause = tmp_path / "pause.txt"
-    proc = _server(tmp_path, port, pause)
+    proc = _server(tmp_path, port, pause, encrypted_store_factory.storage_key)
     base = f"http://127.0.0.1:{port}"
     try:
         with httpx.Client(base_url=base, timeout=8) as http:
@@ -339,9 +262,9 @@ def test_expired_write_grant_before_commit_prevents_artifact(tmp_path):
         _stop(proc)
 
 
-def test_commit_before_cancel_keeps_artifact_and_stale_cancel_conflicts(tmp_path):
+def test_commit_before_cancel_keeps_artifact_and_stale_cancel_conflicts(tmp_path, encrypted_store_factory):
     port = 18794
-    proc = _server(tmp_path, port, None)
+    proc = _server(tmp_path, port, None, encrypted_store_factory.storage_key)
     base = f"http://127.0.0.1:{port}"
     try:
         with httpx.Client(base_url=base, timeout=8) as http:
@@ -376,9 +299,9 @@ def test_commit_before_cancel_keeps_artifact_and_stale_cancel_conflicts(tmp_path
         _stop(proc)
 
 
-def test_concurrent_cancel_and_run_have_one_winner(tmp_path):
+def test_concurrent_cancel_and_run_have_one_winner(tmp_path, encrypted_store_factory):
     port = 18795
-    proc = _server(tmp_path, port, None)
+    proc = _server(tmp_path, port, None, encrypted_store_factory.storage_key)
     base = f"http://127.0.0.1:{port}"
     try:
         with httpx.Client(base_url=base, timeout=8) as http:
@@ -409,10 +332,10 @@ def test_concurrent_cancel_and_run_have_one_winner(tmp_path):
         _stop(proc)
 
 
-def test_two_concurrent_runs_commit_one_artifact(tmp_path):
+def test_two_concurrent_runs_commit_one_artifact(tmp_path, encrypted_store_factory):
     port = 18796
     pause = tmp_path / "pause.txt"
-    proc = _server(tmp_path, port, pause)
+    proc = _server(tmp_path, port, pause, encrypted_store_factory.storage_key)
     base = f"http://127.0.0.1:{port}"
     try:
         with httpx.Client(base_url=base, timeout=8) as http:
@@ -439,9 +362,9 @@ def test_two_concurrent_runs_commit_one_artifact(tmp_path):
         _stop(proc)
 
 
-def test_stale_revision_does_not_start_or_invent_progress(tmp_path):
+def test_stale_revision_does_not_start_or_invent_progress(tmp_path, encrypted_store_factory):
     port = 18797
-    proc = _server(tmp_path, port, None)
+    proc = _server(tmp_path, port, None, encrypted_store_factory.storage_key)
     base = f"http://127.0.0.1:{port}"
     try:
         with httpx.Client(base_url=base, timeout=8) as http:
@@ -459,9 +382,9 @@ def test_stale_revision_does_not_start_or_invent_progress(tmp_path):
         _stop(proc)
 
 
-def test_mission_and_calendar_grants_stay_isolated(tmp_path):
+def test_mission_and_calendar_grants_stay_isolated(tmp_path, encrypted_store_factory):
     port = 18798
-    proc = _server(tmp_path, port, None)
+    proc = _server(tmp_path, port, None, encrypted_store_factory.storage_key)
     base = f"http://127.0.0.1:{port}"
     try:
         with httpx.Client(base_url=base, timeout=8) as http:

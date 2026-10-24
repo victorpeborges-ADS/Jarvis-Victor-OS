@@ -66,18 +66,18 @@ def _parse_time(value: str | None) -> time | None:
     if value is None or value == "":
         return None
     if not isinstance(value, str) or _HHMM.fullmatch(value) is None:
-        raise AutomationError("scope_invalid")
+        raise AutomationError("automation_invalid")
     hour, minute = (int(part) for part in value.split(":"))
     return time(hour, minute)
 
 
 def _zone(value: str) -> ZoneInfo:
     if not isinstance(value, str) or not 1 <= len(value) <= 64 or value.startswith("/") or ".." in value:
-        raise AutomationError("scope_invalid")
+        raise AutomationError("automation_invalid")
     try:
         return ZoneInfo(value)
     except (ZoneInfoNotFoundError, ValueError):
-        raise AutomationError("scope_invalid") from None
+        raise AutomationError("automation_invalid") from None
 
 
 def _wall_candidates(wall: datetime, zone: ZoneInfo) -> list[datetime]:
@@ -93,7 +93,7 @@ def _wall_candidates(wall: datetime, zone: ZoneInfo) -> list[datetime]:
 def resolve_wall_time(wall: datetime, zone: ZoneInfo) -> datetime:
     """Use the first instant for an ambiguous time and move a DST gap forward."""
     if wall.tzinfo is not None:
-        raise AutomationError("scope_invalid")
+        raise AutomationError("automation_invalid")
     # IANA zones include historical date-line jumps as large as 24 hours,
     # in addition to ordinary one-hour DST gaps.
     for shift in range(24 * 60 + 1):
@@ -101,7 +101,7 @@ def resolve_wall_time(wall: datetime, zone: ZoneInfo) -> datetime:
         candidates = _wall_candidates(adjusted, zone)
         if candidates:
             return candidates[0].astimezone(UTC)
-    raise AutomationError("scope_invalid")
+    raise AutomationError("automation_invalid")
 
 
 def next_run_at(recurrence: str, local_schedule: str, timezone_name: str, after: datetime) -> datetime:
@@ -109,14 +109,14 @@ def next_run_at(recurrence: str, local_schedule: str, timezone_name: str, after:
     zone = _zone(timezone_name)
     if recurrence == "once":
         if not isinstance(local_schedule, str) or _LOCAL_DATETIME.fullmatch(local_schedule) is None:
-            raise AutomationError("scope_invalid")
+            raise AutomationError("automation_invalid")
         try:
             wall = datetime.strptime(local_schedule, "%Y-%m-%dT%H:%M")
         except ValueError:
-            raise AutomationError("scope_invalid") from None
+            raise AutomationError("automation_invalid") from None
         return resolve_wall_time(wall, zone)
     if recurrence != "daily" or _HHMM.fullmatch(local_schedule) is None:
-        raise AutomationError("scope_invalid")
+        raise AutomationError("automation_invalid")
     hour, minute = (int(part) for part in local_schedule.split(":"))
     local_after = after_utc.astimezone(zone)
     for offset in range(0, 9):
@@ -124,7 +124,7 @@ def next_run_at(recurrence: str, local_schedule: str, timezone_name: str, after:
         candidate = resolve_wall_time(datetime.combine(target_date, time(hour, minute)), zone)
         if candidate > after_utc:
             return candidate
-    raise AutomationError("scope_invalid")
+    raise AutomationError("automation_invalid")
 
 
 def _quiet_end(due: datetime, timezone_name: str, quiet_start: str | None, quiet_end: str | None) -> datetime | None:
@@ -133,7 +133,7 @@ def _quiet_end(due: datetime, timezone_name: str, quiet_start: str | None, quiet
     if start is None and end is None:
         return None
     if start is None or end is None or start == end:
-        raise AutomationError("scope_invalid")
+        raise AutomationError("automation_invalid")
     zone = _zone(timezone_name)
     local = _utc(due).astimezone(zone)
     local_time = local.timetz().replace(tzinfo=None)
@@ -180,18 +180,18 @@ def create_automation(
     if owner != "owner" or kind not in AUTOMATION_KINDS or recurrence not in {"once", "daily"}:
         raise AutomationError("scope_invalid")
     if not isinstance(title, str) or not 1 <= len(title.strip()) <= MAX_TITLE or _has_control(title):
-        raise AutomationError("scope_invalid")
+        raise AutomationError("automation_invalid")
     title = title.strip()
     if kind == "reminder":
         if not isinstance(message, str) or not 1 <= len(message.strip()) <= MAX_MESSAGE or _has_control(message):
-            raise AutomationError("scope_invalid")
+            raise AutomationError("automation_invalid")
         message = message.strip()
     elif message:
-        raise AutomationError("scope_invalid")
+        raise AutomationError("automation_invalid")
     _quiet_end(instant, timezone_name, quiet_start, quiet_end)
     next_at = next_run_at(recurrence, local_schedule, timezone_name, instant)
     if next_at <= instant:
-        raise AutomationError("scope_invalid")
+        raise AutomationError("automation_invalid")
     source_json = json.dumps(_sources_for(kind), ensure_ascii=True, separators=(",", ":"))
     automation_id = secrets.token_hex(16)
     timestamp = _iso(instant)
@@ -298,7 +298,7 @@ def update_timezone(store: SQLiteMemoryStore, owner: str, automation_id: str, ti
             row["recurrence"], row["local_schedule"], timezone_name, instant
         )
         if next_at is not None and next_at <= instant:
-            raise AutomationError("scope_invalid")
+            raise AutomationError("automation_invalid")
         connection.execute(
             "UPDATE local_automations SET timezone=?, next_run_at_utc=?, updated_at=? WHERE id=?",
             (timezone_name, _iso(next_at) if next_at else None, _iso(instant), automation_id),
@@ -367,7 +367,7 @@ def control_automation(
             _supersede_unstarted_runs(connection, automation_id, instant, "schedule_resumed")
             next_at = next_run_at(row["recurrence"], row["local_schedule"], row["timezone"], instant)
             if next_at <= instant:
-                raise AutomationError("scope_invalid")
+                raise AutomationError("automation_invalid")
             connection.execute(
                 "UPDATE local_automations SET state='active', next_run_at_utc=?, updated_at=? WHERE id=?",
                 (_iso(next_at), _iso(instant), automation_id),

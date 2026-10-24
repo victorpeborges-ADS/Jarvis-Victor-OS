@@ -1,0 +1,11 @@
+;; macOS policy for the complete Web unit suite. No DNS or external network.
+;; The readiness test owns its HTTP server on literal IPv4 loopback and a port
+;; allocated by the OS (listen(0)); it never targets an existing service.
+(version 1)
+(allow default)
+(deny network*)
+;; Seatbelt's IP filter spells loopback "localhost" (not a DNS lookup).
+;; The test itself binds/connects only to the literal address 127.0.0.1.
+(allow network-bind (local ip "localhost:*"))
+(allow network-inbound (local ip "localhost:*"))
+(allow network-outbound (remote ip "localhost:*"))

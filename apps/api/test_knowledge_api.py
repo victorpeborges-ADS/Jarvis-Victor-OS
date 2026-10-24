@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+from api_test_support import sqlite_rows
+
 import sqlite3
 import threading
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 
 from backup_recovery import create_backup, restore_backup
+from memory_store import SQLiteMemoryStore
 from local_security import Grant, put_grant_for_tests, put_session_for_tests
 from test_review_api import (
     ORIGIN, client, create_and_run_step, login, mission_all_grants,
@@ -75,9 +78,17 @@ def test_staged_knowledge_needs_approved_source_and_separate_decision(client, tm
     assert review_id in context_artifact["content"]
     assert context_artifact["source_refs"][0]["source_id"] == f"synthetic:knowledge:{knowledge['id']}"
     assert context_artifact["skill_id"] == "build-context"
-    archive = create_backup(client.database_path, tmp_path / "backups", "senha-sintetica-backup-conhecimento")
-    restored = restore_backup(archive, tmp_path / "restore", "senha-sintetica-backup-conhecimento")
-    with sqlite3.connect(restored) as con:
+    archive = create_backup(
+        client.database_path, tmp_path / "backups", "senha-sintetica-backup-conhecimento",
+        storage_key=client.storage_key,
+    )
+    restored = restore_backup(
+        archive, tmp_path / "restore", "senha-sintetica-backup-conhecimento",
+        storage_key=client.storage_key, confirm_legacy_resurrection=True,
+    )
+    restored_store = SQLiteMemoryStore(restored, storage_key=client.storage_key)
+    restored_store.initialize()
+    with sqlite_rows(restored_store) as con:
         assert con.execute("SELECT COUNT(*) FROM mission_knowledge_decisions").fetchone()[0] == 1
         assert con.execute("PRAGMA foreign_key_check").fetchall() == []
 
@@ -97,7 +108,9 @@ def test_knowledge_isolated_by_principal_and_grant(client):
         expires_at=datetime.now(timezone.utc) + timedelta(days=1),
     ))
     from fastapi.testclient import TestClient
-    with TestClient(client.app, base_url="http://127.0.0.1", client=("127.0.0.1", 50995)) as other:
+    # A second HTTP principal shares the live app; it does not start a runtime.
+    from contextlib import closing
+    with closing(TestClient(client.app, base_url="http://127.0.0.1", client=("127.0.0.1", 50995))) as other:
         other.cookies.set("jarvis_session", other_token)
         assert other.get("/real/knowledge", headers={"origin": ORIGIN}).json()["items"] == []
         assert other.get(f"/real/knowledge/context/{review['mission_id']}",
@@ -147,7 +160,7 @@ def test_knowledge_grant_revoke_before_commit(client, monkeypatch):
         release.set()
         worker.join(timeout=5)
     assert sink == [403]
-    with sqlite3.connect(client.database_path) as con:
+    with sqlite_rows(client.app.state.memory_store) as con:
         assert con.execute("SELECT COUNT(*) FROM mission_knowledge_decisions").fetchone()[0] == 0
 
 
@@ -165,12 +178,12 @@ def test_context_omits_changed_content_and_source(client):
     ).status_code == 200
     path = f"/real/knowledge/context/{review['mission_id']}"
     assert len(client.get(path, headers={"origin": ORIGIN}).json()["included"]) == 1
-    with sqlite3.connect(client.database_path) as con:
+    with sqlite_rows(client.app.state.memory_store) as con:
         con.execute("UPDATE mission_knowledge SET content='adulterado' WHERE id=?", (knowledge["id"],))
     changed = client.get(path, headers={"origin": ORIGIN}).json()
     assert changed["included"] == []
     assert changed["omitted"][0]["reason"] == "integridade"
-    with sqlite3.connect(client.database_path) as con:
+    with sqlite_rows(client.app.state.memory_store) as con:
         con.execute("UPDATE mission_knowledge SET content=? WHERE id=?", (knowledge["content"], knowledge["id"]))
         con.execute("UPDATE mission_artifact_reviews SET state='pending' WHERE id=?", (review_id,))
     stale = client.get(path, headers={"origin": ORIGIN}).json()

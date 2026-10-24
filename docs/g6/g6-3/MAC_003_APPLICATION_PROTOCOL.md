@@ -99,3 +99,16 @@ Alterar somente nesta branch/worktree:
 READY só é publicado depois que o runner conclui o startup FastAPI e o Rust valida health, versão e proof HMAC daquela geração. O supervisor mantém a capacidade de processar STOP enquanto a prova roda; prova inválida mata e recolhe o mesmo `Child`. O fluxo aprovado retorna no WebView a missão sintética pela operação fixa, depois de sessão aberta e grant confirmado.
 
 O aceite inclui regressões MAC-002 de runtime falso, HMAC, nonce/replay, geração velha e isolamento entre managers; STOP, EOF, crash/restart/reap sem órfãos; sessão/grant ausentes, inválidos, expirados e revogados; isolamento por geração; ausência de capability/token nos canais proibidos; ausência de listeners TCP; rotas web inalteradas; nenhum dado real, migration, contrato SQLite, dependência ou lockfile alterado.
+
+
+## Emenda aditiva: histórico paginado de workflows — 2026-10-14
+
+O conteúdo anterior registra o primeiro marco; os fluxos atuais de credencial nativa e workflows são descritos em [WORKFLOW_EXECUTOR.md](../WORKFLOW_EXECUTOR.md). Esta emenda adiciona somente uma operação fechada, preservando as operações anteriores e o envelope v3:
+
+| Operação | Campos exatos e ordenados | Sucesso |
+|---|---|---|
+| `POST /v1/app/workflows/page` | `session_token`, `cursor` | `ok=true`, `tasks_json`, `next_cursor` |
+
+IPC `g5_workflow_page(cursor)` não aceita método/URL/token/limite. Resposta com campos novos pertence somente a esta operação; `/workflows/list` permanece intacta. Cursores inválidos e campos extras recebem o código já existente do executor `schema_rejected`; item que não cabe recebe `limit_exceeded`. Códigos desconhecidos permanecem recusados. Não exige nova versão porque nenhum DTO ou semântica de operação existente foi modificado. Clientes antigos não recebem respostas desta rota; runtimes antigos a recusam fechada. O cliente novo não faz fallback silencioso.
+
+Keyset por `(created_at,id)` imutáveis, limite de quatro itens reduzido pelo tamanho serializado, cursor canônico de até 80 bytes e fim com cursor vazio. Corpo percent-encoded da página até 1.792 bytes, incluindo cursor; frame e envelope criptográfico total abaixo de 2.048 bytes, sem ampliar limites globais. Contrato completo de remoção/inserções/item grande e evidências no documento do executor. Nenhuma mudança em autorização, capability, HMAC, partições CTR, replay, PID do peer ou listener. Allowlist contém somente essa nova rota exata, testada no backend e no Rust.

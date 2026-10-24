@@ -15,6 +15,7 @@ import httpx
 from fastapi.testclient import TestClient
 from pydantic import ValidationError
 
+from api_test_support import sqlite_rows
 import local_security
 from memory_models import EventRecord, ProvenanceRecord, SourceRecord
 from local_security import (
@@ -39,16 +40,24 @@ RESOURCE = "calendar:synthetic-primary"
 
 
 @pytest.fixture
-def client():
-    app = create_app(LocalServerConfig())
+def client(tmp_path, encrypted_store_factory):
+    app = create_app(
+        LocalServerConfig(),
+        database_path=tmp_path / "jarvis-private" / "memory.sqlite3",
+    )
+    app.state.memory_store.unlock(encrypted_store_factory.storage_key)
     with TestClient(app, base_url="http://127.0.0.1", client=("127.0.0.1", 51000)) as test_client:
         _seed_test_catalog(app.state.memory_store)
         yield test_client
 
 
 @pytest.fixture
-def empty_client():
-    app = create_app(LocalServerConfig())
+def empty_client(tmp_path, encrypted_store_factory):
+    app = create_app(
+        LocalServerConfig(),
+        database_path=tmp_path / "jarvis-empty" / "memory.sqlite3",
+    )
+    app.state.memory_store.unlock(encrypted_store_factory.storage_key)
     with TestClient(app, base_url="http://127.0.0.1", client=("127.0.0.1", 51000)) as test_client:
         yield test_client
 
@@ -157,7 +166,7 @@ def test_real_database_starts_empty_and_never_imports_demo_fixture(empty_client)
     assert empty_client.get("/real/briefing").status_code == 200
     assert empty_client.get("/real/briefing").json() == {"dataset": "real", "items": []}
     assert empty_client.get("/real/events/evt_001").status_code == 404
-    with sqlite3.connect(empty_client.app.state.memory_store.path) as connection:
+    with sqlite_rows(empty_client.app.state.memory_store) as connection:
         assert connection.execute("SELECT COUNT(*) FROM events").fetchone()[0] == 0
         tables = {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")}
         assert "grants" not in tables
@@ -183,7 +192,7 @@ def test_malformed_persisted_record_is_omitted_without_crashing_api(client):
     assert login(client).status_code == 201
     csrf = csrf_for(client)
     assert grant(client, csrf, ["dom_synthetic_a"]).status_code == 201
-    with sqlite3.connect(client.app.state.memory_store.path) as connection:
+    with sqlite_rows(client.app.state.memory_store) as connection:
         connection.execute("PRAGMA ignore_check_constraints=ON")
         connection.execute("UPDATE events SET payload_json='{' WHERE id='real_evt_synth_a_1'")
         connection.commit()
@@ -575,6 +584,9 @@ def test_grants_are_volatile_even_when_database_survives_process_restart(client)
     assert grant(client, csrf, ["dom_synthetic_a"]).status_code == 201
     assert [event["id"] for event in client.get("/real/events").json()] == ["real_evt_synth_a_1"]
 
+    # A restart ends the first runtime cooperatively before acquiring the new
+    # writer lease. The fixture's later ExitStack close is idempotent.
+    client.__exit__(None, None, None)
     child_env = {**os.environ, "JARVIS_LOCAL_PASSPHRASE": PASSPHRASE}
     child_code = (
         "from fastapi.testclient import TestClient\n"

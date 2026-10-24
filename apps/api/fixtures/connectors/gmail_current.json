@@ -1,0 +1,15 @@
+{
+  "fixture_id": "gmail_current",
+  "connector": "gmail",
+  "source_claimed_at": "2026-10-17T11:50:00Z",
+  "revoked": false,
+  "elapsed_ms": 0,
+  "items": [
+    {
+      "kind": "gmail",
+      "external_id": "m-1",
+      "subject": "Nota sintética",
+      "snippet": "Texto fictício de correio."
+    }
+  ]
+}

@@ -5,6 +5,7 @@ import os
 import sqlite3
 import stat
 import threading
+from contextlib import contextmanager
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
@@ -20,16 +21,17 @@ from memory_models import (
     SourceRecord,
 )
 from memory_store import SQLiteMemoryStore
+from sealed_database import read_encrypted_snapshot
 
 PASSPHRASE = "synthetic-only-backup-passphrase"
 OTHER_PASSPHRASE = "synthetic-other-backup-passphrase"
 MARKER = "synthetic-content-must-not-appear-in-archive"
 
 
-def _store(tmp_path: Path, name: str = "source") -> SQLiteMemoryStore:
+def _store(tmp_path: Path, encrypted_store_factory, name: str = "source") -> SQLiteMemoryStore:
     directory = tmp_path / name
     directory.mkdir(mode=0o700)
-    store = SQLiteMemoryStore(directory / "memory.sqlite3")
+    store = encrypted_store_factory(directory / "memory.sqlite3")
     store.initialize()
     return store
 
@@ -64,14 +66,17 @@ def _event(source_id: str, event_id: str, external_ref: str, *, title: str = MAR
     )
 
 
-def _backup(store: SQLiteMemoryStore, tmp_path: Path, *, filename: str = "jarvis-backup-v1-test.jvb") -> Path:
+def _backup(store: SQLiteMemoryStore, tmp_path: Path, encrypted_store_factory, *, filename: str = "jarvis-backup-v1-test.jvb") -> Path:
     return backup.create_backup(
-        store.path, tmp_path / "private-backups", PASSPHRASE, filename=filename
+        store.path, tmp_path / "private-backups", PASSPHRASE, filename=filename,
+        storage_key=encrypted_store_factory.storage_key,
     )
 
 
-def _database_rows(path: Path) -> dict[str, list[tuple]]:
-    with sqlite3.connect(path) as connection:
+def _database_rows(path: Path, storage_key: bytes) -> dict[str, list[tuple]]:
+    connection = sqlite3.connect(":memory:")
+    connection.deserialize(read_encrypted_snapshot(path, storage_key))
+    try:
         tables = [
             row[0]
             for row in connection.execute(
@@ -82,12 +87,24 @@ def _database_rows(path: Path) -> dict[str, list[tuple]]:
             table: connection.execute(f'SELECT * FROM "{table}" ORDER BY rowid').fetchall()
             for table in tables
         }
+    finally:
+        connection.close()
+
+
+@contextmanager
+def _connect_store(store: SQLiteMemoryStore):
+    connection = store._connect()
+    connection.row_factory = None
+    try:
+        yield connection
+    finally:
+        connection.close()
 
 
 def test_online_wal_backup_restores_complete_synthetic_database_without_plaintext(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, encrypted_store_factory
 ):
-    store = _store(tmp_path)
+    store = _store(tmp_path, encrypted_store_factory)
     store.save_source(_source())
     event = store.save_event(_event("src_synthetic_calendar", "real_evt_synthetic_backup_a", "ref-a"))
     store.save_entity(EntityRecord(
@@ -105,7 +122,7 @@ def test_online_wal_backup_restores_complete_synthetic_database_without_plaintex
     ))
     store.record_audit("memory_read", 1)
 
-    archive_path = _backup(store, tmp_path)
+    archive_path = _backup(store, tmp_path, encrypted_store_factory)
     validation_temp = tmp_path / "validation-temp"
     validation_temp.mkdir(mode=0o700)
     monkeypatch.setattr(backup.tempfile, "tempdir", str(validation_temp))
@@ -120,6 +137,8 @@ def test_online_wal_backup_restores_complete_synthetic_database_without_plaintex
     restored_file = backup.restore_backup(
         archive_path, tmp_path / "restore-root", PASSPHRASE,
         destination_name="restore-v1-synthetic-roundtrip",
+        storage_key=encrypted_store_factory.storage_key,
+        confirm_legacy_resurrection=True,
     )
     assert restored_file != store.path
     assert restored_file.parent != store.path.parent
@@ -127,11 +146,11 @@ def test_online_wal_backup_restores_complete_synthetic_database_without_plaintex
     assert stat.S_IMODE(restored_file.parent.stat().st_mode) == 0o700
     assert stat.S_IMODE(restored_file.stat().st_mode) == 0o600
     assert sorted(item.name for item in restored_file.parent.parent.iterdir()) == [restored_file.parent.name]
-    assert _database_rows(restored_file) == _database_rows(store.path)
+    assert _database_rows(restored_file, encrypted_store_factory.storage_key) == _database_rows(store.path, encrypted_store_factory.storage_key)
     assert store.path.read_bytes() == source_image_before
-    restored = SQLiteMemoryStore(restored_file)
+    restored = encrypted_store_factory(restored_file)
     restored.initialize()
-    with sqlite3.connect(restored_file) as connection:
+    with _connect_store(restored) as connection:
         assert connection.execute("SELECT COUNT(*) FROM events").fetchone()[0] == 1
         assert connection.execute("SELECT COUNT(*) FROM event_provenance").fetchone()[0] == 1
         assert connection.execute("SELECT COUNT(*) FROM relation_evidence").fetchone()[0] == 1
@@ -140,21 +159,27 @@ def test_online_wal_backup_restores_complete_synthetic_database_without_plaintex
         assert not {"sessions", "grants", "demo_events", "fixtures"} & names
 
 
-def test_empty_database_stays_empty_and_demo_fixture_ids_are_not_imported(tmp_path):
-    store = _store(tmp_path)
-    with sqlite3.connect(store.path) as connection:
+def test_empty_database_stays_empty_and_demo_fixture_ids_are_not_imported(tmp_path, encrypted_store_factory):
+    store = _store(tmp_path, encrypted_store_factory)
+    with _connect_store(store) as connection:
         for table in ("sources", "events", "event_provenance", "entities", "relations", "audit_entries"):
             assert connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] == 0
-    archive = _backup(store, tmp_path)
-    restored = backup.restore_backup(archive, tmp_path / "restore", PASSPHRASE)
-    with sqlite3.connect(restored) as connection:
+    archive = _backup(store, tmp_path, encrypted_store_factory)
+    restored = backup.restore_backup(
+        archive, tmp_path / "restore", PASSPHRASE,
+        storage_key=encrypted_store_factory.storage_key,
+        confirm_legacy_resurrection=True,
+    )
+    restored_store = encrypted_store_factory(restored)
+    restored_store.initialize()
+    with _connect_store(restored_store) as connection:
         assert connection.execute("SELECT COUNT(*) FROM events").fetchone()[0] == 0
         assert connection.execute("SELECT COUNT(*) FROM sources").fetchone()[0] == 0
         assert connection.execute("SELECT COUNT(*) FROM events WHERE id='evt_001'").fetchone()[0] == 0
 
 
-def test_online_snapshot_is_consistent_during_concurrent_store_writes(tmp_path):
-    store = _store(tmp_path)
+def test_online_snapshot_is_consistent_during_concurrent_store_writes(tmp_path, encrypted_store_factory):
+    store = _store(tmp_path, encrypted_store_factory)
     store.save_source(_source())
     started = threading.Event()
 
@@ -169,11 +194,17 @@ def test_online_snapshot_is_consistent_during_concurrent_store_writes(tmp_path):
     with ThreadPoolExecutor(max_workers=1) as pool:
         future = pool.submit(writer)
         assert started.wait(timeout=2)
-        archive = _backup(store, tmp_path)
+        archive = _backup(store, tmp_path, encrypted_store_factory)
         future.result(timeout=30)
 
-    restored = backup.restore_backup(archive, tmp_path / "restore", PASSPHRASE)
-    with sqlite3.connect(restored) as connection:
+    restored = backup.restore_backup(
+        archive, tmp_path / "restore", PASSPHRASE,
+        storage_key=encrypted_store_factory.storage_key,
+        confirm_legacy_resurrection=True,
+    )
+    restored_store = encrypted_store_factory(restored)
+    restored_store.initialize()
+    with _connect_store(restored_store) as connection:
         events = connection.execute("SELECT COUNT(*) FROM events").fetchone()[0]
         provenance = connection.execute("SELECT COUNT(*) FROM event_provenance").fetchone()[0]
         event_audits = connection.execute(
@@ -184,11 +215,11 @@ def test_online_snapshot_is_consistent_during_concurrent_store_writes(tmp_path):
 
 
 @pytest.mark.parametrize("mutation", ["ciphertext", "header", "truncate"])
-def test_authentication_tampering_and_wrong_password_never_create_restore_target(tmp_path, mutation):
-    store = _store(tmp_path)
+def test_authentication_tampering_and_wrong_password_never_create_restore_target(tmp_path, mutation, encrypted_store_factory):
+    store = _store(tmp_path, encrypted_store_factory)
     store.save_source(_source())
     store.save_event(_event("src_synthetic_calendar", "real_evt_auth_a", "auth-ref"))
-    archive_path = _backup(store, tmp_path)
+    archive_path = _backup(store, tmp_path, encrypted_store_factory)
     original = archive_path.read_bytes()
     if mutation == "ciphertext":
         changed = original[:-1] + bytes([original[-1] ^ 1])
@@ -199,15 +230,15 @@ def test_authentication_tampering_and_wrong_password_never_create_restore_target
     archive_path.write_bytes(changed)
     restore_root = tmp_path / f"restore-{mutation}"
     with pytest.raises(backup.BackupError):
-        backup.restore_backup(archive_path, restore_root, PASSPHRASE)
+        backup.restore_backup(archive_path, restore_root, PASSPHRASE, storage_key=encrypted_store_factory.storage_key)
     assert not restore_root.exists()
     archive_path.write_bytes(original)
     with pytest.raises(backup.BackupAuthenticationError):
-        backup.restore_backup(archive_path, restore_root, OTHER_PASSPHRASE)
+        backup.restore_backup(archive_path, restore_root, OTHER_PASSPHRASE, storage_key=encrypted_store_factory.storage_key)
     assert not restore_root.exists()
 
 
-def test_decrypted_but_invalid_sqlite_is_rejected_before_restore_root_is_created(tmp_path):
+def test_decrypted_but_invalid_sqlite_is_rejected_before_restore_root_is_created(tmp_path, encrypted_store_factory):
     archive_dir = tmp_path / "private-archive"
     archive_dir.mkdir(mode=0o700)
     archive_path = archive_dir / "invalid.jvb"
@@ -215,41 +246,41 @@ def test_decrypted_but_invalid_sqlite_is_rejected_before_restore_root_is_created
     os.chmod(archive_path, 0o600)
     restore_root = tmp_path / "restore"
     with pytest.raises(backup.BackupError):
-        backup.restore_backup(archive_path, restore_root, PASSPHRASE)
+        backup.restore_backup(archive_path, restore_root, PASSPHRASE, storage_key=encrypted_store_factory.storage_key)
     assert not restore_root.exists()
 
 
-def test_validation_temp_directory_cannot_be_redirected_into_repository(tmp_path, monkeypatch):
-    store = _store(tmp_path)
+def test_validation_temp_directory_cannot_be_redirected_into_repository(tmp_path, monkeypatch, encrypted_store_factory):
+    store = _store(tmp_path, encrypted_store_factory)
     store.save_source(_source())
-    archive = _backup(store, tmp_path)
+    archive = _backup(store, tmp_path, encrypted_store_factory)
     monkeypatch.setattr(backup.tempfile, "tempdir", str(backup.REPOSITORY_ROOT))
     restore_root = tmp_path / "restore"
     with pytest.raises(backup.BackupError):
-        backup.restore_backup(archive, restore_root, PASSPHRASE)
+        backup.restore_backup(archive, restore_root, PASSPHRASE, storage_key=encrypted_store_factory.storage_key)
     assert not restore_root.exists()
 
 
-def test_validation_temp_directory_rejects_shared_writable_parent(tmp_path, monkeypatch):
-    store = _store(tmp_path)
+def test_validation_temp_directory_rejects_shared_writable_parent(tmp_path, monkeypatch, encrypted_store_factory):
+    store = _store(tmp_path, encrypted_store_factory)
     store.save_source(_source())
-    archive = _backup(store, tmp_path)
+    archive = _backup(store, tmp_path, encrypted_store_factory)
     shared_temp = tmp_path / "shared-temp"
     shared_temp.mkdir(mode=0o700)
     os.chmod(shared_temp, 0o777)
     monkeypatch.setattr(backup.tempfile, "tempdir", str(shared_temp))
     with pytest.raises(backup.BackupError):
-        backup.restore_backup(archive, tmp_path / "restore", PASSPHRASE)
+        backup.restore_backup(archive, tmp_path / "restore", PASSPHRASE, storage_key=encrypted_store_factory.storage_key)
     assert list(shared_temp.iterdir()) == []
 
 
-def test_invalid_schema_snapshot_is_rejected_without_changing_archive_or_destination(tmp_path):
-    store = _store(tmp_path)
+def test_invalid_schema_snapshot_is_rejected_without_changing_archive_or_destination(tmp_path, encrypted_store_factory):
+    store = _store(tmp_path, encrypted_store_factory)
     store.save_source(_source())
     store.save_event(_event("src_synthetic_calendar", "real_evt_bad_schema", "bad-schema"))
-    with sqlite3.connect(store.path) as connection:
+    with _connect_store(store) as connection:
         connection.execute("DROP TABLE audit_entries")
-    with sqlite3.connect(store.path) as connection:
+    with _connect_store(store) as connection:
         image = connection.serialize()
     archive_dir = tmp_path / "private-archive"
     archive_dir.mkdir(mode=0o700)
@@ -259,26 +290,26 @@ def test_invalid_schema_snapshot_is_rejected_without_changing_archive_or_destina
     os.chmod(archive_path, 0o600)
     restore_root = tmp_path / "restore"
     with pytest.raises(backup.BackupError):
-        backup.restore_backup(archive_path, restore_root, PASSPHRASE)
+        backup.restore_backup(archive_path, restore_root, PASSPHRASE, storage_key=encrypted_store_factory.storage_key)
     assert archive_path.read_bytes() == raw
     assert not restore_root.exists()
 
 
-def test_backup_collision_preserves_original_and_leaves_no_partial_file(tmp_path):
-    store = _store(tmp_path)
+def test_backup_collision_preserves_original_and_leaves_no_partial_file(tmp_path, encrypted_store_factory):
+    store = _store(tmp_path, encrypted_store_factory)
     store.save_source(_source())
-    archive = _backup(store, tmp_path)
+    archive = _backup(store, tmp_path, encrypted_store_factory)
     before = archive.read_bytes()
     with pytest.raises(backup.BackupCollisionError):
-        backup.create_backup(store.path, archive.parent, PASSPHRASE, filename=archive.name)
+        backup.create_backup(store.path, archive.parent, PASSPHRASE, filename=archive.name, storage_key=encrypted_store_factory.storage_key)
     assert archive.read_bytes() == before
     assert list(archive.parent.iterdir()) == [archive]
 
 
-def test_existing_restore_destination_is_untouched_and_path_traversal_is_rejected(tmp_path):
-    store = _store(tmp_path)
+def test_existing_restore_destination_is_untouched_and_path_traversal_is_rejected(tmp_path, encrypted_store_factory):
+    store = _store(tmp_path, encrypted_store_factory)
     store.save_source(_source())
-    archive = _backup(store, tmp_path)
+    archive = _backup(store, tmp_path, encrypted_store_factory)
     root = tmp_path / "restore-root"
     root.mkdir(mode=0o700)
     existing = root / "restore-v1-existing"
@@ -287,15 +318,15 @@ def test_existing_restore_destination_is_untouched_and_path_traversal_is_rejecte
     marker.write_text("synthetic-preserve")
     os.chmod(marker, 0o600)
     with pytest.raises(backup.RestoreDestinationError):
-        backup.restore_backup(archive, root, PASSPHRASE, destination_name=existing.name)
+        backup.restore_backup(archive, root, PASSPHRASE, destination_name=existing.name, storage_key=encrypted_store_factory.storage_key)
     with pytest.raises(backup.RestoreDestinationError):
-        backup.restore_backup(archive, root, PASSPHRASE, destination_name="../escape")
+        backup.restore_backup(archive, root, PASSPHRASE, destination_name="../escape", storage_key=encrypted_store_factory.storage_key)
     assert marker.read_text() == "synthetic-preserve"
     assert sorted(path.name for path in root.iterdir()) == ["restore-v1-existing"]
 
 
-def test_symlink_sources_archives_and_output_directories_are_rejected(tmp_path):
-    store = _store(tmp_path)
+def test_symlink_sources_archives_and_output_directories_are_rejected(tmp_path, encrypted_store_factory):
+    store = _store(tmp_path, encrypted_store_factory)
     store.save_source(_source())
     outside = tmp_path / "outside.sqlite3"
     outside.write_bytes(store.path.read_bytes())
@@ -303,27 +334,27 @@ def test_symlink_sources_archives_and_output_directories_are_rejected(tmp_path):
     source_link = tmp_path / "source-link.sqlite3"
     source_link.symlink_to(outside)
     with pytest.raises(backup.BackupError):
-        backup.create_backup(source_link, tmp_path / "out", PASSPHRASE)
+        backup.create_backup(source_link, tmp_path / "out", PASSPHRASE, storage_key=encrypted_store_factory.storage_key)
 
-    archive = _backup(store, tmp_path)
+    archive = _backup(store, tmp_path, encrypted_store_factory)
     archive_link = archive.parent / "linked.jvb"
     archive_link.symlink_to(archive)
     with pytest.raises(backup.BackupError):
-        backup.restore_backup(archive_link, tmp_path / "restore", PASSPHRASE)
+        backup.restore_backup(archive_link, tmp_path / "restore", PASSPHRASE, storage_key=encrypted_store_factory.storage_key)
 
     link_directory = tmp_path / "out-link"
     link_directory.symlink_to(archive.parent, target_is_directory=True)
     with pytest.raises(backup.BackupError):
-        backup.create_backup(store.path, link_directory, PASSPHRASE)
+        backup.create_backup(store.path, link_directory, PASSPHRASE, storage_key=encrypted_store_factory.storage_key)
     restore_link = tmp_path / "restore-link"
     restore_link.symlink_to(archive.parent, target_is_directory=True)
     with pytest.raises(backup.BackupError):
-        backup.restore_backup(archive, restore_link, PASSPHRASE)
+        backup.restore_backup(archive, restore_link, PASSPHRASE, storage_key=encrypted_store_factory.storage_key)
 
 
 @pytest.mark.parametrize("suffix", ["-wal", "-shm", "-journal"])
-def test_symlinked_sqlite_sidecars_are_rejected(tmp_path, suffix):
-    store = _store(tmp_path)
+def test_symlinked_sqlite_sidecars_are_rejected(tmp_path, suffix, encrypted_store_factory):
+    store = _store(tmp_path, encrypted_store_factory)
     store.save_source(_source())
     sidecar = Path(f"{store.path}{suffix}")
     sidecar.unlink(missing_ok=True)
@@ -332,15 +363,15 @@ def test_symlinked_sqlite_sidecars_are_rejected(tmp_path, suffix):
     os.chmod(target, 0o600)
     sidecar.symlink_to(target)
     with pytest.raises(backup.BackupError):
-        backup.create_backup(store.path, tmp_path / "out", PASSPHRASE)
+        backup.create_backup(store.path, tmp_path / "out", PASSPHRASE, storage_key=encrypted_store_factory.storage_key)
 
 
-def test_failed_backup_write_and_restore_write_are_clean_and_do_not_leak_secrets(tmp_path, monkeypatch, caplog):
-    store = _store(tmp_path)
+def test_failed_backup_write_and_restore_write_are_clean_and_do_not_leak_secrets(tmp_path, monkeypatch, caplog, encrypted_store_factory):
+    store = _store(tmp_path, encrypted_store_factory)
     store.save_source(_source())
     store.save_event(_event("src_synthetic_calendar", "real_evt_write_fail", "write-ref"))
     caplog.set_level(logging.DEBUG)
-    source_before = _database_rows(store.path)
+    source_before = _database_rows(store.path, encrypted_store_factory.storage_key)
 
     def fail_write(fd: int, payload: bytes) -> None:
         raise OSError("synthetic low-level failure with " + PASSPHRASE)
@@ -348,27 +379,27 @@ def test_failed_backup_write_and_restore_write_are_clean_and_do_not_leak_secrets
     monkeypatch.setattr(backup, "_write_all", fail_write)
     backup_directory = tmp_path / "write-failure-backups"
     with pytest.raises(backup.BackupError) as caught:
-        backup.create_backup(store.path, backup_directory, PASSPHRASE)
+        backup.create_backup(store.path, backup_directory, PASSPHRASE, storage_key=encrypted_store_factory.storage_key)
     assert PASSPHRASE not in str(caught.value)
     assert PASSPHRASE not in caplog.text
     assert list(backup_directory.iterdir()) == []
-    assert _database_rows(store.path) == source_before
+    assert _database_rows(store.path, encrypted_store_factory.storage_key) == source_before
 
     monkeypatch.undo()
-    archive = _backup(store, tmp_path)
+    archive = _backup(store, tmp_path, encrypted_store_factory)
     monkeypatch.setattr(backup, "_write_all", fail_write)
     restore_root = tmp_path / "restore-write-failure"
     with pytest.raises(backup.BackupError) as caught:
-        backup.restore_backup(archive, restore_root, PASSPHRASE)
+        backup.restore_backup(archive, restore_root, PASSPHRASE, storage_key=encrypted_store_factory.storage_key)
     assert PASSPHRASE not in str(caught.value)
     assert not restore_root.exists() or not list(restore_root.iterdir())
     assert PASSPHRASE not in caplog.text
 
 
-def test_failure_after_publication_rolls_back_new_restore_files(tmp_path, monkeypatch):
-    store = _store(tmp_path)
+def test_failure_after_publication_rolls_back_new_restore_files(tmp_path, monkeypatch, encrypted_store_factory):
+    store = _store(tmp_path, encrypted_store_factory)
     store.save_source(_source())
-    archive = _backup(store, tmp_path)
+    archive = _backup(store, tmp_path, encrypted_store_factory)
     restore_root = tmp_path / "restore-fsync-failure"
 
     def fail_sync(_path: Path) -> None:
@@ -376,23 +407,23 @@ def test_failure_after_publication_rolls_back_new_restore_files(tmp_path, monkey
 
     monkeypatch.setattr(backup, "_fsync_directory", fail_sync)
     with pytest.raises(backup.BackupError):
-        backup.restore_backup(archive, restore_root, PASSPHRASE)
+        backup.restore_backup(archive, restore_root, PASSPHRASE, storage_key=encrypted_store_factory.storage_key)
     assert not restore_root.exists() or not list(restore_root.iterdir())
 
 
-def test_source_wal_sidecar_permissions_and_password_constraints(tmp_path):
-    store = _store(tmp_path)
+def test_source_wal_sidecar_permissions_and_password_constraints(tmp_path, encrypted_store_factory):
+    store = _store(tmp_path, encrypted_store_factory)
     store.save_source(_source())
     wal = Path(f"{store.path}-wal")
     wal.write_bytes(b"synthetic")
     os.chmod(wal, 0o644)
     with pytest.raises(backup.BackupError):
-        backup.create_backup(store.path, tmp_path / "out", PASSPHRASE)
+        backup.create_backup(store.path, tmp_path / "out", PASSPHRASE, storage_key=encrypted_store_factory.storage_key)
     wal.unlink()
     with pytest.raises(backup.BackupError):
-        backup.create_backup(store.path, tmp_path / "out", "short")
+        backup.create_backup(store.path, tmp_path / "out", "short", storage_key=encrypted_store_factory.storage_key)
     with pytest.raises(backup.BackupError):
-        backup.create_backup(store.path, tmp_path / "out", "x" * 1025)
+        backup.create_backup(store.path, tmp_path / "out", "x" * 1025, storage_key=encrypted_store_factory.storage_key)
 
 
 def test_cli_has_no_password_argument_and_rejects_noninteractive_usage(monkeypatch, capsys):
@@ -414,8 +445,8 @@ def test_cli_restore_accepts_only_basename_under_private_backup_root(monkeypatch
     monkeypatch.setattr(backup_cli, "_prompt_passphrase", lambda *, confirm: PASSPHRASE)
     observed = {}
 
-    def fake_restore(source, root, passphrase):
-        observed.update(source=source, root=root, passphrase=passphrase)
+    def fake_restore(source, root, passphrase, **options):
+        observed.update(source=source, root=root, passphrase=passphrase, options=options)
         return tmp_path / "synthetic" / "restores" / "restore-v1-x" / "memory.sqlite3"
 
     monkeypatch.setattr(backup_cli, "restore_backup", fake_restore)
@@ -423,15 +454,16 @@ def test_cli_restore_accepts_only_basename_under_private_backup_root(monkeypatch
     assert observed["source"] == tmp_path / "synthetic" / "backups" / "jarvis-backup-v1-synthetic.jvb"
     assert observed["root"] == tmp_path / "synthetic" / "restores"
     assert observed["passphrase"] == PASSPHRASE
+    assert observed["options"] == {"confirm_legacy_resurrection": False}
     assert "synthetic-secret" not in capsys.readouterr().out
 
     assert backup_cli.run(["restore", "../jarvis-backup-v1-synthetic.jvb"]) == 2
 
 
 def test_cli_end_to_end_uses_terminal_prompts_and_restores_to_isolated_default_root(
-    monkeypatch, tmp_path, capsys
+    monkeypatch, tmp_path, capsys, encrypted_store_factory
 ):
-    store = _store(tmp_path)
+    store = _store(tmp_path, encrypted_store_factory)
     store.save_source(_source())
     store.save_event(_event("src_synthetic_calendar", "real_evt_cli_a", "cli-ref"))
     source_before = store.path.read_bytes()
@@ -439,6 +471,20 @@ def test_cli_end_to_end_uses_terminal_prompts_and_restores_to_isolated_default_r
     monkeypatch.setattr(backup_cli.sys.stdin, "isatty", lambda: True)
     monkeypatch.setattr(backup_cli.sys.stderr, "isatty", lambda: True)
     monkeypatch.setattr(backup_cli.getpass, "getpass", lambda _prompt: PASSPHRASE)
+
+    def create_with_ephemeral_key(database, directory, passphrase):
+        return backup.create_backup(
+            database, directory, passphrase, storage_key=encrypted_store_factory.storage_key
+        )
+
+    def restore_with_ephemeral_key(source, root, passphrase, **options):
+        return backup.restore_backup(
+            source, root, passphrase, storage_key=encrypted_store_factory.storage_key,
+            **options,
+        )
+
+    monkeypatch.setattr(backup_cli, "create_backup", create_with_ephemeral_key)
+    monkeypatch.setattr(backup_cli, "restore_backup", restore_with_ephemeral_key)
 
     assert backup_cli.run(["backup"]) == 0
     backup_output = capsys.readouterr().out
@@ -448,7 +494,11 @@ def test_cli_end_to_end_uses_terminal_prompts_and_restores_to_isolated_default_r
     assert archive.is_file()
     assert store.path.read_bytes() == source_before
 
-    assert backup_cli.run(["restore", filename]) == 0
+    assert backup_cli.run(["restore", filename]) == 2
+    assert "backup sem exclusões registradas" in capsys.readouterr().err
+    assert not (store.path.parent / "restores").exists()
+
+    assert backup_cli.run(["restore", filename, "--confirm-legacy-resurrection"]) == 0
     restored_output = capsys.readouterr().out
     assert "restaurado isoladamente" in restored_output
     restore_root = store.path.parent / "restores"
@@ -456,7 +506,7 @@ def test_cli_end_to_end_uses_terminal_prompts_and_restores_to_isolated_default_r
     assert len(restored_directories) == 1
     restored = restored_directories[0] / "memory.sqlite3"
     assert restored != store.path
-    assert _database_rows(restored) == _database_rows(store.path)
+    assert _database_rows(restored, encrypted_store_factory.storage_key) == _database_rows(store.path, encrypted_store_factory.storage_key)
     assert store.path.read_bytes() == source_before
 
 
@@ -469,15 +519,15 @@ def test_backup_and_restore_do_not_expose_any_http_routes():
     assert not any("backup" in path or "restore" in path for path in paths)
 
 
-def test_backup_rejects_database_inside_repository_before_reading_it(tmp_path):
+def test_backup_rejects_database_inside_repository_before_reading_it(tmp_path, encrypted_store_factory):
     repo_file = Path(__file__).resolve().parents[2] / "synthetic-forbidden.sqlite3"
     with pytest.raises(backup.BackupError):
-        backup.create_backup(repo_file, tmp_path / "backup", PASSPHRASE)
+        backup.create_backup(repo_file, tmp_path / "backup", PASSPHRASE, storage_key=encrypted_store_factory.storage_key)
 
 
-def test_backup_of_missing_source_does_not_initialize_or_create_it(tmp_path):
+def test_backup_of_missing_source_does_not_initialize_or_create_it(tmp_path, encrypted_store_factory):
     source = tmp_path / "not-created" / "memory.sqlite3"
     with pytest.raises(backup.BackupError):
-        backup.create_backup(source, tmp_path / "backup", PASSPHRASE)
+        backup.create_backup(source, tmp_path / "backup", PASSPHRASE, storage_key=encrypted_store_factory.storage_key)
     assert not source.exists()
     assert not source.parent.exists()

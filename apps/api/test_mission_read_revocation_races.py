@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import threading
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 
 import pytest
 from fastapi.testclient import TestClient
@@ -101,12 +101,12 @@ def test_read_snapshot_wins_then_revoke_waits_for_assembly(client, monkeypatch, 
         monkeypatch.setattr(MissionRepository, method_name, paused)
 
     def read_request():
-        with _client_with_session(client, 50997) as reader:
+        with closing(_client_with_session(client, 50997)) as reader:
             responses["read"] = reader.get(path, headers={"origin": ORIGIN})
 
     def revoke_request():
         revoke_started.set()
-        with _client_with_session(client, 50998) as revoker:
+        with closing(_client_with_session(client, 50998)) as revoker:
             responses["revoke"] = revoker.post(
                 f"/real/grants/{grant_id}/revoke", headers=_headers(csrf)
             )

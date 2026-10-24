@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
+import hashlib
 import re
 import sqlite3
+import threading
 from datetime import datetime, timedelta, timezone
 from urllib.parse import quote, unquote_to_bytes
 
@@ -28,6 +31,7 @@ from local_security import (
     native_session_confirmed,
     native_review_grant_confirmed,
     revoke_native_review_grants,
+    reset_state,
 )
 from external_connectors import public_status
 from local_captures import (
@@ -36,8 +40,19 @@ from local_captures import (
     delete_capture,
     encode_capture_items,
     list_captures,
+    open_capture,
+    search_captures,
     update_capture,
 )
+from memory_categories import (
+    CATEGORIES as MEMORY_CATEGORIES,
+    DOMAINS as MEMORY_DOMAINS,
+    delete_memory,
+    page_memory,
+    record_memory,
+    revise_memory,
+)
+from memory_deletions import MemoryRevisionConflict
 from local_automations import (
     AutomationError,
     control_automation,
@@ -47,10 +62,16 @@ from local_automations import (
     list_automations,
     list_runs,
     update_timezone,
+    run_app_worker,
 )
 from mission_repository import MissionConflict, MissionCorrupt, MissionDenied, MissionRejected, MissionRepository
-from memory_store import MemoryStoreError
-from workflow_executor import WorkflowError, WorkflowExecutor, session_binding
+from memory_store import MemoryStoreError, is_synthetic_temporary_database
+from workflow_executor import WorkflowError, WorkflowExecutor, session_binding, workflow_cursor
+from conversation_gateway import Budget
+from conversation_continuity import open_conversation, conversation_exists
+from grounded_read import GroundedRead, encoded_grounded_body
+from artifact_store import put_artifact
+from skill_registry import Permission, SkillRegistry, canonical_json
 
 router = APIRouter()
 NATIVE_DOMAIN = "dom_synthetic_a"
@@ -61,6 +82,12 @@ MAX_WORKFLOW_LIST_ITEMS = 4
 MAX_PASSPHRASE_BYTES = 128
 MAX_MISSION_TITLE = 80
 EXPECTED_FIELDS = {
+    "/v1/app/storage/unlock": ("database_key",),
+    "/v1/app/storage/rotate": ("database_key", "generation", "operation_id", "intent"),
+    "/v1/app/storage/rotate-retire": ("from_account",),
+    "/v1/app/storage/rotate-finalize": ("database_key", "operation_id"),
+    "/v1/app/storage/lock": (),
+    "/v1/app/storage/status": (),
     "/v1/app/session/open": ("passphrase",),
     "/v1/app/session/close": ("session_token", "csrf_token"),
     "/v1/app/grants/mission-read": ("session_token", "csrf_token", "domain_id"),
@@ -70,7 +97,17 @@ EXPECTED_FIELDS = {
     "/v1/app/captures/edit": ("session_token", "csrf_token", "capture_id", "text"),
     "/v1/app/captures/delete": ("session_token", "csrf_token", "capture_id"),
     "/v1/app/captures/list": ("session_token",),
+    "/v1/app/captures/search": ("session_token", "query"),
+    "/v1/app/captures/open": ("session_token", "capture_id"),
     "/v1/app/captures/clear": ("session_token", "csrf_token"),
+    "/v1/app/memory/page": ("session_token", "category", "domain_id", "offset"),
+    "/v1/app/memory/create": ("session_token", "csrf_token", "category", "domain_id", "body", "source_ref"),
+    "/v1/app/memory/edit": ("session_token", "csrf_token", "category", "domain_id", "record_id", "body", "expected_revision"),
+    "/v1/app/memory/delete": ("session_token", "csrf_token", "category", "domain_id", "record_id", "expected_revision"),
+    "/v1/app/conversation/ask": ("session_token", "conversation_id", "question", "domain_id"),
+    "/v1/app/conversation/open": ("session_token", "domain_id", "mode"),
+    "/v1/app/conversation/cancel": ("session_token", "conversation_id", "domain_id"),
+    "/v1/app/artifacts/synthetic-document": ("session_token", "csrf_token"),
     "/v1/app/connectors/status": ("session_token",),
     "/v1/app/grants/mission-review": ("session_token", "csrf_token", "domain_id", "confirm"),
     "/v1/app/grants/mission-review/revoke": ("session_token", "csrf_token", "domain_id", "confirm"),
@@ -94,6 +131,7 @@ EXPECTED_FIELDS = {
     ),
     "/v1/app/workflows/submit": ("session_token", "csrf_token", "tool_id", "arguments_json", "idempotency_key"),
     "/v1/app/workflows/list": ("session_token",),
+    "/v1/app/workflows/page": ("session_token", "cursor"),
     "/v1/app/workflows/detail": ("session_token", "task_id"),
     "/v1/app/workflows/approve": ("session_token", "csrf_token", "task_id", "expected_sha256", "confirm"),
     "/v1/app/workflows/execute": ("session_token", "csrf_token", "task_id", "idempotency_key"),
@@ -139,6 +177,8 @@ def _epoch_microseconds(value: datetime) -> int:
 
 async def _read_fields(request: Request, expected: tuple[str, ...]) -> dict[str, str]:
     body = await request.body()
+    if not body and not expected:
+        return {}
     if len(body) > MAX_REQUEST_BYTES or not body.endswith(b"\n"):
         raise ValueError("corpo inválido")
     try:
@@ -189,9 +229,174 @@ def _error(code: str) -> PlainTextResponse:
         "task_not_found", "task_corrupt", "state_rejected", "approval_not_required",
         "approval_required", "approval_rejected", "approval_replayed", "approval_expired",
         "parameters_changed", "result_corrupt", "retry_exhausted", "timeout",
+        "storage_locked", "storage_unlock_failed", "storage_rotation_blocked",
+        "memory_rejected", "memory_conflict",
     }
     safe_code = code if code in allowed else "operation_failed"
     return _response((("ok", "false"), ("code", safe_code)))
+
+
+@router.post("/v1/app/storage/status")
+async def storage_status(request: Request) -> PlainTextResponse:
+    try:
+        await _read_fields(request, EXPECTED_FIELDS[request.url.path])
+    except (ValueError, UnicodeError):
+        return _error("operation_failed")
+    store = request.app.state.memory_store
+    return _success(state="unlocked" if store.is_unlocked else "locked")
+
+
+@router.post("/v1/app/storage/unlock")
+async def storage_unlock(request: Request) -> PlainTextResponse:
+    key = bytearray()
+    try:
+        fields = await _read_fields(request, EXPECTED_FIELDS[request.url.path])
+        encoded = fields["database_key"]
+        if len(encoded) != 64 or re.fullmatch(r"[0-9a-f]{64}", encoded) is None:
+            return _error("storage_unlock_failed")
+        key.extend(bytes.fromhex(encoded))
+        fields.clear()
+        store = request.app.state.memory_store
+        if not is_synthetic_temporary_database(store.path):
+            return _error("storage_unlock_failed")
+        async with request.app.state.storage_lifecycle_lock:
+            if store.is_unlocked:
+                return _success(state="unlocked")
+            store.unlock(key)
+            from mission_engine import recover_interrupted
+            from source_admission import reconcile_legacy_selected_sources
+
+            reconcile_legacy_selected_sources(store)
+            recover_interrupted(store)
+            WorkflowExecutor(store).recover(_now())
+            scheduler = request.app.state.local_automation_scheduler
+            request.app.state.storage_worker = asyncio.create_task(run_app_worker(scheduler))
+    except Exception:
+        store = request.app.state.memory_store
+        store.lock()
+        reset_state()
+        scheduler = getattr(request.app.state, "local_automation_scheduler", None)
+        if scheduler is not None:
+            scheduler.clear_session()
+        return _error("storage_unlock_failed")
+    finally:
+        key[:] = b"\x00" * len(key)
+    return _success(state="unlocked")
+
+
+@router.post("/v1/app/storage/lock")
+async def storage_lock(request: Request) -> PlainTextResponse:
+    try:
+        await _read_fields(request, EXPECTED_FIELDS[request.url.path])
+        async with request.app.state.storage_lifecycle_lock:
+            worker = request.app.state.storage_worker
+            if worker is not None:
+                worker.cancel()
+                try:
+                    await worker
+                except asyncio.CancelledError:
+                    pass
+                request.app.state.storage_worker = None
+            request.app.state.conversation_gateway.clear_all()
+            with request.app.state.conversation_cancellation_lock:
+                for cancellation in request.app.state.conversation_cancellations.values():
+                    cancellation.set()
+                request.app.state.conversation_cancellations.clear()
+            request.app.state.memory_store.lock()
+            reset_state()
+            scheduler = getattr(request.app.state, "local_automation_scheduler", None)
+            if scheduler is not None:
+                scheduler.clear_session()
+    except (ValueError, UnicodeError):
+        return _error("operation_failed")
+    except Exception:
+        return _error("operation_failed")
+    return _success(state="locked")
+
+
+@router.post("/v1/app/storage/rotate")
+async def storage_rotate(request: Request) -> PlainTextResponse:
+    key = bytearray()
+    try:
+        fields = await _read_fields(request, EXPECTED_FIELDS[request.url.path])
+        encoded = fields["database_key"]
+        generation = fields["generation"]
+        operation_id = fields["operation_id"]
+        intent = fields["intent"]
+        if len(encoded) != 64 or re.fullmatch(r"[0-9a-f]{64}", encoded) is None:
+            return _error("storage_rotation_blocked")
+        if re.fullmatch(r"gen-v1-[0-9a-f]{32}", generation) is None:
+            return _error("storage_rotation_blocked")
+        if re.fullmatch(r"[0-9a-f]{64}", operation_id) is None or intent not in {"begin", "resume"}:
+            return _error("storage_rotation_blocked")
+        key.extend(bytes.fromhex(encoded))
+        fields.clear()
+        store = request.app.state.memory_store
+        if not is_synthetic_temporary_database(store.path) or not store.is_unlocked:
+            return _error("storage_rotation_blocked")
+        async with request.app.state.storage_lifecycle_lock:
+            result = await asyncio.to_thread(
+                store.rotate_storage_key, bytes(key), generation, operation_id, intent,
+            )
+        if result.cleanup not in {"pending", "complete"} or result.phase not in {
+            "validated", "committed", "finalized",
+        }:
+            return _error("storage_rotation_blocked")
+        state = result.phase
+        if result.retire_account and re.fullmatch(r"primary|gen-v1-[0-9a-f]{32}", result.retire_account) is None:
+            return _error("storage_rotation_blocked")
+    except Exception:
+        return _error("storage_rotation_blocked")
+    finally:
+        key[:] = b"\x00" * len(key)
+    return _success(
+        state=state, retire_account=result.retire_account, operation_id=result.operation_id,
+        cleanup=result.cleanup,
+    )
+
+
+@router.post("/v1/app/storage/rotate-retire")
+async def storage_rotate_retire(request: Request) -> PlainTextResponse:
+    try:
+        fields = await _read_fields(request, EXPECTED_FIELDS[request.url.path])
+        from_account = fields["from_account"]
+        if re.fullmatch(r"primary|gen-v1-[0-9a-f]{32}", from_account) is None:
+            return _error("storage_rotation_blocked")
+        store = request.app.state.memory_store
+        if not is_synthetic_temporary_database(store.path) or not store.is_unlocked:
+            return _error("storage_rotation_blocked")
+        async with request.app.state.storage_lifecycle_lock:
+            await asyncio.to_thread(store.mark_storage_key_retired, from_account)
+    except Exception:
+        return _error("storage_rotation_blocked")
+    return _success(state="committed")
+
+
+@router.post("/v1/app/storage/rotate-finalize")
+async def storage_rotate_finalize(request: Request) -> PlainTextResponse:
+    key = bytearray()
+    try:
+        fields = await _read_fields(request, EXPECTED_FIELDS[request.url.path])
+        encoded = fields["database_key"]
+        operation_id = fields["operation_id"]
+        if len(encoded) != 64 or re.fullmatch(r"[0-9a-f]{64}", encoded) is None:
+            return _error("storage_rotation_blocked")
+        if re.fullmatch(r"[0-9a-f]{64}", operation_id) is None:
+            return _error("storage_rotation_blocked")
+        key.extend(bytes.fromhex(encoded))
+        fields.clear()
+        store = request.app.state.memory_store
+        if not is_synthetic_temporary_database(store.path) or not store.is_unlocked:
+            return _error("storage_rotation_blocked")
+        async with request.app.state.storage_lifecycle_lock:
+            result = await asyncio.to_thread(store.finalize_storage_key, operation_id)
+        if result.phase != "finalized" or result.operation_id != operation_id:
+            return _error("storage_rotation_blocked")
+    except Exception:
+        return _error("storage_rotation_blocked")
+    finally:
+        key[:] = b"\x00" * len(key)
+    return _success(state="finalized", operation_id=operation_id, cleanup="complete")
 
 
 def _error_for(exc: HTTPException) -> PlainTextResponse:
@@ -246,6 +451,14 @@ async def close_native_session(request: Request) -> PlainTextResponse:
     try:
         fields = await _read_fields(request, EXPECTED_FIELDS[request.url.path])
         session = _native_session(fields["session_token"], fields["csrf_token"], mutation=True)
+        request.app.state.conversation_gateway.retire_session(session.token)
+        with request.app.state.conversation_cancellation_lock:
+            stale_keys = [
+                key for key in request.app.state.conversation_cancellations
+                if key[0] == session.token
+            ]
+            for key in stale_keys:
+                request.app.state.conversation_cancellations.pop(key).set()
         _close_session_for(session)
         scheduler = getattr(request.app.state, "local_automation_scheduler", None)
         if scheduler is not None:
@@ -309,7 +522,7 @@ async def list_native_missions(request: Request) -> PlainTextResponse:
     try:
         fields = await _read_fields(request, EXPECTED_FIELDS[request.url.path])
         session = _native_session(fields["session_token"])
-        if fields["domain_id"] != NATIVE_DOMAIN:
+        if session.principal != "owner" or fields["domain_id"] != NATIVE_DOMAIN:
             return _error("scope_invalid")
         with mission_read_scope_confirmed(session.principal, NATIVE_DOMAIN, session.token) as allowed:
             if allowed != frozenset({NATIVE_DOMAIN}):
@@ -417,6 +630,176 @@ async def list_native_captures(request: Request) -> PlainTextResponse:
     return _success(count=len(items), items=payload)
 
 
+def _memory_fields(item: dict[str, str | int]) -> dict[str, object]:
+    return {key: item[key] for key in (
+        "id", "category", "domain_id", "body", "source_kind", "source_ref",
+        "version", "recorded_at", "revised_at",
+    )}
+
+
+def _memory_record_json(item: dict[str, str | int]) -> str:
+    return json.dumps(_memory_fields(item), ensure_ascii=False, separators=(",", ":"))
+
+
+@router.post("/v1/app/memory/page")
+async def page_native_memory(request: Request) -> PlainTextResponse:
+    try:
+        fields = await _read_fields(request, EXPECTED_FIELDS[request.url.path])
+        session = _native_session(fields["session_token"])
+        category, domain = fields["category"], fields["domain_id"]
+        offset = int(fields["offset"])
+        if category not in {"explicit_capture", *MEMORY_CATEGORIES} or domain not in MEMORY_DOMAINS:
+            raise ValueError("memória recusada")
+        item = page_memory(request.app.state.memory_store, session.principal, domain, category, offset)
+    except (ValueError, UnicodeError):
+        return _error("memory_rejected")
+    except HTTPException as exc:
+        return _error_for(exc)
+    except (MemoryStoreError, OSError, sqlite3.Error):
+        return _error("operation_failed")
+    if item is None:
+        return _success(has_item="false")
+    return _success(has_item="true", record=_memory_record_json(item))
+
+
+@router.post("/v1/app/memory/create")
+async def create_native_memory(request: Request) -> PlainTextResponse:
+    try:
+        fields = await _read_fields(request, EXPECTED_FIELDS[request.url.path])
+        session = _native_session(fields["session_token"], fields["csrf_token"], mutation=True)
+        category, domain = fields["category"], fields["domain_id"]
+        if category == "explicit_capture":
+            if domain != "dom_synthetic_a" or fields["source_ref"] != "explicit_capture":
+                raise ValueError("memória recusada")
+            saved = create_capture(request.app.state.memory_store, session.principal, fields["body"], _now())
+            item = {
+                "id": saved["id"], "category": category, "domain_id": domain, "body": fields["body"],
+                "source_kind": "user_authored_capture", "source_ref": "explicit_capture", "version": 1,
+                "recorded_at": saved["created_at"], "revised_at": saved["created_at"],
+            }
+        else:
+            expected = MEMORY_CATEGORIES.get(category)
+            if expected is None:
+                raise ValueError("memória recusada")
+            item = record_memory(
+                request.app.state.memory_store, session.principal, domain, category, fields["body"],
+                expected[1], fields["source_ref"], _now(),
+            )
+    except MemoryRevisionConflict:
+        return _error("memory_conflict")
+    except (ValueError, UnicodeError):
+        return _error("memory_rejected")
+    except HTTPException as exc:
+        return _error_for(exc)
+    except (MemoryStoreError, OSError, sqlite3.Error):
+        return _error("operation_failed")
+    return _success(record=_memory_record_json(item))
+
+
+@router.post("/v1/app/memory/edit")
+async def edit_native_memory(request: Request) -> PlainTextResponse:
+    try:
+        fields = await _read_fields(request, EXPECTED_FIELDS[request.url.path])
+        session = _native_session(fields["session_token"], fields["csrf_token"], mutation=True)
+        expected_revision = int(fields["expected_revision"])
+        if not 1 <= expected_revision <= 2**31 - 1:
+            raise ValueError("memória recusada")
+        category, domain, record_id = fields["category"], fields["domain_id"], fields["record_id"]
+        if category == "explicit_capture":
+            if domain != "dom_synthetic_a":
+                raise ValueError("memória recusada")
+            saved = update_capture(
+                request.app.state.memory_store, session.principal, record_id, fields["body"], expected_revision,
+            )
+            item = {
+                "id": record_id, "category": category, "domain_id": domain, "body": fields["body"],
+                "source_kind": "user_authored_capture", "source_ref": "explicit_capture",
+                "version": saved["version"], "recorded_at": saved["created_at"], "revised_at": saved["revised_at"],
+            }
+        else:
+            item = revise_memory(
+                request.app.state.memory_store, session.principal, domain, category, record_id,
+                fields["body"], _now(), expected_revision,
+            )
+    except MemoryRevisionConflict:
+        return _error("memory_conflict")
+    except (ValueError, UnicodeError):
+        return _error("memory_rejected")
+    except HTTPException as exc:
+        return _error_for(exc)
+    except (MemoryStoreError, OSError, sqlite3.Error):
+        return _error("operation_failed")
+    return _success(record=_memory_record_json(item))
+
+
+@router.post("/v1/app/memory/delete")
+async def delete_native_memory(request: Request) -> PlainTextResponse:
+    try:
+        fields = await _read_fields(request, EXPECTED_FIELDS[request.url.path])
+        session = _native_session(fields["session_token"], fields["csrf_token"], mutation=True)
+        expected_revision = int(fields["expected_revision"])
+        if not 1 <= expected_revision <= 2**31 - 1:
+            raise ValueError("memória recusada")
+        category, domain, record_id = fields["category"], fields["domain_id"], fields["record_id"]
+        if category == "explicit_capture":
+            if domain != "dom_synthetic_a":
+                raise ValueError("memória recusada")
+            deleted = delete_capture(request.app.state.memory_store, session.principal, record_id, expected_revision)
+        else:
+            deleted = delete_memory(
+                request.app.state.memory_store, session.principal, domain, category, record_id, expected_revision,
+            )
+    except MemoryRevisionConflict:
+        return _error("memory_conflict")
+    except (ValueError, UnicodeError):
+        return _error("memory_rejected")
+    except HTTPException as exc:
+        return _error_for(exc)
+    except (MemoryStoreError, OSError, sqlite3.Error):
+        return _error("operation_failed")
+    return _success(deleted="true", deleted_revision=deleted.get("deleted_revision", expected_revision),
+                    operation_id=deleted.get("operation_id", ""))
+
+
+@router.post("/v1/app/captures/search")
+async def search_native_captures(request: Request) -> PlainTextResponse:
+    try:
+        fields = await _read_fields(request, EXPECTED_FIELDS[request.url.path])
+        session = _native_session(fields["session_token"])
+        items, omitted = search_captures(
+            request.app.state.memory_store, session.principal, fields["query"]
+        )
+        payload = encode_capture_items(items)
+    except (ValueError, UnicodeError):
+        return _error("capture_rejected")
+    except HTTPException as exc:
+        return _error_for(exc)
+    except (MemoryStoreError, OSError, sqlite3.Error):
+        return _error("operation_failed")
+    return _success(count=len(items), omitted=omitted, items=payload)
+
+
+@router.post("/v1/app/captures/open")
+async def open_native_capture(request: Request) -> PlainTextResponse:
+    try:
+        fields = await _read_fields(request, EXPECTED_FIELDS[request.url.path])
+        session = _native_session(fields["session_token"])
+        opened = open_capture(request.app.state.memory_store, session.principal, fields["capture_id"])
+    except (ValueError, UnicodeError):
+        return _error("capture_rejected")
+    except HTTPException as exc:
+        return _error_for(exc)
+    except (MemoryStoreError, OSError, sqlite3.Error):
+        return _error("operation_failed")
+    return _success(
+        id=opened["id"],
+        created_at=opened["created_at"],
+        domain_id=opened["domain_id"],
+        category=opened["category"],
+        text=opened["text"],
+    )
+
+
 @router.post("/v1/app/captures/clear")
 async def clear_native_captures(request: Request) -> PlainTextResponse:
     try:
@@ -430,6 +813,180 @@ async def clear_native_captures(request: Request) -> PlainTextResponse:
     except (MemoryStoreError, OSError, sqlite3.Error):
         return _error("operation_failed")
     return _success(cleared="true")
+
+
+@router.post("/v1/app/conversation/ask")
+async def ask_native_conversation(request: Request) -> PlainTextResponse:
+    try:
+        fields = await _read_fields(request, EXPECTED_FIELDS[request.url.path])
+        session = _native_session(fields["session_token"])
+        if session.principal != "owner" or fields["domain_id"] != NATIVE_DOMAIN:
+            return _error("scope_invalid")
+        cancellation_key = (session.token, fields["conversation_id"])
+        cancellation = threading.Event()
+        with request.app.state.conversation_cancellation_lock:
+            previous = request.app.state.conversation_cancellations.get(cancellation_key)
+            if previous is not None:
+                previous.set()
+            request.app.state.conversation_cancellations[cancellation_key] = cancellation
+        def run_read():
+            with request.app.state.grounded_read_lock:
+                registry = getattr(request.app.state, "skill_registry", None)
+                manifest_sha256 = (
+                    registry.trusted_manifest_sha256("generate-synthetic-document")
+                    if isinstance(registry, SkillRegistry) else ""
+                )
+                reader = GroundedRead(
+                    request.app.state.conversation_gateway,
+                    request.app.state.memory_store,
+                    request.app.state.grounded_documents,
+                    lambda text: request.app.state.grounded_reply.__setitem__("text", text),
+                    manifest_sha256=manifest_sha256,
+                )
+                return reader.ask(
+                    fields["session_token"],
+                    {
+                        "conversation_id": fields["conversation_id"],
+                        "question": fields["question"],
+                        "domain_id": fields["domain_id"],
+                    },
+                    Budget(max_seconds=2.0, max_tokens=64, max_attempts=1, max_calls=1, max_identical=1),
+                    cancel_event=cancellation,
+                )
+
+        try:
+            result = await asyncio.to_thread(run_read)
+        finally:
+            with request.app.state.conversation_cancellation_lock:
+                if request.app.state.conversation_cancellations.get(cancellation_key) is cancellation:
+                    request.app.state.conversation_cancellations.pop(cancellation_key, None)
+        if result.status == "session_required":
+            return _error("session_required")
+        if result.status == "invalid_request":
+            return _error("capture_rejected")
+        if session.principal != "owner":
+            return _error("scope_invalid")
+        body = encoded_grounded_body(
+            status=result.status,
+            reason=result.reason,
+            provider_id=request.app.state.conversation_gateway._provider.provider_id,
+            cost="unmeasured",
+            text=result.text,
+            omitted=result.omitted,
+            sources=result.sources,
+        )
+    except (ValueError, UnicodeError):
+        return _error("capture_rejected")
+    except HTTPException as exc:
+        return _error_for(exc)
+    except (MemoryStoreError, OSError, sqlite3.Error):
+        return _error("operation_failed")
+    if len(body) > MAX_RESPONSE_BYTES:
+        return _error("operation_failed")
+    return PlainTextResponse(body, media_type="text/plain", headers={"Cache-Control": "no-store"})
+
+
+@router.post("/v1/app/conversation/open")
+async def open_native_conversation(request: Request) -> PlainTextResponse:
+    try:
+        fields = await _read_fields(request, EXPECTED_FIELDS[request.url.path])
+        session = _native_session(fields["session_token"])
+        if session.principal != "owner" or fields["domain_id"] != NATIVE_DOMAIN:
+            return _error("scope_invalid")
+        if fields["mode"] not in {"new", "resume"}:
+            return _error("capture_rejected")
+        result = open_conversation(
+            request.app.state.memory_store,
+            session.principal,
+            NATIVE_DOMAIN,
+            fields["mode"],
+            _now(),
+        )
+    except (ValueError, UnicodeError):
+        return _error("capture_rejected")
+    except HTTPException as exc:
+        return _error_for(exc)
+    except (MemoryStoreError, OSError, sqlite3.Error):
+        return _error("operation_failed")
+    return _success(conversation_id=result["conversation_id"], expires_at=result["expires_at"])
+
+
+@router.post("/v1/app/conversation/cancel")
+async def cancel_native_conversation(request: Request) -> PlainTextResponse:
+    try:
+        fields = await _read_fields(request, EXPECTED_FIELDS[request.url.path])
+        session = _native_session(fields["session_token"])
+        if session.principal != "owner" or fields["domain_id"] != NATIVE_DOMAIN:
+            return _error("scope_invalid")
+        if not conversation_exists(
+            request.app.state.memory_store,
+            session.principal,
+            NATIVE_DOMAIN,
+            fields["conversation_id"],
+            _now(),
+        ):
+            return _error("capture_rejected")
+        cancellation_key = (session.token, fields["conversation_id"])
+        with request.app.state.conversation_cancellation_lock:
+            cancellation = request.app.state.conversation_cancellations.get(cancellation_key)
+            if cancellation is not None:
+                cancellation.set()
+        request.app.state.conversation_gateway.cancel(session.token, fields["conversation_id"])
+    except (ValueError, UnicodeError):
+        return _error("capture_rejected")
+    except HTTPException as exc:
+        return _error_for(exc)
+    except (MemoryStoreError, OSError, sqlite3.Error):
+        return _error("operation_failed")
+    return _success(cancelled="true")
+
+
+@router.post("/v1/app/artifacts/synthetic-document")
+async def generate_native_synthetic_document(request: Request) -> PlainTextResponse:
+    try:
+        fields = await _read_fields(request, EXPECTED_FIELDS[request.url.path])
+        session = _native_session(fields["session_token"], fields["csrf_token"], mutation=True)
+        registry = getattr(request.app.state, "skill_registry", None)
+        if not isinstance(registry, SkillRegistry):
+            return _error("operation_failed")
+        result = registry.run(
+            "generate-synthetic-document",
+            {
+                "title": "Resumo sintético de exemplo",
+                "sections": [{
+                    "heading": "Conteúdo de teste",
+                    "paragraphs": ["Este documento contém somente texto sintético local."],
+                    "source_id": "src_exemplo_sintetico",
+                }],
+            },
+            Permission("generate_synthetic_document", "synthetic", session.principal),
+        )
+        if not result.ok or result.artifact is None:
+            return _error("operation_failed")
+        artifact_json = canonical_json(result.artifact)
+        from datetime import timedelta
+        manifest_hash = registry.trusted_manifest_sha256("generate-synthetic-document")
+        stored = put_artifact(
+            request.app.state.memory_store,
+            session.principal,
+            NATIVE_DOMAIN,
+            artifact_json.encode("utf-8"),
+            _now(),
+            _now() + timedelta(hours=24),
+            manifest_sha256=manifest_hash,
+        )
+        if stored["sha256"] != hashlib.sha256(artifact_json.encode("utf-8")).hexdigest():
+            return _error("operation_failed")
+        response = _success(artifact_json=artifact_json, artifact_sha256=stored["sha256"])
+    except (ValueError, UnicodeError):
+        return _error("schema_rejected")
+    except HTTPException as exc:
+        return _error_for(exc)
+    except (OSError, sqlite3.Error):
+        return _error("operation_failed")
+    if len(response.body) > MAX_RESPONSE_BYTES:
+        return _error("operation_failed")
+    return response
 
 
 @router.post("/v1/app/connectors/status")
@@ -739,6 +1296,47 @@ async def list_native_workflows(request: Request) -> PlainTextResponse:
         return _success(tasks_json=json.dumps(tasks, ensure_ascii=False, sort_keys=True, separators=(",", ":")))
     except (ValueError, UnicodeError):
         return _error("session_required")
+    except HTTPException as exc:
+        return _error_for(exc)
+    except PermissionError:
+        return _error("session_required")
+    except WorkflowError as exc:
+        return _workflow_error(exc)
+
+
+# 256 bytes reserved for MAC-003 framing (7), nonce/tag (48), and margin.
+# The existing list contract and global transport limits are unchanged.
+WORKFLOW_PAGE_BODY_BYTES = 1792
+
+
+def _workflow_page_response(tasks: list[dict], has_more: bool) -> PlainTextResponse:
+    for count in range(len(tasks), 0, -1):
+        selected = tasks[:count]
+        cursor = workflow_cursor(selected[-1]) if has_more or count < len(tasks) else ""
+        response = _success(
+            tasks_json=json.dumps(selected, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
+            next_cursor=cursor,
+        )
+        # _response's oversized fallback is not a successful page.
+        if response.body.startswith(b"ok=true\n") and len(response.body) <= WORKFLOW_PAGE_BODY_BYTES:
+            return response
+    if tasks:
+        return _error("limit_exceeded")  # Never skip or truncate an oversized item.
+    return _success(tasks_json="[]", next_cursor="")
+
+
+@router.post("/v1/app/workflows/page")
+async def page_native_workflows(request: Request) -> PlainTextResponse:
+    try:
+        fields = await _read_fields(request, EXPECTED_FIELDS[request.url.path])
+        session = _native_session(fields["session_token"])
+        with native_session_confirmed(session.token) as current:
+            tasks, has_more = WorkflowExecutor(request.app.state.memory_store).page_tasks(
+                current.principal, _now(), fields["cursor"]
+            )
+        return _workflow_page_response(tasks, has_more)
+    except (ValueError, UnicodeError):
+        return _error("schema_rejected")
     except HTTPException as exc:
         return _error_for(exc)
     except PermissionError:
