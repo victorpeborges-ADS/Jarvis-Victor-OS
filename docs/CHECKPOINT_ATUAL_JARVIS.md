@@ -47,3 +47,10 @@ Adotar `docs/PROTOCOLO_CONTINUIDADE_CONVERSAS.md` para reduzir o contexto das co
 - Protocolo: [continuidade](PROTOCOLO_CONTINUIDADE_CONVERSAS.md)
 
 **Nota de persistência:** este documento é versionado. Antes de reusar, verificar se a branch/commit e o estado do ambiente ainda correspondem a esta coleta.
+
+## Adendo: capturador técnico de continuidade — 07/11/2026
+
+- **IMPLEMENTADO NA BRANCH DOCUMENTAL DESTA PR:** `scripts/continuity_capture.py` registra metadados Git em `.git/continuity/checkpoint.json`, privadamente; fornece `capture`, `resume` e wrapper opt-in `run -- comando`.
+- **TESTADO SINTETICAMENTE:** 5/5 casos de `scripts/test_continuity_capture.py`, incluindo privacidade e erro de execução.
+- **EXERCITADO LOCALMENTE NO CHECKOUT PRINCIPAL:** captura do Git em `495bc21c5893`, com 3 arquivos rastreados modificados e 3 não rastreados naquele momento; nenhum arquivo do projeto principal foi limpo, alterado ou commitado por essa captura.
+- **NÃO REALIZADO:** monitoramento automático do comprimento dos chats, interceptação automática de Codex Desktop/Friday/Cursor, atualização automática de decisões ou testes do JARVIS e merge deste PR.

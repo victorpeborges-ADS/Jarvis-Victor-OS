@@ -104,3 +104,11 @@ O modo de integração web/API usa o mesmo hostname loopback no navegador e na A
 
 ## 10. Handoff obrigatório
 Responder com: BASELINE (branch/commit), OBJETIVO, ARQUIVOS ALTERADOS, DECISÕES, COMANDOS EXECUTADOS, TESTES PASS/FAIL/BLOCKED, CAPTURAS/DEMOS, RISCOS RESIDUAIS, PENDÊNCIAS DE AUTORIZAÇÃO, PRÓXIMO GATE.
+
+## 11. Continuidade de sessão e controle de contexto
+
+- Sempre que iniciar uma nova sessão técnica, ler `docs/PROTOCOLO_CONTINUIDADE_CONVERSAS.md` e `docs/CHECKPOINT_ATUAL_JARVIS.md`, comparar com Git e fontes do ambiente atual. Este resumo não substitui `AGENTS.md` ou evidência.
+- Ao encerrar **um marco executado**, produzir handoff no formato da seção 10, com resultados atuais, pendências e links; atualizar o checkpoint vivo somente com evidências, em branch segura.
+- Para rotinas locais de CLI autorizadas, `python3 scripts/continuity_capture.py run -- <comando>` faz snapshot técnico before/after automaticamente. `capture` e `resume` são alternativas explícitas. Não considerar isso hook global, execução em background ou monitor de tokens do ChatGPT.
+- O JSON do capturador fica privado na área Git, não contém conversas, logs ou dados pessoais e não deve ser publicado. Friday segue separada, com seus checkpoints locais próprios.
+- Não aumentar permissões, não copiar arquivos do Mac, não fazer push/merge/deploy nem transferir dados externos apenas em virtude da regra de continuidade.

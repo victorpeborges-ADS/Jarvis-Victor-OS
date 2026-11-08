@@ -63,3 +63,20 @@ O handoff operacional deve também atender à seção **Handoff obrigatório** d
 - Nunca declarar `PASS`, implantação, conexão real, autonomia contínua ou custo zero sem evidência específica.
 - Nenhum checkpoint autoriza push, deploy, acesso remoto adicional, envio externo, dados reais, operações destrutivas ou cobrança. Aplicam-se as aprovações de `AGENTS.md`.
 - Não afirmar que a troca de conversa é automática: as fontes persistem, mas a nova sessão deve ser iniciada e verificada.
+
+## Capturador local do Jarvis (implementação técnica)
+
+Existe um CLI sem dependências externas em `scripts/continuity_capture.py`. Ele lê somente metadados Git, grava JSON atômico privado com permissões 0600 sob o git-path `continuity/checkpoint.json` (em geral `.git/continuity/checkpoint.json`) e NÃO copia descrições de tarefa, diffs, prompts, logs, nomes de arquivos nem tokens. O arquivo não é versionado nem enviado ao Google Drive.
+
+```bash
+# A partir da raiz do repositório, depois de aplicar esta PR:
+python3 scripts/continuity_capture.py capture
+python3 scripts/continuity_capture.py resume
+
+# Wrapper opt-in de um comando autorizado: registra before/after e código de saída.
+python3 scripts/continuity_capture.py run -- python3 -m unittest
+```
+
+O comando `run` executa somente o comando explícito recebido (sem shell implícito e sem captura de stdout/stderr), mas **não** intercepta Codex Desktop, Cursor, Friday ou chats abertos fora dele. Ele não substitui checkpoint narrativo revisado nem pode ler o limite interno de tokens do ChatGPT. Não há hook Git instalado nem processo residente em segundo plano.
+
+QA da implementação: testes sintéticos em `scripts/test_continuity_capture.py`, cobrindo exclusão de dados privados, permissões do arquivo, retomada, comando com êxito/erro e evento inválido. O resultado da sessão inicial foi 5/5 PASS, sem reexecução das suítes do produto.
