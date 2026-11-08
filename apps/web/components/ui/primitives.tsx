@@ -38,6 +38,7 @@ export function Button({
   };
   return (
     <button
+      type="button"
       className={["inline-flex items-center justify-center rounded-full font-medium transition disabled:opacity-60", variants[variant], sizes[size], className].join(" ")}
       {...props}
     >
