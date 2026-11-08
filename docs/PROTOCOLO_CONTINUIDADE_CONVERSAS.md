@@ -77,6 +77,6 @@ python3 scripts/continuity_capture.py resume
 python3 scripts/continuity_capture.py run -- python3 -m unittest
 ```
 
-O comando `run` executa somente o comando explícito recebido (sem shell implícito e sem captura de stdout/stderr), mas **não** intercepta Codex Desktop, Cursor, Friday ou chats abertos fora dele. Ele não substitui checkpoint narrativo revisado nem pode ler o limite interno de tokens do ChatGPT. Não há hook Git instalado nem processo residente em segundo plano.
+O comando `run` executa somente o comando explícito recebido (sem shell implícito e sem captura de stdout/stderr), mas **não** intercepta Codex Desktop, Cursor, Friday ou chats abertos fora dele. Ele não substitui checkpoint narrativo revisado nem pode ler o limite interno de tokens do ChatGPT. No Mac de desenvolvimento foi instalado um hook local post-commit fora do repositório, que usa este capturador sem transmissão externa. Esse hook não é versionado nem aparece automaticamente em outros clones; não existe processo residente em segundo plano.
 
 QA da implementação: testes sintéticos em `scripts/test_continuity_capture.py`, cobrindo exclusão de dados privados, permissões do arquivo, retomada, comando com êxito/erro e evento inválido. O resultado da sessão inicial foi 5/5 PASS, sem reexecução das suítes do produto.

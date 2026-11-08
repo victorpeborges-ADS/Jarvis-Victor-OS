@@ -54,3 +54,5 @@ Adotar `docs/PROTOCOLO_CONTINUIDADE_CONVERSAS.md` para reduzir o contexto das co
 - **TESTADO SINTETICAMENTE:** 5/5 casos de `scripts/test_continuity_capture.py`, incluindo privacidade e erro de execução.
 - **EXERCITADO LOCALMENTE NO CHECKOUT PRINCIPAL:** captura do Git em `495bc21c5893`, com 3 arquivos rastreados modificados e 3 não rastreados naquele momento; nenhum arquivo do projeto principal foi limpo, alterado ou commitado por essa captura.
 - **NÃO REALIZADO:** monitoramento automático do comprimento dos chats, interceptação automática de Codex Desktop/Friday/Cursor, atualização automática de decisões ou testes do JARVIS e merge deste PR.
+
+- **HOOK LOCAL PÓS-COMMIT (MAC, FORA DO REPOSITÓRIO):** instalado e verificado em repositório sintético, com snapshot privado e sem copiar conteúdo. Não equivale a interceptação do ChatGPT/Codex Desktop e outros clones não herdam essa configuração.
